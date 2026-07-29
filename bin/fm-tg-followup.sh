@@ -23,6 +23,13 @@
 # window or cap is skipped silently and the link is cleared. A failed send
 # leaves the link and counter untouched so it can be retried.
 #
+# The message is already on the captain's phone once tg returns, so a
+# post-send meta write that fails must never let the same follow-up be spent
+# twice: if the counter write fails, the link is cleared instead (a warning on
+# stderr, still exit 0), which costs the remaining budget rather than risking a
+# duplicate. Only when that fallback clear ALSO fails does the send report a
+# failure.
+#
 # The cap and window are local policy, not a transport limit (there is no relay
 # binding to expire): FMTG_FOLLOWUP_MAX_COUNT defaults to 3 non-final
 # follow-ups and FMTG_FOLLOWUP_MAX_AGE_SECS to 604800 (7 days).

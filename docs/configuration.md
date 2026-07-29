@@ -390,6 +390,7 @@ The `fmtg-respond` skill owns the note lifecycle: claim through phone-inbox's `i
 Work spawned from a note is linked with `bin/fm-tg-link.sh <task-id> <note-id>` (`tg_note=`, `tg_note_ts=`, `tg_followups=` in the task's meta, with `--carry-count`/`--carry-ts` preserving budget across a recovery relink).
 Completion follow-ups go through `bin/fm-tg-followup.sh`, which sends through the phone-inbox `tg` client with the text on stdin (`FMTG_TG_BIN` overrides the default `~/dev/phone-inbox/tg`, e.g. for tests).
 `FMTG_FOLLOWUP_MAX_COUNT` (default 3) and `FMTG_FOLLOWUP_MAX_AGE_SECS` (default 604800) are local anti-spam policy, not a transport cap; `--final` always clears the link.
+Follow-ups are deliberately not gated on the opt-in flag: removing the flag stops new notes and new links, but a task linked before opt-out may still finish its follow-up thread within the same cap and window, so a request the captain made from his phone always gets its outcome.
 Every live send notifies the captain's phone, so nothing in this mode sends as a test.
 
 ## Environment variables
