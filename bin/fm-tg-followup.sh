@@ -176,8 +176,11 @@ if [ "$NEW_COUNT" -ge "$MAX_COUNT" ]; then
   }
 else
   fmtg_meta_followups_set "$META" "$NEW_COUNT" || {
-    echo "fm-tg-followup: sent, but failed to record the follow-up count in state/$ID.meta" >&2
-    exit 1
+    fmtg_meta_link_clear "$META" || {
+      echo "fm-tg-followup: sent, but failed to record the follow-up count or clear the link in state/$ID.meta" >&2
+      exit 1
+    }
+    echo "fm-tg-followup: warning: sent, but failed to record the follow-up count in state/$ID.meta; cleared the link to avoid duplicate follow-ups" >&2
   }
 fi
 printf 'follow-up %s/%s sent for %s (note %s)\n' "$NEW_COUNT" "$MAX_COUNT" "$ID" "$NID"

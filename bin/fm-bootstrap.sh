@@ -723,8 +723,7 @@ EOF
 # and no secret anywhere: the phone-inbox project owns the bot token and no
 # firstmate-side code reads it.
 tg_mode_setup() {
-  local flag shim cadence shim_body cadence_body
-  flag="$CONFIG/telegram-mode"
+  local shim cadence shim_body cadence_body
   shim="$STATE/tg-watch.check.sh"
   cadence="$CONFIG/tg-mode.env"
 
