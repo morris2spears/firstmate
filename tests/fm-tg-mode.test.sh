@@ -40,9 +40,9 @@ path_mode() {
 make_home() {
   local home="$TMP_ROOT/$1"
   mkdir -p "$home/config" "$home/state" "$home/inbox/pending"
-  # The private-artifact helpers shared with X mode require the 0700 state
-  # identity for dedupe records and offer markers.
-  chmod 0700 "$home/state"
+  # A real home's state/ is created under the ambient umask, so the poll must
+  # own the 0700 identity of every private artifact directory it writes.
+  chmod 0755 "$home/state"
   : > "$home/config/telegram-mode"
   printf '%s\n' "$home"
 }
@@ -73,7 +73,7 @@ test_poll_no_optin_is_hard_noop() {
   expect_code 0 "$rc" "poll no-optin exit"
   [ -z "$out" ] || fail "poll without opt-in must be silent (got: $out)"
   assert_absent "$home/state/tg-offered" "poll without opt-in must not create offer markers"
-  assert_absent "$home/state/tg-poll.error" "poll without opt-in must not create error state"
+  assert_absent "$home/state/tg-poll" "poll without opt-in must not create error state"
   pass "fm-tg-poll is a hard no-op without the opt-in flag (inert default)"
 }
 
@@ -152,17 +152,20 @@ test_poll_missing_inbox_reports_once() {
   local home out
   home="$TMP_ROOT/poll-missing-inbox"
   mkdir -p "$home/config" "$home/state"
-  chmod 0700 "$home/state"
+  # An ordinary umask-created state/, not a 0700 one: the dedupe record must
+  # still persist, or the error re-emits on every poll of the 30s cadence.
+  chmod 0755 "$home/state"
   : > "$home/config/telegram-mode"
   out=$(PHONE_INBOX_ROOT="$home/no-such-inbox" FM_HOME="$home" "$ROOT/bin/fm-tg-poll.sh")
   assert_contains "$out" "tg-mode-error missing phone inbox" "opted-in poll must surface a missing inbox"
+  assert_present "$home/state/tg-poll/error" "the inbox error dedupe record must persist under a umask-created state dir"
   out=$(PHONE_INBOX_ROOT="$home/no-such-inbox" FM_HOME="$home" "$ROOT/bin/fm-tg-poll.sh")
   [ -z "$out" ] || fail "the same inbox error must be reported once, not every poll (got: $out)"
   # Recovery clears the dedupe record so a later failure reports again.
   mkdir -p "$home/no-such-inbox/pending"
   out=$(PHONE_INBOX_ROOT="$home/no-such-inbox" FM_HOME="$home" "$ROOT/bin/fm-tg-poll.sh")
   [ -z "$out" ] || fail "a recovered inbox with no notes must be silent (got: $out)"
-  assert_absent "$home/state/tg-poll.error" "recovery must clear the error dedupe record"
+  assert_absent "$home/state/tg-poll/error" "recovery must clear the error dedupe record"
   pass "fm-tg-poll reports a missing inbox once and recovers silently"
 }
 
@@ -501,6 +504,11 @@ test_supervision_instructions_carry_tg_cadence() {
   out=$(FM_HOME="$home" "$ROOT/bin/fm-supervision-instructions.sh" --harness claude 2>/dev/null)
   assert_contains "$out" "Telegram mode: active; source $home/config/tg-mode.env" \
     "the operating block must name the Telegram cadence file"
+  # X mode being off must not contradict the Telegram 30s cadence one line down.
+  assert_not_contains "$out" "default watcher cadence" \
+    "an inactive X mode must not claim the default cadence while Telegram mode is active"
+  assert_not_contains "$out" "Watcher cadence: default" \
+    "the block must not claim the default cadence while Telegram mode is active"
   out=$(FM_HOME="$home" "$ROOT/bin/fm-supervision-instructions.sh" --harness claude --repair-line 2>/dev/null)
   assert_contains "$out" "source '$home/config/tg-mode.env' first" \
     "the repair line must source the Telegram cadence file"
@@ -509,6 +517,10 @@ test_supervision_instructions_carry_tg_cadence() {
   out=$(FM_HOME="$home" "$ROOT/bin/fm-supervision-instructions.sh" --harness claude 2>/dev/null)
   assert_not_contains "$out" "- Telegram mode: active" \
     "a non-opted-in home must not report Telegram mode active"
+  assert_contains "$out" "- Telegram mode: inactive." \
+    "the block must report Telegram mode inactive symmetrically with X mode"
+  assert_contains "$out" "Watcher cadence: default" \
+    "with both modes off the block must state the default cadence once"
   pass "supervision instructions carry the Telegram cadence exactly when armed"
 }
 

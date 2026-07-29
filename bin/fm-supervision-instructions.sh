@@ -218,10 +218,15 @@ fi
 if [ "$X_MODE" -eq 1 ]; then
   printf '%s%s%s\n' '- X mode: active; source ' "$x_mode_env" ' before launching any watcher process so the 30s cadence is inherited.'
 else
-  printf '%s\n' '- X mode: inactive; use the default watcher cadence.'
+  printf '%s\n' '- X mode: inactive.'
 fi
 if [ "$TG_MODE" -eq 1 ]; then
   printf '%s%s%s\n' '- Telegram mode: active; source ' "$tg_mode_env" ' before launching any watcher process so the 30s cadence is inherited.'
+else
+  printf '%s\n' '- Telegram mode: inactive.'
+fi
+if [ "$X_MODE" -eq 0 ] && [ "$TG_MODE" -eq 0 ]; then
+  printf '%s\n' '- Watcher cadence: default; no mode overrides it.'
 fi
 ordinary_wake_line
 printf '\n'

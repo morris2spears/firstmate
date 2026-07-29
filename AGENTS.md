@@ -103,7 +103,7 @@ state/               volatile runtime signals; gitignored
   x-watch.check.sh   generated X-mode relay poll shim; present only when opted in (section 14)
   tg-watch.check.sh  generated Telegram-mode inbox poll shim; present only when opted in (section 15)
   tg-offered/        generated Telegram-mode durable offered markers, one per pending note id; pruned when the note leaves pending (section 15)
-  tg-poll.error tg-poll.claim-error  generated Telegram-mode inbox and offer-claim diagnostic dedupe markers
+  tg-poll/           generated Telegram-mode diagnostic dedupe markers: error (inbox) and claim-error (offer claim)
   pending-replies/   parent-owned secondmate pending-reply records (correlation id, delivery vs reply, recovery, escalation); fm-pending-reply-lib.sh
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated X-mode durable per-request reply context and one-wake offer markers, keyed by request_id; survives inbox cleanup and expires within seven days (section 14; bin/fm-x-lib.sh)

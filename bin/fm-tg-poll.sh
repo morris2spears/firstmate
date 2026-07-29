@@ -44,47 +44,35 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # Hard no-op when Telegram mode is off: this is what keeps the check shim inert.
 fmtg_enabled "$FM_HOME" || exit 0
 
-ERROR_FILE="$STATE/tg-poll.error"
-CLAIM_ERROR_FILE="$STATE/tg-poll.claim-error"
+# Dedupe records live in their own directory rather than directly under $STATE:
+# the private-artifact helpers demand a 0700 directory identity, and a home's
+# state/ is created under the ambient umask, so publishing into it would fail
+# and re-emit the same diagnostic on every 30s poll forever.
+ERROR_DIR="$STATE/tg-poll"
 
 emit_error_once() {
-  local msg=$1
-  if fmx_private_artifact_file_valid "$STATE" "tg-poll.error" 600 \
-    && [ "$(cat "$ERROR_FILE" 2>/dev/null)" = "$msg" ]; then
+  local base=$1 msg=$2
+  if fmx_private_artifact_file_valid "$ERROR_DIR" "$base" 600 \
+    && [ "$(cat "$ERROR_DIR/$base" 2>/dev/null)" = "$msg" ]; then
     return 0
   fi
   printf '%s\n' "$msg" \
-    | fmx_private_artifact_publish_stdin "$STATE" "tg-poll.error" 600 2>/dev/null || true
+    | fmx_private_artifact_publish_stdin "$ERROR_DIR" "$base" 600 2>/dev/null || true
   printf 'tg-mode-error %s\n' "$msg"
 }
 
 clear_error() {
-  fmx_private_artifact_dir_device "$STATE" >/dev/null 2>&1 || return 0
-  rm -f "$ERROR_FILE" 2>/dev/null || true
-}
-
-emit_claim_error_once() {
-  local msg=$1
-  if fmx_private_artifact_file_valid "$STATE" "tg-poll.claim-error" 600 \
-    && [ "$(cat "$CLAIM_ERROR_FILE" 2>/dev/null)" = "$msg" ]; then
-    return 0
-  fi
-  printf '%s\n' "$msg" \
-    | fmx_private_artifact_publish_stdin "$STATE" "tg-poll.claim-error" 600 2>/dev/null || true
-  printf 'tg-mode-error %s\n' "$msg"
-}
-
-clear_claim_error() {
-  fmx_private_artifact_dir_device "$STATE" >/dev/null 2>&1 || return 0
-  rm -f "$CLAIM_ERROR_FILE" 2>/dev/null || true
+  local base=$1
+  fmx_private_artifact_dir_device "$ERROR_DIR" >/dev/null 2>&1 || return 0
+  rm -f "$ERROR_DIR/$base" 2>/dev/null || true
 }
 
 INBOX_ROOT=$(fmtg_inbox_root)
 if [ ! -d "$INBOX_ROOT" ] || [ -L "$INBOX_ROOT" ]; then
-  emit_error_once "missing phone inbox at $INBOX_ROOT"
+  emit_error_once error "missing phone inbox at $INBOX_ROOT"
   exit 0
 fi
-clear_error
+clear_error error
 
 PENDING="$INBOX_ROOT/pending"
 OFFERED="$STATE/tg-offered"
@@ -131,6 +119,8 @@ while IFS= read -r id; do
     if printf '%s\n' "$NOW" \
       | fmx_private_artifact_publish_stdin "$OFFERED" "$id" 600 2>/dev/null; then
       WAKE_IDS="$WAKE_IDS $id"
+    else
+      claim_failed=1
     fi
     continue
   fi
@@ -153,9 +143,9 @@ $PENDING_IDS
 EOF
 
 if [ "$claim_failed" -eq 1 ]; then
-  emit_claim_error_once "cannot record note offer"
+  emit_error_once claim-error "cannot record note offer"
 else
-  clear_claim_error
+  clear_error claim-error
 fi
 
 [ -n "$WAKE_IDS" ] || exit 0

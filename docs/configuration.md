@@ -384,7 +384,7 @@ Steady-state off is silent and writes nothing, so a fresh clone behaves identica
 It surfaces each pending note id at most once per offer by atomically claiming a durable marker at `state/tg-offered/<id>`, prints the wake payload `tg-message <id> [<id>...]`, and re-offers a note still unclaimed after `FMTG_REOFFER_SECS` (default 1800) so a firstmate that died between wake and claim self-heals.
 Markers are pruned when their note leaves pending, which bounds retention.
 The wake payload carries note ids only: note bodies are untrusted phone text and pending filenames embed the body as a slug, so neither ever appears in a wake payload, a marker name, or poll output.
-Inbox or offer-claim problems are reported once as `tg-mode-error ...` until recovery.
+Inbox or offer-claim problems are reported once as `tg-mode-error ...` until recovery; the dedupe records live in the poll-owned private directory `state/tg-poll/` (`error`, `claim-error`), so deduplication holds regardless of how the home's `state/` was created.
 
 The `fmtg-respond` skill owns the note lifecycle: claim through phone-inbox's `inbox claim`, classify, act through the normal lifecycle within the authority boundary, reply via `inbox reply` (stdin only), and archive pure acknowledgments with `inbox done`.
 Work spawned from a note is linked with `bin/fm-tg-link.sh <task-id> <note-id>` (`tg_note=`, `tg_note_ts=`, `tg_followups=` in the task's meta, with `--carry-count`/`--carry-ts` preserving budget across a recovery relink).
