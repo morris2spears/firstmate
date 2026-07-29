@@ -1192,6 +1192,7 @@ fi
 # presentation cleanup. The per-project journal is durable and is never
 # retired here; teardown never closes a workspace.
 HERDR_PROJECT_SPACE_TASK=0
+HERDR_PROJECT_SPACE_UNSAFE=0
 if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" != 1 ] && [ "$BACKEND" = herdr ] \
    && [ "$(meta_value "$META" herdr_project_space)" = 1 ]; then
   fm_backend_source herdr || true
@@ -1201,6 +1202,12 @@ if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" != 1 ] && [ "$BACKEND" = herdr ] \
      && [ -n "$HERDR_PRESENTATION_PANE" ] \
      && [ "$T" = "$HERDR_PRESENTATION_SESSION:$HERDR_PRESENTATION_PANE" ]; then
     HERDR_PROJECT_SPACE_TASK=1
+  else
+    # The recorded endpoint identities disagree, so no pane can be closed
+    # exactly. A plain kill here would close an unverified pane in a shared
+    # workspace holding the captain's own tabs; refuse instead.
+    HERDR_PROJECT_SPACE_UNSAFE=1
+    echo "warning: herdr project-workspace metadata for $ID is inconsistent; refusing an inexact pane close and leaving its shared project workspace untouched" >&2
   fi
 fi
 
@@ -1229,7 +1236,7 @@ if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ] || [ "$HERDR_PROJECT_SPACE_TAS
   # shellcheck source=bin/fm-wake-lib.sh
   . "$SCRIPT_DIR/fm-wake-lib.sh"
   herdr_focus_safe_pane_close "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_PANE"
-elif [ "$BACKEND" != orca ]; then
+elif [ "$BACKEND" != orca ] && [ "$HERDR_PROJECT_SPACE_UNSAFE" != 1 ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
 fi
 if [ "$HERDR_PROJECT_SPACE_TASK" = 1 ] \

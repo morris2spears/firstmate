@@ -1246,10 +1246,6 @@ fm_backend_herdr_project_container_ensure() {  # <session> <state-dir> <project-
     return 2
   }
   label=$(fm_backend_herdr_project_workspace_label "$project" "$token")
-  fm_backend_herdr_project_journal_write "$journal" "$project" "$session" "$token" "$label" || {
-    echo "warning: could not record the herdr project workspace attempt for '$name'; using the ordinary flat layout" >&2
-    return 2
-  }
   # Focus safety: a completely empty session has nothing to preserve (and its
   # first workspace focuses regardless); otherwise an exact snapshot is
   # required before the create, exactly like the per-task projection.
@@ -1262,6 +1258,10 @@ fm_backend_herdr_project_container_ensure() {  # <session> <state-dir> <project-
       return 2
     fi
   fi
+  fm_backend_herdr_project_journal_write "$journal" "$project" "$session" "$token" "$label" || {
+    echo "warning: could not record the herdr project workspace attempt for '$name'; using the ordinary flat layout" >&2
+    return 2
+  }
   if ! out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$project" --label "$label" --no-focus 2>/dev/null); then
     [ -z "$focus_before" ] || fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "project workspace create" || true
     echo "warning: herdr project workspace create failed for '$name'; using the ordinary flat layout" >&2

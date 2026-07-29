@@ -1037,12 +1037,12 @@ case "$BACKEND" in
         # agent-free (the same duplicate-launch guard as presentation
         # recovery), because a live task tab may sit in a workspace the flat
         # dup-label check would never inspect.
+        if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+          herdr_projection_existing_meta_allows_flat "$STATE/$ID.meta" || exit 1
+        fi
         if ! fm_backend_herdr_server_ensure "$HERDR_SES"; then
           echo "warning: herdr project workspace could not ensure its session server; using the ordinary flat layout" >&2
         elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES"; then
-          if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
-            herdr_projection_existing_meta_allows_flat "$STATE/$ID.meta" || exit 1
-          fi
           set +e
           HERDR_PROJECT_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_project_container_ensure \
             "$HERDR_SES" "$STATE" "$PROJ_ABS")
