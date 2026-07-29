@@ -19,7 +19,7 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-# shellcheck source=bin/fm-tg-lib.sh
+# shellcheck source=/dev/null
 . "$ROOT/bin/fm-tg-lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-tg-mode-tests)
@@ -487,7 +487,7 @@ test_followup_lifecycle() {
 test_supervision_needed_by_tg_shim() {
   local home
   home="$TMP_ROOT/sup-needed"; mkdir -p "$home/state"
-  # shellcheck source=bin/fm-supervision-lib.sh
+  # shellcheck source=/dev/null
   . "$ROOT/bin/fm-supervision-lib.sh"
   fm_supervision_status "$home/state"
   [ "$FM_SUP_NEEDED" = false ] || fail "an empty home must not need supervision"
