@@ -160,6 +160,11 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-operational-input.sh
 . "$FM_DAEMON_DIR/fm-operational-input.sh"
 
+# Telegram mode's existing authenticated outbound transport owner.
+# The daemon uses only its stdin sender helper and never reads credentials.
+# shellcheck source=bin/fm-tg-lib.sh
+. "$FM_DAEMON_DIR/fm-tg-lib.sh"
+
 # Shared wake classifier (last_status_line, status_is_captain_relevant,
 # window_to_task, scan_captain_relevant_statuses). The SAME library backs the
 # always-on watcher's triage, so the captain-relevant verb set and the
@@ -617,19 +622,98 @@ escalate_add() {  # <state> <distilled-item>
   printf '%s\n' "$item" >> "$buf"
 }
 
-# Flush the escalation buffer as ONE batched, single-line digest to the
-# supervisor pane. Returns 0 on successful inject (or empty buffer), non-zero on
-# inject failure (buffer preserved for retry / catch-up).
+# Send one batched away alert through Telegram mode's existing phone-inbox tg
+# client. The durable record stores only a delivery id, result class, and epoch.
+# It never stores alert text, credentials, chat ids, or raw sender diagnostics.
+# An attempting record is written before network I/O. If the daemon dies in the
+# narrow accepted-before-recorded window, the next pass classifies that attempt
+# as failed/uncertain and never retries it, preferring a visible fallback over a
+# duplicate phone alert.
+telegram_away_deliver() {  # <state> <batch-body>
+  local state=$1 body=$2 buf since delivery_id dir base record status now rc alert
+  if [ "${FM_TG_AWAY_EXEC:-live}" = discard ] || ! afk_active "$state" || ! fmtg_enabled "$FM_HOME"; then
+    printf 'off|none\n'
+    return 0
+  fi
+  buf="$state/.subsuper-escalations"
+  since=$(cat "${buf}.since" 2>/dev/null || true)
+  case "$since" in ''|*[!0-9]*) since=$(_now) ;; esac
+  delivery_id="${since}-$(_hash_text "$body")"
+  dir="$state/tg-away-delivery"
+  base="$delivery_id.status"
+  if fmx_private_artifact_file_valid "$dir" "$base" 600; then
+    record=$(cat "$dir/$base" 2>/dev/null || true)
+    status=${record%% *}
+    case "$status" in
+      accepted|failed|unavailable)
+        printf '%s|%s\n' "$status" "$delivery_id"
+        return 0
+        ;;
+      attempting)
+        now=$(_now)
+        printf 'failed %s uncertain_previous_attempt\n' "$now" \
+          | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+        printf 'failed|%s\n' "$delivery_id"
+        return 0
+        ;;
+    esac
+  elif [ -e "$dir/$base" ] || [ -L "$dir/$base" ]; then
+    printf 'unavailable|%s\n' "$delivery_id"
+    return 0
+  fi
+
+  now=$(_now)
+  if ! printf 'attempting %s\n' "$now" \
+    | fmx_private_artifact_publish_stdin_once "$dir" "$base" 600 2>/dev/null; then
+    printf 'unavailable|%s\n' "$delivery_id"
+    return 0
+  fi
+
+  alert=$(printf 'Firstmate needs you: %s Notice only. This message does not approve a merge, privileged change, destructive action, or security-sensitive action.' "$body")
+  printf '%s' "$alert" | fmtg_send_stdin >/dev/null 2>/dev/null
+  rc=$?
+  now=$(_now)
+  if [ "$rc" -eq 0 ]; then
+    printf 'accepted %s\n' "$now" \
+      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+    printf 'accepted|%s\n' "$delivery_id"
+  elif [ "$rc" -eq 127 ]; then
+    printf 'unavailable %s sender_missing\n' "$now" \
+      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+    printf 'unavailable|%s\n' "$delivery_id"
+  else
+    printf 'failed %s sender_rejected\n' "$now" \
+      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+    printf 'failed|%s\n' "$delivery_id"
+  fi
+}
+
+# Flush the escalation buffer as one batched digest. Telegram receives the
+# concise captain notice first. On accepted delivery, Firstmate receives only a
+# private receipt and reconciles the durable work records, avoiding a duplicate
+# captain-facing chat notice. Failed or unavailable delivery preserves the
+# existing in-session escalation as the safe fallback and says Telegram did not
+# receive it. The buffer clears only after the in-session submit is confirmed.
 escalate_flush() {  # <state>
-  local state=$1 buf item n msg
+  local state=$1 buf n body msg tg_result tg_status tg_id
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
   n=$(wc -l < "$buf" 2>/dev/null || echo 0)
-  # Join buffered items with the literal " | " separator into one digest line.
-  msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
-  # safety net, but keeping the source single-line makes the intent explicit).
-  msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
+  body=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
+  tg_result=$(telegram_away_deliver "$state" "$body")
+  tg_status=${tg_result%%|*}
+  tg_id=${tg_result#*|}
+  case "$tg_status" in
+    accepted)
+      msg=$(printf 'Telegram accepted away-mode alert %s (%s event(s)). Reconcile the durable fleet records now; do not repeat this alert in captain chat. (pre-read; re-arm not needed - watcher daemon-managed)' "$tg_id" "$n")
+      ;;
+    failed|unavailable)
+      msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery %s; the captain was not contacted there. Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body" "$tg_status")
+      ;;
+    *)
+      msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
+      ;;
+  esac
   if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
   return 1
 }
@@ -1511,5 +1595,6 @@ else
   # exported so a real daemon a test later spawns inherits the safe default too.
   # The executed branch above never runs this, so production is untouched.
   : "${FM_WEDGE_ALARM_EXEC:=discard}"
-  export FM_WEDGE_ALARM_EXEC
+  : "${FM_TG_AWAY_EXEC:=discard}"
+  export FM_WEDGE_ALARM_EXEC FM_TG_AWAY_EXEC
 fi

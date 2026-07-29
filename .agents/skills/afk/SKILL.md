@@ -170,17 +170,19 @@ Classify each wake this way:
   captain-relevant status line the per-wake classifier might miss.
 - Unknown reason, or any uncertainty -> escalate fail-safe.
 
-Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 =
-immediate) and flushed as one single-line digest prefixed with the current
-operational prefix, carrying pre-read status summaries and a recommended action.
-The single-line format makes the submission unambiguous across harnesses, and
-the operational prefix lets firstmate distinguish it from a real captain message.
+Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 = immediate) and flushed as one batch.
+When Telegram mode is configured, that same batch first goes through the existing phone-inbox `tg` client as one concise notice with an explicit reminder that the notice grants no approval.
+An accepted send leaves only a non-secret internal delivery receipt in Firstmate chat, so firstmate reconciles the durable work records and does not repeat the alert to the captain there.
+A failed or unavailable send preserves the full in-session escalation as the safe fallback and explicitly says the captain was not contacted on Telegram.
+Accepted, failed, and unavailable outcomes persist under `state/tg-away-delivery/` by opaque delivery id without message text, chat id, token, or raw sender diagnostics.
+The daemon records an attempt before network I/O and never retries an uncertain attempt, preventing a crash between Telegram acceptance and local recording from duplicating the alert.
+Without Telegram mode configured, away mode keeps its existing in-session fallback behavior.
+The single-line internal format makes submission unambiguous across harnesses, and the operational prefix lets firstmate distinguish it from a real captain message.
 
 ## Injection hardening
 
-- **Single-line digest** - embedded newlines are collapsed to a literal
-  separator before injection, so submission is unambiguous regardless of
-  harness.
+- **Single-line digest** - embedded newlines are collapsed to a literal separator before phone delivery or injection, so submission is unambiguous regardless of harness.
+- **No duplicate captain notice** - accepted Telegram delivery injects only an opaque receipt; firstmate reads the durable fleet records to act and does not repeat the alert in captain chat while away mode remains active.
 - **Composer guard on the supervisor pane** - before injecting, the daemon checks `pane_is_busy` (harness busy footer means agent mid-turn) and reads `fm_backend_composer_state` directly.
   Only `empty` permits injection; `pending` protects half-typed or swallowed input, and `unknown` protects unreadable panes and bare dead-shell prompts.
   Every other result preserves the buffer for retry, so the daemon never merges its digest into the captain's half-typed line or types it into a shell.

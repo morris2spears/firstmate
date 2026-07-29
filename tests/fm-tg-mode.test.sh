@@ -21,6 +21,8 @@ set -u
 
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-tg-lib.sh"
+# shellcheck source=/dev/null
+. "$ROOT/bin/fm-supervise-daemon.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-tg-mode-tests)
 
@@ -497,6 +499,113 @@ test_supervision_needed_by_tg_shim() {
   pass "fm_supervision_status counts the Telegram poll as supervision-needed"
 }
 
+test_away_delivery_is_inert_outside_away_mode() {
+  local home state tg out
+  home=$(make_home away-inactive)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  printf '1700000000\n' > "$state/.subsuper-escalations.since"
+
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+    FMTG_TG_BIN="$tg" telegram_away_deliver "$state" 'blocked: should stay in session')
+  [ "$out" = 'off|none' ] || fail "Telegram away delivery must be off outside away mode (got: $out)"
+  assert_absent "$home/tg-sent.log" "Telegram delivery outside away mode must not call the outbound client"
+  assert_absent "$state/tg-away-delivery" "Telegram delivery outside away mode must not create evidence"
+  pass "Telegram escalation delivery is inert outside away mode"
+}
+
+test_away_delivery_is_accepted_once_and_records_no_content() {
+  local home state tg out first_id second_id
+  home=$(make_home away-accepted)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  printf '1700000000\n' > "$state/.subsuper-escalations.since"
+
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+    FMTG_TG_BIN="$tg" telegram_away_deliver "$state" 'needs-decision: approve privileged cutover')
+  first_id=${out#*|}
+  [ "${out%%|*}" = accepted ] || fail "away delivery must report accepted (got: $out)"
+
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+    FMTG_TG_BIN="$tg" telegram_away_deliver "$state" 'needs-decision: approve privileged cutover')
+  second_id=${out#*|}
+  [ "${out%%|*}" = accepted ] || fail "accepted away delivery must remain accepted (got: $out)"
+  [ "$first_id" = "$second_id" ] || fail "the same away batch must keep one delivery id"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "the same away batch reached the outbound client more than once"
+  grep -Eq '^accepted [0-9]+$' "$state/tg-away-delivery/$first_id.status" \
+    || fail "accepted delivery must have non-secret durable evidence"
+  assert_no_grep 'privileged cutover' "$state/tg-away-delivery/$first_id.status" \
+    "delivery evidence must not contain message text"
+  pass "away delivery records Telegram acceptance and sends each batch exactly once"
+}
+
+test_away_delivery_failure_classes_and_safe_chat_fallback() {
+  local home state tg out injected
+  home=$(make_home away-failure)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  printf '1700000001\n' > "$state/.subsuper-escalations.since"
+
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+    FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 telegram_away_deliver "$state" 'blocked: credential needed')
+  [ "${out%%|*}" = failed ] || fail "a rejected Telegram send must report failed (got: $out)"
+  grep -Eq '^failed [0-9]+ sender_rejected$' "$state/tg-away-delivery/${out#*|}.status" \
+    || fail "failed delivery must have non-secret durable evidence"
+
+  printf '1700000002\n' > "$state/.subsuper-escalations.since"
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+    FMTG_TG_BIN="$home/missing-tg" telegram_away_deliver "$state" 'blocked: second credential needed')
+  [ "${out%%|*}" = unavailable ] || fail "a missing Telegram client must report unavailable (got: $out)"
+  grep -Eq '^unavailable [0-9]+ sender_missing$' "$state/tg-away-delivery/${out#*|}.status" \
+    || fail "unavailable delivery must have non-secret durable evidence"
+
+  : > "$state/.subsuper-escalations"
+  printf 'blocked: safe fallback required\n' > "$state/.subsuper-escalations"
+  printf '1700000003\n' > "$state/.subsuper-escalations.since"
+  injected="$home/injected.log"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
+  ) || fail "failed Telegram delivery must retain the in-session fallback"
+  assert_grep 'blocked: safe fallback required' "$injected" \
+    "the fallback must preserve the captain-relevant escalation"
+  assert_grep 'Telegram delivery unavailable; the captain was not contacted there' "$injected" \
+    "the fallback must never claim Telegram delivery"
+  pass "away delivery distinguishes failed and unavailable transport and falls back safely"
+}
+
+test_away_delivery_acceptance_does_not_duplicate_alert_in_chat() {
+  local home state tg injected
+  home=$(make_home away-no-chat-duplicate)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  printf 'needs-decision: approve privileged cutover\n' > "$state/.subsuper-escalations"
+  printf '1700000004\n' > "$state/.subsuper-escalations.since"
+  injected="$home/injected.log"
+
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "accepted Telegram delivery must complete the away flush"
+
+  assert_grep 'Telegram accepted away-mode alert' "$injected" \
+    "Firstmate must receive a non-secret accepted receipt"
+  assert_no_grep 'approve privileged cutover' "$injected" \
+    "an accepted Telegram alert must not be duplicated into captain chat"
+  assert_grep 'needs-decision: approve privileged cutover' "$home/tg-sent.log" \
+    "the existing outbound client must receive the actual batched alert"
+  assert_grep 'does not approve a merge, privileged change, destructive action, or security-sensitive action' "$home/tg-sent.log" \
+    "the phone notice must preserve approval boundaries"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "confirmed receipt injection must clear the away buffer"
+  pass "accepted away alerts reach Telegram once without duplicating their contents in captain chat"
+}
+
 test_supervision_instructions_carry_tg_cadence() {
   local home out
   home="$TMP_ROOT/sup-instructions"; mkdir -p "$home/config"
@@ -544,6 +653,10 @@ test_watcher_rejects_tampered_tg_shim
 test_link_records_note_and_timestamp
 test_link_rejects_unsafe_and_missing
 test_followup_lifecycle
+test_away_delivery_is_inert_outside_away_mode
+test_away_delivery_is_accepted_once_and_records_no_content
+test_away_delivery_failure_classes_and_safe_chat_fallback
+test_away_delivery_acceptance_does_not_duplicate_alert_in_chat
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence
 

@@ -30,6 +30,9 @@
 #                                  tg_followups to 0
 #   fmtg_meta_followups_set <meta> <n> - rewrite just the follow-up counter
 #   fmtg_meta_link_clear <meta>  - remove the Telegram note link entirely
+#   fmtg_send_stdin              - send one message through phone-inbox's
+#                                  existing authenticated tg client, with text
+#                                  on stdin and no credential handling here
 
 FM_TG_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-x-lib.sh
@@ -44,6 +47,18 @@ fmtg_enabled() {
 
 fmtg_inbox_root() {
   printf '%s\n' "${PHONE_INBOX_ROOT:-$HOME/.claude/inbox}"
+}
+
+# The phone-inbox tg client remains the single outbound transport owner.
+# Callers provide text on stdin only, so alert content never appears in process
+# arguments. The client validates Telegram's accepted response and scrubs its
+# own diagnostics; callers should still classify failures without relaying raw
+# stderr because it can name private local paths.
+fmtg_send_stdin() {
+  local tg_bin
+  tg_bin=${FMTG_TG_BIN:-$HOME/dev/phone-inbox/tg}
+  [ -f "$tg_bin" ] && [ -x "$tg_bin" ] || return 127
+  "$tg_bin"
 }
 
 # Print the numeric ids of pending phone-inbox notes, one per line, sorted and

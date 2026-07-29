@@ -397,6 +397,16 @@ Completion follow-ups go through `bin/fm-tg-followup.sh`, which sends through th
 Follow-ups are deliberately not gated on the opt-in flag: removing the flag stops new notes and new links, but a task linked before opt-out may still finish its follow-up thread within the same cap and window, so a request the captain made from his phone always gets its outcome.
 Every live send notifies the captain's phone, so nothing in this mode sends as a test.
 
+While `state/.afk` is present, the away daemon also routes each captain-relevant escalation batch through the same phone-inbox `tg` client before its in-session delivery.
+It sends exactly one concise Telegram notice per batch and includes an explicit reminder that delivery grants no approval for a merge, privileged change, destructive action, or security-sensitive action.
+An accepted send causes the daemon to inject only a non-secret receipt into Firstmate, preventing the same alert contents from being repeated in captain chat while preserving Firstmate's obligation to reconcile and act on the durable work records.
+A failed or unavailable send keeps the complete in-session escalation as the existing fallback and labels the Telegram outcome accurately.
+Delivery evidence lives in the private `state/tg-away-delivery/<opaque-id>.status` records as `attempting`, `accepted`, `failed`, or `unavailable` plus an epoch and a non-secret reason class.
+The records never contain alert text, raw sender output, a token, or a chat id.
+An `attempting` record is written before network I/O; if a daemon restart finds an unresolved attempt, it marks that attempt failed/uncertain and never retries it, avoiding duplicate phone alerts when Telegram may already have accepted the send.
+A successful `tg` exit means the Telegram API returned an accepted response end to end; it does not prove the captain read the notice.
+This away-only use does not change inbound notes, linked-task follow-ups, opt-out behavior, watcher ownership, return catch-up, or buffering outside away mode.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):

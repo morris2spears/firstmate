@@ -161,7 +161,8 @@ if [ ! -f "$TG_BIN" ] || [ ! -x "$TG_BIN" ]; then
 fi
 
 # The text travels on stdin only; tg owns the Telegram message limit.
-if ! printf '%s' "$TEXT" | "$TG_BIN"; then
+# fmtg_send_stdin keeps every firstmate outbound path on this same client.
+if ! printf '%s' "$TEXT" | fmtg_send_stdin; then
   echo "fm-tg-followup: tg send failed; link kept for retry" >&2
   exit 1
 fi
