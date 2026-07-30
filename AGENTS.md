@@ -107,6 +107,7 @@ state/               volatile runtime signals; gitignored
   tg-poll/           generated Telegram-mode diagnostic dedupe markers: error (inbox) and claim-error (offer claim)
   tg-away-delivery/  away-mode Telegram escalation delivery evidence, one text-free <delivery-id>.status per attempt; never holds alert text, chat id, token, or sender output
   tg-away-digest/    away-mode private 0600 working copies of the escalation lines an accepted Telegram notice carried; read these when a delivery receipt points at them, folded into return catch-up, and retired with the away session (bin/fm-away-ledger-lib.sh)
+  tg-away-versions/  away-mode immutable batch versions, one complete v.<id>/ copy of the escalation buffer, ledger sidecar, wedge marker, and digests per lifecycle transaction, plus the single active/active.applied pointer switched only while the daemon is stopped; folded into return catch-up and retired whole once it is acknowledged (bin/fm-away-ledger-lib.sh)
   pending-replies/   parent-owned secondmate pending-reply records (correlation id, delivery vs reply, recovery, escalation); fm-pending-reply-lib.sh
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated X-mode durable per-request reply context and one-wake offer markers, keyed by request_id; survives inbox cleanup and expires within seven days (section 14; bin/fm-x-lib.sh)

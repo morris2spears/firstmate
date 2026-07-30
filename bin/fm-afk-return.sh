@@ -125,12 +125,20 @@ print_blockers() {  # <file>
 }
 
 clear_delivery_artifacts() {
-  # Retire the complete owned unit through the ledger owner. Only ever called
-  # after the catch-up evidence above has folded the digests in, so an accepted
-  # one-shot escalation is never dropped here. The text-free <id>.status
-  # delivery evidence is deliberately kept.
+  # Retire the complete owned unit and every away batch version through the
+  # ledger owner. This is the ACKNOWLEDGEMENT boundary: it only runs once the
+  # catch-up evidence above has folded in the live digests and every retained
+  # version, and only once the gate has closed with no blocker left, so no
+  # actionable escalation text is dropped here and nothing survives to be
+  # presented a second time. The text-free <id>.status delivery evidence is
+  # deliberately kept.
+  local result=0
   away_ledger_retire_batch "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged"
+    "$STATE/.subsuper-inject-wedged" || result=1
+  away_ledger_versions_retire_all "$STATE" || result=1
+  [ "$result" -eq 0 ] \
+    || printf 'fm-afk-return: some away batch records could not be retired after catch-up\n' >&2
+  return "$result"
 }
 
 return_guard() {
@@ -147,7 +155,7 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations away_items retained lifecycle_ok=1
+  local evidence blockers drained wedge escalations away_items lifecycle_ok=1
   local fold_retained_rc=0
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
@@ -167,50 +175,48 @@ return_reconcile() {
   }
   append_evidence wake "$drained" "$evidence"
 
-  # Reclaim any complete buffer/sidecar/wedge group (and any digest text,
-  # unconditionally) stranded in a leftover launch-rollback backup BEFORE the
-  # live-unit evidence below is gathered, so an adopted group (only possible
-  # when the live unit was clear) is captured by those reads in this same pass
-  # instead of being adopted and then destroyed by clear_delivery_artifacts
-  # with no evidence ever recorded. Its result is not decided here - a real
-  # copy/prepare/removal failure (rc 1) or a live conflict (rc 2) both leave a
-  # backup for away_ledger_fold_retained_backups below to retry, which is the
-  # authoritative pass: it retries the same digest merge and, on the common
-  # transient fault, fully resolves it, so the lifecycle blocker is decided
-  # once after that pass has had its turn rather than on this result alone.
-  away_ledger_reclaim_backups "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged" 2>/dev/null || true
-
-  if [ -s "$STATE/.subsuper-inject-wedged" ]; then
-    wedge=$(head -1 "$STATE/.subsuper-inject-wedged" 2>/dev/null || true)
-    append_evidence wedge "$wedge" "$evidence"
-  fi
-  if [ -s "$STATE/.subsuper-escalations" ]; then
-    escalations=$(cat "$STATE/.subsuper-escalations" 2>/dev/null || true)
-    append_evidence escalation "$escalations" "$evidence"
-  fi
-  # Whatever away_ledger_reclaim_backups could not fully reconcile above (a
-  # live buffer/sidecar/wedge conflicted with a backup's group, or a digest
-  # item failed to merge) is folded here - including any digest text - from
-  # each backup's own preserved sidecar count, then removed; publication and
-  # removal are atomic per backup, so a genuine failure here (surfaced below)
-  # never leaves already-folded evidence behind to duplicate on the next
-  # catch-up.
-  retained=$(away_ledger_fold_retained_backups "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged" 2>/dev/null) || fold_retained_rc=$?
-  if [ -n "$retained" ]; then
-    append_evidence away-retained "$retained" "$evidence"
-  fi
-  if [ "$fold_retained_rc" -ne 0 ]; then
-    append_evidence lifecycle 'a leftover away-mode rollback backup could not be fully folded; retry catch-up before ordinary work' "$evidence"
-    lifecycle_ok=0
-  fi
+  # Every catch-up read below appends into the SAME evidence kind whether the text
+  # came from the live unit or from a retained immutable batch version, because a
+  # retained version's content is a prefix-subset of the live unit whenever the
+  # live unit was materialised from it. append_evidence dedupes exact records per
+  # kind, so each logical escalation reaches Firstmate exactly once instead of
+  # once per source under two different labels.
+  wedge=$(
+    if [ -s "$STATE/.subsuper-inject-wedged" ]; then
+      head -1 "$STATE/.subsuper-inject-wedged" 2>/dev/null || true
+    fi
+    away_ledger_fold_versions "$STATE" wedges 2>/dev/null || true
+  )
+  append_evidence wedge "$wedge" "$evidence"
+  # Only the lines the ledger has NOT already accounted for in a private away
+  # digest: anything at or below `accounted` is reported once below as
+  # away-telegram, and appending the whole buffer here would present the same
+  # escalation to Firstmate as two separate catch-up items to act on. An absent
+  # or unreadable record falls back to the whole buffer, so an unusable ledger
+  # over-reports rather than dropping a captain-relevant line.
+  #
+  # The retained side is every immutable away batch version still in the store:
+  # one whose active-pointer switch was refused (a daemon still live, e.g. after
+  # a failed stop), one whose launch transaction was abandoned, and the one a
+  # fresh away entry published before retiring that content from the live paths.
+  # All of it is read-only here; nothing is retired before the acknowledgement in
+  # clear_delivery_artifacts.
+  escalations=$(
+    away_ledger_unaccounted_lines "$STATE/.subsuper-escalations" 2>/dev/null || true
+    away_ledger_fold_versions "$STATE" escalations 2>/dev/null || exit 1
+  ) || fold_retained_rc=$?
+  append_evidence escalation "$escalations" "$evidence"
   # An accepted away batch has already been receipted and its buffer truncated, so
   # the ledger owner's private digests are the only local copy of those events.
   # Fold them in BEFORE anything retires them.
-  away_items=$(away_ledger_fold_digests "$STATE" 2>/dev/null || true)
-  if [ -n "$away_items" ]; then
-    append_evidence away-telegram "$away_items" "$evidence"
+  away_items=$(
+    away_ledger_fold_digests "$STATE" 2>/dev/null || true
+    away_ledger_fold_versions "$STATE" digests 2>/dev/null || exit 1
+  ) || fold_retained_rc=$?
+  append_evidence away-telegram "$away_items" "$evidence"
+  if [ "$fold_retained_rc" -ne 0 ]; then
+    append_evidence lifecycle 'a retained away-mode batch version could not be read; retry catch-up before ordinary work' "$evidence"
+    lifecycle_ok=0
   fi
 
   scan_open_blockers > "$blockers"

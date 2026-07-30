@@ -46,13 +46,14 @@
 # daemon, away start, and away return all agree on one state machine.
 #
 # All of it lives in the sidecar because every away lifecycle path already
-# retires, backs up, and restores that sidecar together with its buffer through
-# this owner's away_ledger_snapshot/away_ledger_restore/away_ledger_retire_batch,
-# never by enumerating the artifact set itself. away launch's crash rollback
-# copies the whole unit (buffer, sidecar, wedge marker, digest directory) as
-# opaque bytes rather than reading or advancing counts, so it cannot
-# desynchronise the state machine, and away-mode's own flag file is the one
-# artifact outside this unit - it belongs to the launcher, not the ledger.
+# retires, publishes, and restores that sidecar together with its buffer through
+# this owner's immutable version store (away_ledger_version_publish /
+# away_ledger_version_activate / away_ledger_retire_batch), never by enumerating
+# the artifact set itself. away launch's crash rollback publishes the whole unit
+# (buffer, sidecar, wedge marker, digest directory) as one opaque immutable
+# version rather than reading or advancing counts, so it cannot desynchronise the
+# state machine, and away-mode's own flag file is the one artifact outside this
+# unit - it belongs to the launcher, not the ledger.
 
 FM_AWAY_LEDGER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-x-lib.sh
@@ -309,8 +310,11 @@ away_ledger_retire() {  # <buf>
 }
 
 # Retire the away session's working records: the private digests, any leaked
-# spool, and any ledger temp. The text-free <id>.status delivery evidence is
-# deliberately kept, so accepted/failed/unavailable outcomes stay auditable.
+# spool, any ledger temp, and any abandoned version-store staging directory
+# (never a published version - those are retired only through
+# away_ledger_version_retire / away_ledger_versions_retire_all). The text-free
+# <id>.status delivery evidence is deliberately kept, so accepted/failed/
+# unavailable outcomes stay auditable.
 #
 # <preserve-digests>, when 1, keeps the digest directory intact. Callers pass 1
 # when this call is reached on a continuation of an already-active away session
@@ -322,71 +326,420 @@ away_ledger_retire_working_records() {  # <state> [preserve-digests]
   [ "$preserve" -eq 1 ] || rm -rf "$(away_ledger_digest_dir "$state")" 2>/dev/null
   rm -f "$(away_ledger_delivery_dir "$state")"/.spool.* \
         "$state"/.subsuper-escalations.since.* \
-        "$state"/.subsuper-escalations.reclaim.* \
-        "$state"/.subsuper-inject-wedged.reclaim.* 2>/dev/null
+        "$state"/.subsuper-escalations.apply.* \
+        "$state"/.subsuper-inject-wedged.apply.* 2>/dev/null
+  rm -rf "$(away_ledger_versions_dir "$state")"/.staging.* \
+         "$state"/.tg-away-digest.apply.* 2>/dev/null
   return 0
 }
 
-# The complete owned artifact unit for one away batch transaction: the
+# --------------------------------------------------------------------------
+# The immutable versioned batch store.
+#
+# The complete owned artifact unit for one away batch transaction is the
 # escalation buffer, its ledger sidecar, the wedge marker, and the private
 # digest directory - every artifact a crash or a failed re-entry must resume
 # exactly once from. The text-free <id>.status delivery evidence is NEVER part
-# of this unit: it outlives every snapshot/restore/retire of the batch above it,
-# so accepted/failed/unavailable outcomes stay auditable regardless of how many
+# of this unit: it outlives every version of the batch above it, so
+# accepted/failed/unavailable outcomes stay auditable regardless of how many
 # batches come and go over it.
 #
-# The away-mode lifecycle callers (launch, start, return) snapshot/restore/
-# retire through these functions only; they never enumerate or independently
-# delete an owned artifact themselves, so a rollback always restores the
-# complete prior unit or leaves a durable recoverable transaction - never a
-# partial mix of retired and restored pieces. The daemon's in-session success
-# path does not call away_ledger_retire_batch: it only truncates the buffer and
-# retires the sidecar/wedge marker, deliberately leaving the digest directory
-# alone, because the away session is still live and its digests may still be
-# needed by a later crash-recovery read or the eventual return fold.
+# A version is one COMPLETE copy of that unit in its own directory under
+# state/tg-away-versions:
+#
+#   .staging.XXXXXX/   a private in-progress build. Never listed, never read,
+#                      never activated; swept as an away working record.
+#   v.<epoch>-<nonce>/ a published version. Built in staging, validated against
+#                      its own manifest, and made visible by ONE rename, so a
+#                      crash can only ever leave a staging directory behind,
+#                      never a half-built version. The `.complete` marker
+#                      written last inside staging is the readable proof of
+#                      that, and any v.* directory lacking it is treated as
+#                      incomplete: ignored by every reader and swept by
+#                      away_ledger_version_gc.
+#   active             the single owner-controlled pointer naming the version
+#                      the live unit must hold. Written atomically, and that
+#                      write IS the commit point of a switch.
+#   active.applied     the version whose content has already been materialised
+#                      onto the live paths. active != active.applied means a
+#                      switch is still pending and is replayed, so an
+#                      interrupted switch converges instead of leaving the live
+#                      unit half-installed.
+#
+# Nothing is ever copied or merged INTO a published version, and no individual
+# file is ever merged into the live unit: a switch installs one version's whole
+# unit or leaves the live unit entirely alone, so a version's sidecar counts can
+# never be paired with a foreign buffer.
+#
+# A switch is only ever performed while no live away daemon holds the
+# supervise-daemon lock - checked inside this owner (away_ledger_daemon_live)
+# rather than trusted to callers, and reported as rc 3. The daemon is the sole
+# writer of the live buffer and its sidecar with no shared lock around them, so
+# installing a unit under a running daemon would overwrite a freshly appended
+# escalation that had never been reserved, digested, or shown in captain chat.
+# Callers therefore only ever switch BEFORE daemon start; a refused switch
+# leaves every version untouched and the return catch-up folds them instead.
+#
+# Versions are read - never mutated - by away_ledger_fold_versions at return,
+# and retired as WHOLE versions only once that catch-up is acknowledged.
 
-# Copy the complete owned unit into <backup> (a directory the caller owns and
-# is responsible for removing once it is no longer needed).
-away_ledger_snapshot() {  # <state> <buf> <wedge> <backup>
-  local state=$1 buf=$2 wedge=$3 backup=$4 artifact base digest_dir result=0
-  mkdir -p "$backup" || return 1
-  for artifact in "$buf" "${buf}.since" "$wedge"; do
-    base=${artifact##*/}
-    if [ -e "$artifact" ]; then
-      cp -p "$artifact" "$backup/$base" || result=1
+away_ledger_versions_dir() {  # <state>
+  printf '%s\n' "$1/tg-away-versions"
+}
+
+# A published version name: minted by this owner, never derived from a live
+# basename, and validated on every read so a pointer can only ever address a
+# version directory inside the store.
+away_ledger_version_name_valid() {  # <name>
+  case "${1:-}" in
+    v.*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!a-zA-Z0-9.-]*) return 1 ;;
+  esac
+  return 0
+}
+
+away_ledger_version_is_complete() {  # <version-dir>
+  [ -n "${1:-}" ] && [ -d "$1" ] && [ -f "$1/.complete" ] && [ -f "$1/manifest" ]
+}
+
+away_ledger_version_path() {  # <state> <name>
+  away_ledger_version_name_valid "${2:-}" || return 1
+  printf '%s\n' "$(away_ledger_versions_dir "$1")/$2"
+}
+
+# Whether a live away daemon holds the supervise-daemon lock right now. Derived
+# from <state> alone - never from a caller-supplied claim - and fail-closed: an
+# owner whose recorded pid is alive counts as live, so an ambiguous lock refuses
+# a pointer switch rather than racing a possible writer.
+away_ledger_daemon_live() {  # <state>
+  local lock="$1/.supervise-daemon.lock" owner pid
+  if [ -L "$lock" ]; then
+    owner=$(readlink "$lock" 2>/dev/null) || return 1
+    [ -n "$owner" ] || return 1
+    case "$owner" in
+      /*) ;;
+      *) owner="$1/$owner" ;;
+    esac
+  elif [ -d "$lock" ]; then
+    owner=$lock
+  else
+    return 1
+  fi
+  pid=$(head -n 1 "$owner/pid" 2>/dev/null || true)
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+# Same-directory mktemp plus mv, so a reader never sees a half-written pointer.
+# The temp lives under the store's own .pointer. prefix, so it can never be
+# mistaken for a version and is swept by away_ledger_version_gc.
+away_ledger_pointer_write() {  # <versions-dir> active|active.applied <name>
+  local dir=$1 base=$2 name=$3 tmp
+  away_ledger_version_name_valid "$name" || return 1
+  case "$base" in
+    active|active.applied) ;;
+    *) return 1 ;;
+  esac
+  tmp=$(umask 077; mktemp "$dir/.pointer.XXXXXX" 2>/dev/null) || return 1
+  if ! printf '%s\n' "$name" > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$dir/$base" 2>/dev/null; then
+    rm -f -- "$tmp" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+away_ledger_pointer_read() {  # <pointer-file>
+  local name
+  name=$(head -n 1 "${1:-}" 2>/dev/null || true)
+  away_ledger_version_name_valid "$name" || return 1
+  printf '%s\n' "$name"
+}
+
+# Publish the CURRENT live unit as one new immutable version and print its name.
+# Built entirely inside a private staging directory, validated against the
+# manifest it wrote, marked complete, and published by a single rename - so a
+# failure or a crash at any point leaves only staging behind and never a
+# partially published version a later caller could activate.
+away_ledger_version_publish() {  # <state> <buf> <wedge>
+  local state=$1 buf=$2 wedge=$3 dir staging name digest_dir slot artifact i
+  local -a artifacts slots
+  dir=$(away_ledger_versions_dir "$state")
+  fmx_private_artifact_dir_prepare "$dir" >/dev/null 2>&1 || return 1
+  staging=$(umask 077; mktemp -d "$dir/.staging.XXXXXX" 2>/dev/null) || return 1
+  artifacts=("$buf" "${buf}.since" "$wedge")
+  slots=(escalations escalations.since wedge)
+  if ! : > "$staging/manifest" 2>/dev/null; then
+    rm -rf -- "$staging" 2>/dev/null
+    return 1
+  fi
+  i=0
+  while [ "$i" -lt "${#slots[@]}" ]; do
+    artifact=${artifacts[$i]}
+    slot=${slots[$i]}
+    i=$((i + 1))
+    [ -e "$artifact" ] || continue
+    if ! cp -p "$artifact" "$staging/$slot" 2>/dev/null \
+      || ! printf '%s\n' "$slot" >> "$staging/manifest" 2>/dev/null; then
+      rm -rf -- "$staging" 2>/dev/null
+      return 1
     fi
   done
   digest_dir=$(away_ledger_digest_dir "$state")
   if [ -d "$digest_dir" ]; then
-    cp -pR "$digest_dir" "$backup/tg-away-digest" || result=1
+    if ! cp -pR "$digest_dir" "$staging/tg-away-digest" 2>/dev/null \
+      || ! printf '%s\n' tg-away-digest >> "$staging/manifest" 2>/dev/null; then
+      rm -rf -- "$staging" 2>/dev/null
+      return 1
+    fi
   fi
+  while IFS= read -r slot; do
+    [ -n "$slot" ] || continue
+    if [ ! -e "$staging/$slot" ]; then
+      rm -rf -- "$staging" 2>/dev/null
+      return 1
+    fi
+  done < "$staging/manifest"
+  if ! : > "$staging/.complete" 2>/dev/null; then
+    rm -rf -- "$staging" 2>/dev/null
+    return 1
+  fi
+  name="v.$(away_ledger_mint_id)"
+  if ! mv "$staging" "$dir/$name" 2>/dev/null; then
+    rm -rf -- "$staging" 2>/dev/null
+    return 1
+  fi
+  printf '%s\n' "$name"
+  return 0
+}
+
+# Every COMPLETE published version, oldest first (the minted name carries the
+# publication epoch). An incomplete directory is never listed, so no reader can
+# act on a version that was never validated.
+away_ledger_version_names() {  # <state>
+  local dir v name
+  dir=$(away_ledger_versions_dir "$1")
+  [ -d "$dir" ] || return 0
+  for v in "$dir"/v.*; do
+    away_ledger_version_is_complete "$v" || continue
+    name=${v##*/}
+    away_ledger_version_name_valid "$name" || continue
+    printf '%s\n' "$name"
+  done | sort
+  return 0
+}
+
+# Drop everything the store must never act on: abandoned staging builds, leaked
+# pointer temps, and any version directory that is not provably complete. Never
+# touches a complete version or a pointer, so it is safe to run at any moment,
+# including while a daemon is live.
+away_ledger_version_gc() {  # <state>
+  local dir v result=0
+  dir=$(away_ledger_versions_dir "$1")
+  [ -d "$dir" ] || return 0
+  rm -rf -- "$dir"/.staging.* 2>/dev/null
+  rm -f -- "$dir"/.pointer.* 2>/dev/null
+  for v in "$dir"/v.*; do
+    [ -e "$v" ] || continue
+    away_ledger_version_is_complete "$v" && continue
+    rm -rf -- "$v" || result=1
+  done
   return "$result"
 }
 
-# Replace the complete owned unit with what <backup> holds (dropping whatever
-# is currently on disk first), so a caller never ends up with some artifacts
-# restored and others left from the failed attempt.
-away_ledger_restore() {  # <state> <buf> <wedge> <backup>
-  local state=$1 buf=$2 wedge=$3 backup=$4 artifact base digest_dir result=0
-  rm -f "$buf" "${buf}.since" "$wedge" || result=1
+# THE pointer switch, and the only way a version's content ever reaches the live
+# paths. Refuses an unknown or incomplete version (rc 1) and refuses outright
+# while a live daemon holds the lock (rc 3); either way every version and the
+# live unit are left exactly as they were.
+away_ledger_version_activate() {  # <state> <buf> <wedge> <name>
+  local state=$1 buf=$2 wedge=$3 name=$4 dir vdir
+  vdir=$(away_ledger_version_path "$state" "$name") || return 1
+  away_ledger_version_is_complete "$vdir" || return 1
+  if away_ledger_daemon_live "$state"; then
+    return 3
+  fi
+  dir=$(away_ledger_versions_dir "$state")
+  away_ledger_pointer_write "$dir" active "$name" || return 1
+  away_ledger_version_apply_pending "$state" "$buf" "$wedge"
+}
+
+# Replay a switch whose materialisation has not completed. Idempotent: with no
+# pointer, or with the pointer already applied, it is a no-op. Callers run it
+# before daemon start so an interrupted switch converges; it refuses (rc 3)
+# while a daemon is live, so it can never race the daemon's own writes.
+away_ledger_version_apply_pending() {  # <state> <buf> <wedge>
+  local state=$1 buf=$2 wedge=$3 dir name applied vdir
+  dir=$(away_ledger_versions_dir "$state")
+  [ -d "$dir" ] || return 0
+  name=$(away_ledger_pointer_read "$dir/active") || return 0
+  applied=$(away_ledger_pointer_read "$dir/active.applied" 2>/dev/null || true)
+  [ "$name" != "$applied" ] || return 0
+  vdir="$dir/$name"
+  away_ledger_version_is_complete "$vdir" || return 1
+  if away_ledger_daemon_live "$state"; then
+    return 3
+  fi
+  away_ledger_version_materialise "$state" "$buf" "$wedge" "$vdir" || return 1
+  away_ledger_pointer_write "$dir" active.applied "$name"
+}
+
+# Install ONE version's whole unit onto the live paths, dropping whatever is
+# there first, so no live artifact is ever left paired with a foreign version's
+# counts. Every file lands through a same-directory mktemp-then-mv and the
+# digest directory through a staged rename, so a reader elsewhere can never
+# observe a half-copied artifact. A failure leaves the pointer unapplied, which
+# is what makes the replay above safe to re-run.
+away_ledger_version_materialise() {  # <state> <buf> <wedge> <version-dir>
+  local state=$1 buf=$2 wedge=$3 vdir=$4 digest_dir slot artifact tmp i
+  local -a artifacts slots
+  artifacts=("$buf" "${buf}.since" "$wedge")
+  slots=(escalations escalations.since wedge)
   digest_dir=$(away_ledger_digest_dir "$state")
-  rm -rf "$digest_dir" || result=1
-  for artifact in "$buf" "${buf}.since" "$wedge"; do
-    base=${artifact##*/}
-    if [ -e "$backup/$base" ]; then
-      cp -p "$backup/$base" "$artifact" || result=1
+  rm -f -- "$buf" "${buf}.since" "$wedge" 2>/dev/null || return 1
+  rm -rf -- "$digest_dir" 2>/dev/null || return 1
+  i=0
+  while [ "$i" -lt "${#slots[@]}" ]; do
+    artifact=${artifacts[$i]}
+    slot=${slots[$i]}
+    i=$((i + 1))
+    [ -e "$vdir/$slot" ] || continue
+    tmp=$(umask 077; mktemp "${artifact}.apply.XXXXXX" 2>/dev/null) || return 1
+    if ! cp -p "$vdir/$slot" "$tmp" 2>/dev/null || ! mv -f "$tmp" "$artifact" 2>/dev/null; then
+      rm -f -- "$tmp" 2>/dev/null
+      return 1
     fi
   done
-  if [ -d "$backup/tg-away-digest" ]; then
-    cp -pR "$backup/tg-away-digest" "$digest_dir" || result=1
+  if [ -d "$vdir/tg-away-digest" ]; then
+    tmp=$(umask 077; mktemp -d "$state/.tg-away-digest.apply.XXXXXX" 2>/dev/null) || return 1
+    if ! cp -pR "$vdir/tg-away-digest/." "$tmp/" 2>/dev/null \
+      || ! chmod 700 "$tmp" 2>/dev/null \
+      || ! mv "$tmp" "$digest_dir" 2>/dev/null; then
+      rm -rf -- "$tmp" 2>/dev/null
+      return 1
+    fi
   fi
+  return 0
+}
+
+# Retire ONE whole version. Any pointer naming it is cleared FIRST, so a crash
+# can never leave a pointer aimed at a version that no longer exists.
+away_ledger_version_retire() {  # <state> <name>
+  local state=$1 name=$2 dir vdir pointer current result=0
+  vdir=$(away_ledger_version_path "$state" "$name") || return 1
+  dir=$(away_ledger_versions_dir "$state")
+  for pointer in active active.applied; do
+    current=$(away_ledger_pointer_read "$dir/$pointer" 2>/dev/null || true)
+    [ "$current" = "$name" ] || continue
+    rm -f -- "$dir/$pointer" || result=1
+  done
+  rm -rf -- "$vdir" || result=1
   return "$result"
 }
 
-# Retire the complete owned unit for a lifecycle boundary (a fresh away entry,
-# a mid-session restart, or a completed return catch-up): the escalation
-# buffer, the wedge marker, the ledger sidecar, and this session's working
-# records.
+# Retire the WHOLE version store. Called only once a return catch-up has been
+# acknowledged: every version's actionable content has reached that catch-up's
+# durable evidence by then, so nothing retired here can resurface as a duplicate
+# delivery, and nothing is retired while a catch-up is still pending.
+away_ledger_versions_retire_all() {  # <state>
+  local dir result=0
+  dir=$(away_ledger_versions_dir "$1")
+  [ -d "$dir" ] || return 0
+  rm -f -- "$dir/active" "$dir/active.applied" "$dir"/.pointer.* || result=1
+  rm -rf -- "$dir"/v.* "$dir"/.staging.* || result=1
+  rmdir "$dir" 2>/dev/null || true
+  return "$result"
+}
+
+# Print the lines of <buf> that no digest has accounted for yet, one per line -
+# the lines that still have to reach captain chat. Falls back to the whole
+# buffer whenever the record is absent or `unknown`, so an unreadable ledger
+# over-reports to the visible catch-up instead of dropping a captain-relevant
+# line.
+away_ledger_unaccounted_lines() {  # <buf>
+  local buf=$1 rec accounted=0 n
+  [ -s "$buf" ] || return 0
+  if [ -f "${buf}.since" ]; then
+    rec=$(away_ledger_read "$buf" 2>/dev/null || true)
+    if [ -n "$rec" ] && [ "$rec" != unknown ]; then
+      IFS=' ' read -r _ _ _ accounted _ _ _ <<< "$rec"
+      away_ledger_is_count "$accounted" || accounted=0
+    fi
+  fi
+  n=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
+  [ "$n" -gt "$accounted" ] || return 0
+  tail -n "+$((accounted + 1))" "$buf" 2>/dev/null || return 1
+  return 0
+}
+
+# Print ONE kind of actionable content held by every RETAINED version, so a
+# version whose switch was refused (a live daemon, a failed stop), whose
+# transaction was abandoned, or whose content a fresh away entry retired from the
+# live paths still reaches the return catch-up instead of ageing out silently.
+#
+# Read-only: nothing is retired, renamed, or marked here, so a crash mid
+# catch-up simply re-reads the same versions next time, and the retirement that
+# eventually removes them happens only after acknowledgement.
+#
+# One kind per call, so a caller can append each to the SAME evidence kind its
+# own live read uses. That is what makes each logical escalation appear exactly
+# once: a version's content is a prefix-subset of the live unit whenever the live
+# unit was materialised from it, and identical lines under one evidence kind
+# collapse in the caller's own dedupe instead of being presented twice under two
+# different labels.
+#
+#   escalations  the lines past each version's OWN accounted count - never
+#                anything that version's own digests already carry.
+#   wedges       each version's wedge marker line.
+#   digests      each version's digest items whose delivery id is not already
+#                live, since one delivery id always names the same text.
+away_ledger_fold_versions() {  # <state> escalations|wedges|digests
+  local state=$1 kind=$2 dir name vdir digest_dir f base
+  case "$kind" in
+    escalations|wedges|digests) ;;
+    *) return 1 ;;
+  esac
+  dir=$(away_ledger_versions_dir "$state")
+  [ -d "$dir" ] || return 0
+  digest_dir=$(away_ledger_digest_dir "$state")
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    vdir="$dir/$name"
+    case "$kind" in
+      escalations)
+        away_ledger_unaccounted_lines "$vdir/escalations" || return 1
+        ;;
+      wedges)
+        if [ -s "$vdir/wedge" ]; then
+          head -n 1 "$vdir/wedge" 2>/dev/null || return 1
+        fi
+        ;;
+      digests)
+        for f in "$vdir"/tg-away-digest/*.items; do
+          [ -f "$f" ] || continue
+          base=${f##*/}
+          if [ -e "$digest_dir/$base" ]; then
+            continue
+          fi
+          cat "$f" 2>/dev/null || return 1
+        done
+        ;;
+    esac
+  done <<EOF
+$(away_ledger_version_names "$state")
+EOF
+  return 0
+}
+
+# Retire the complete owned unit for a lifecycle boundary (a fresh away entry, a
+# mid-session restart, or a completed return catch-up): the escalation buffer,
+# the wedge marker, the ledger sidecar, and this session's working records. The
+# version store is deliberately NOT touched here - a launch transaction calls
+# this while its own rollback version is the only surviving copy of the prior
+# unit.
 #
 # <preserve-digests>, when 1, keeps the digest directory intact (see
 # away_ledger_retire_working_records) - callers pass 1 on a continuation of an
@@ -396,261 +749,5 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
   rm -f "$buf" "$wedge" 2>/dev/null || result=1
   away_ledger_retire "$buf" || result=1
   away_ledger_retire_working_records "$state" "$preserve" || result=1
-  return "$result"
-}
-
-# Reclaim every leftover rollback-backup directory under <state> (this owner's
-# own glob, built from the quoted state directory so a space or glob byte in
-# it can never word-split before the trailing `*` globs - callers pass only
-# the directory, never a prejoined pattern): a backup only survives past its
-# own transaction when away_ledger_restore reported a failure and the caller
-# (fm-afk-launch.sh) deliberately kept it rather than risk a partial restore.
-# Two kinds of artifact inside it are
-# treated differently:
-#
-#   digest text        merged into the live digest directory by delivery id,
-#                       never overwriting an existing file there - a live
-#                       <delivery-id>.items is always the same content, since
-#                       delivery ids are unique per attempt, so this is always
-#                       safe regardless of what else is live.
-#
-#   buffer + sidecar +  treated as ONE opaque unit, never gap-filled
-#   wedge marker        artifact-by-artifact: the sidecar's reserved/confirmed/
-#                       accounted counts are offsets into that EXACT buffer, so
-#                       pairing a live buffer with a foreign backup sidecar (or
-#                       vice versa) would silently misattribute counts onto
-#                       unrelated escalation lines. The unit is adopted whole
-#                       only when the live buffer, sidecar, and wedge marker
-#                       are ALL absent (nothing live to conflict with); if any
-#                       one of them is already live, the whole unit is left
-#                       untouched inside the backup rather than partially
-#                       merged or discarded, so a live session's lines are
-#                       never shadowed and a backup's undigested lines are
-#                       never silently lost - the backup simply waits for a
-#                       later reclaim once the live unit clears (e.g. after
-#                       the away session that owns it ends).
-#
-# The backup is removed only once every artifact it holds has been reconciled
-# onto the live unit (digest merge) or adopted as a whole (buffer/sidecar/
-# wedge) or was already redundant with what is live; a real copy/prepare/
-# removal failure anywhere leaves the complete backup in place rather than
-# discarding a copy that was never actually merged. Called before a new
-# transaction begins (an already-running daemon's refresh) or after a launch
-# transaction fully resolves (success or rollback), and at return, so no copy
-# of actionable escalation text can outlive recovery, and never while a
-# transaction is open, so a rollback can never erase what reclaim merged in.
-#
-# <digests-only>, when 1, never adopts a backup's buffer/sidecar/wedge group -
-# only digest text is merged. Callers pass 1 on a live-daemon refresh: the
-# daemon is the sole writer of the buffer and its sidecar with no shared lock
-# around them, so an adoption there would race a concurrent escalate_add (the
-# freshly appended line would be overwritten) and never be reserved, digested,
-# or reach captain chat. A backup with a group left untouched this way is
-# reported as deferred, exactly like a live-path conflict, since it is not a
-# fault - the group is simply not this call's to adopt.
-#
-# Group adoption itself writes each artifact through the same same-directory
-# mktemp-then-mv pattern away_ledger_write uses for the sidecar, so a reader
-# elsewhere can never observe a half-copied file. Adoption is only ever
-# attempted when all three live paths are provably absent, so if a later
-# artifact in the group fails partway through, every artifact this call
-# already committed live is unlinked before the failure is reported - the
-# live unit is restored to the same absence it started this call in, and the
-# backup remains the single complete copy, never a sidecar-less live buffer.
-#
-# Return status distinguishes an ordinary wait state from a real fault:
-#   0  every backup was fully reconciled (or none matched the glob)
-#   2  deferred only - a live buffer/sidecar/wedge conflicts with at least one
-#      backup's group (or digests-only mode left one untouched), so that
-#      backup was correctly left untouched; this is the normal state during
-#      an active away session and is not a failure
-#   1  a real copy, directory-prepare, or removal failure occurred; callers
-#      should surface this one, unlike the merely-deferred status above
-away_ledger_reclaim_backups() {  # <state> <buf> <wedge> [digests-only]
-  local state=$1 buf=$2 wedge=$3 digests_only=${4:-0}
-  local backup digest_dir artifact base f ok real_fail group_clear_to_adopt group_ok
-  local dir tmp result=0 deferred=0
-  local -a committed
-  digest_dir=$(away_ledger_digest_dir "$state")
-  for backup in "$state"/.afk-launch-backup.*; do
-    [ -d "$backup" ] || continue
-    case "$backup" in
-      *.consumed)
-        rm -rf "$backup" || result=1
-        continue
-        ;;
-    esac
-    if [ -e "$backup/.fold-published" ]; then
-      rm -rf "$backup" || result=1
-      continue
-    fi
-    ok=1
-    real_fail=0
-    if [ -d "$backup/tg-away-digest" ]; then
-      if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
-        for f in "$backup/tg-away-digest"/*.items; do
-          [ -f "$f" ] || continue
-          base=${f##*/}
-          if [ -e "$digest_dir/$base" ]; then
-            :
-          elif ! cp -p "$f" "$digest_dir/$base"; then
-            ok=0; real_fail=1
-          fi
-        done
-      else
-        ok=0; real_fail=1
-      fi
-    fi
-    if [ -e "$backup/${buf##*/}" ] || [ -e "$backup/${buf##*/}.since" ] \
-      || [ -e "$backup/${wedge##*/}" ]; then
-      group_clear_to_adopt=0
-      if [ "$digests_only" -ne 1 ]; then
-        [ -e "$buf" ] || [ -e "${buf}.since" ] || [ -e "$wedge" ] || group_clear_to_adopt=1
-      fi
-      if [ "$group_clear_to_adopt" -eq 1 ]; then
-        group_ok=1
-        committed=()
-        for artifact in "$buf" "${buf}.since" "$wedge"; do
-          base=${artifact##*/}
-          [ -e "$backup/$base" ] || continue
-          dir=${artifact%/*}
-          if tmp=$(umask 077; mktemp "$dir/${base}.reclaim.XXXXXX" 2>/dev/null) \
-            && cp -p "$backup/$base" "$tmp" 2>/dev/null && mv -f "$tmp" "$artifact" 2>/dev/null; then
-            committed+=("$artifact")
-          else
-            rm -f -- "${tmp:-}" 2>/dev/null
-            group_ok=0; ok=0; real_fail=1
-            break
-          fi
-        done
-        if [ "$group_ok" -eq 1 ]; then
-          # Consume the group from the backup as soon as it is fully adopted,
-          # independent of any unrelated digest-merge outcome above, so a
-          # digest failure alone can never leave an already-adopted group
-          # sitting in the backup to be folded a second time by
-          # away_ledger_fold_retained_backups.
-          rm -f "$backup/${buf##*/}" "$backup/${buf##*/}.since" "$backup/${wedge##*/}" \
-            || { ok=0; real_fail=1; }
-        else
-          # A partial group was never valid without every artifact - undo
-          # whatever this call already committed live, so the live unit stays
-          # exactly as absent as it was before adoption began and the backup
-          # remains the single complete copy.
-          [ "${#committed[@]}" -eq 0 ] || rm -f -- "${committed[@]}" 2>/dev/null
-        fi
-      else
-        ok=0
-        deferred=1
-      fi
-    fi
-    if [ "$ok" -eq 1 ]; then
-      rm -rf "$backup" || { result=1; real_fail=1; }
-    elif [ "$real_fail" -eq 1 ]; then
-      result=1
-    fi
-  done
-  [ "$result" -eq 0 ] || return 1
-  [ "$deferred" -eq 0 ] || return 2
-  return 0
-}
-
-# Fold the actionable content of every backup that away_ledger_reclaim_backups
-# left behind directly into the caller's evidence, then remove it - so a
-# backup blocked from adoption by a live conflict (deferred) or still holding
-# an unmerged digest item (a real reclaim failure) is never silently
-# discarded, and never left to resurface as a duplicate delivery once the
-# conflict clears or the merge succeeds. A backup's digest text is folded here
-# too rather than assumed already reconciled: away_ledger_reclaim_backups
-# leaves a backup fully intact - digest items included - whenever even one of
-# its digest items failed to merge, so this is the only path some digest text
-# may ever go through.
-#
-# Reads each backup's own escalation count through its own preserved sidecar
-# (away_ledger_read against the backup's own buffer path), so only the lines
-# past that backup's own accounted count - never anything already digested -
-# are printed, one whitespace-joined line per backup, tagged so the caller can
-# label it distinctly from the live buffer's own evidence.
-#
-# Evidence is printed BEFORE the backup is ever touched, so a crash at any
-# point afterward - mid-rename, mid-removal, or between the two - can never
-# discard content that was never published: the worst it can leave behind is
-# a `.consumed` marker (or the original backup, untouched) for a later call to
-# retry, and any re-print that results is a harmless duplicate a caller's own
-# dedupe absorbs (as it does at return). The same-directory `mv` to a
-# `.consumed` marker is still the removal's own commit point, so `rm -rf`
-# unlinking in unspecified order can never both destroy content and suppress
-# already-published evidence: a later call recognizes the marker by name and
-# retries only the removal, never re-reading or re-printing its content. If
-# even the rename fails, a `.fold-published` sentinel is written inside the
-# backup before falling back to removing it in place, so away_ledger_reclaim_
-# backups (which checks for that sentinel too) can never adopt a backup whose
-# content already reached the catch-up evidence under a different, non-
-# deduplicated kind.
-away_ledger_fold_retained_backups() {  # <state> <buf> <wedge>
-  local state=$1 buf=$2 wedge=$3
-  local backup bbuf accounted rec n body wedge_body digest_dir f base ok consumed result=0
-  digest_dir=$(away_ledger_digest_dir "$state")
-  for backup in "$state"/.afk-launch-backup.*; do
-    [ -d "$backup" ] || continue
-    case "$backup" in
-      *.consumed)
-        rm -rf "$backup" || result=1
-        continue
-        ;;
-    esac
-    if [ -e "$backup/.fold-published" ]; then
-      rm -rf "$backup" || result=1
-      continue
-    fi
-    ok=1
-    if [ -d "$backup/tg-away-digest" ]; then
-      if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
-        for f in "$backup/tg-away-digest"/*.items; do
-          [ -f "$f" ] || continue
-          base=${f##*/}
-          if [ -e "$digest_dir/$base" ]; then
-            :
-          elif ! cp -p "$f" "$digest_dir/$base"; then
-            ok=0
-          fi
-        done
-      else
-        ok=0
-      fi
-    fi
-    if [ "$ok" -ne 1 ]; then
-      result=1
-      continue
-    fi
-
-    bbuf="$backup/${buf##*/}"
-    accounted=0
-    if [ -f "$bbuf" ] && [ -f "${bbuf}.since" ]; then
-      rec=$(away_ledger_read "$bbuf")
-      if [ "$rec" != unknown ]; then
-        IFS=' ' read -r _ _ _ accounted _ _ _ <<< "$rec"
-      fi
-    fi
-    body=''
-    if [ -f "$bbuf" ]; then
-      n=$(( $(wc -l < "$bbuf" 2>/dev/null || echo 0) ))
-      if [ "$n" -gt "$accounted" ]; then
-        body=$(tail -n "+$((accounted + 1))" "$bbuf" 2>/dev/null \
-          | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
-      fi
-    fi
-    wedge_body=''
-    [ -s "$backup/${wedge##*/}" ] && wedge_body=$(head -1 "$backup/${wedge##*/}" 2>/dev/null)
-
-    [ -z "$body" ] || printf '%s\n' "$body"
-    [ -z "$wedge_body" ] || printf 'wedge: %s\n' "$wedge_body"
-    consumed="${backup}.consumed"
-    if mv "$backup" "$consumed" 2>/dev/null; then
-      rm -rf "$consumed" || result=1
-    else
-      : > "$backup/.fold-published" 2>/dev/null
-      rm -rf "$backup" || result=1
-    fi
-  done
   return "$result"
 }

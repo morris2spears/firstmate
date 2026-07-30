@@ -451,6 +451,9 @@ classify_unknown() {  # <reason>
 #           owned by fm-away-ledger-lib.sh.
 #           state/tg-away-digest/<id>.items        private 0600 copy of the
 #           accepted items, the working record the receipt points Firstmate at.
+#           state/tg-away-versions/v.<id>/         one complete immutable copy
+#           of that whole unit per lifecycle transaction, reached only by the
+#           store's single active pointer and only while the daemon is stopped.
 
 _stale_key() { printf '%s' "$1" | tr ':/.' '___'; }
 

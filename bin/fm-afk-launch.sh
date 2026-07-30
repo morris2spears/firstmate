@@ -89,13 +89,30 @@ set +e
 
 fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 
-# A deferred status (rc 2: a live buffer/sidecar/wedge conflicts with a
-# retained backup's group) is the normal state during an active away session
-# and is not logged; only a real copy/prepare/removal failure (rc 1) is.
-fm_afk_launch_reclaim_backups() {
+# Sweep the away batch version store of everything that was never published
+# (abandoned staging builds, pointer temps, incomplete version directories).
+# Safe at any moment, including while a daemon is live: it never touches a
+# complete version or the active pointer.
+fm_afk_launch_versions_sweep() {
+  away_ledger_version_gc "$FM_AFK_LAUNCH_STATE" \
+    || fm_afk_launch_log "could not sweep incomplete away batch versions"
+  return 0
+}
+
+# Make the version store consistent BEFORE a daemon can be started: sweep, then
+# replay an interrupted active-pointer switch. This is the only point in the
+# launcher where a version's content may reach the live paths, and the owner
+# itself refuses the switch (rc 3) if a daemon is live, so no post-start switch
+# is possible even by mistake. A refusal is not a fault - the version stays
+# published and the return catch-up folds it.
+fm_afk_launch_versions_prepare() {
   local rc=0
-  away_ledger_reclaim_backups "$@" || rc=$?
-  [ "$rc" -ne 1 ] || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
+  fm_afk_launch_versions_sweep
+  away_ledger_version_apply_pending "$FM_AFK_LAUNCH_STATE" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" || rc=$?
+  [ "$rc" -ne 1 ] \
+    || fm_afk_launch_log "could not finish an interrupted away batch version switch"
   return 0
 }
 
@@ -367,18 +384,30 @@ fm_afk_launch_reconcile() {
   fi
 }
 
-fm_afk_launch_restore_backup() {  # <backup> <had-afk>
-  local backup=$1 had_afk=$2 result=0
+# Roll the away lifecycle back to the immutable version published before this
+# transaction began: ONE atomic active-pointer switch onto that whole version,
+# never a per-file copy into the live paths. The away-mode flag is the
+# launcher's own artifact, not part of the ledger's unit, so it is restored here
+# from the value captured before the attempt.
+#
+# A refused switch (rc 3: a daemon is live) or a failed materialisation leaves
+# the version published and retained, so its escalation text reaches the return
+# catch-up instead of being lost - the transaction is reported as failed either
+# way.
+fm_afk_launch_rollback() {  # <version> <had-afk> <afk-content>
+  local version=$1 had_afk=$2 afk=$3 result=0 rc=0
   rm -f "$FM_AFK_LAUNCH_STATE/.afk" || result=1
-  away_ledger_restore "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$backup" || result=1
+  away_ledger_version_activate "$FM_AFK_LAUNCH_STATE" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$version" || rc=$?
   if [ "$had_afk" -eq 1 ]; then
-    cp "$backup/.afk" "$FM_AFK_LAUNCH_STATE/.afk" || result=1
+    printf '%s\n' "$afk" > "$FM_AFK_LAUNCH_STATE/.afk" || result=1
   fi
-  if [ "$result" -eq 0 ]; then
-    rm -rf "$backup" || return 1
+  if [ "$rc" -eq 0 ]; then
+    away_ledger_version_retire "$FM_AFK_LAUNCH_STATE" "$version" || result=1
   else
-    fm_afk_launch_log "rollback restoration incomplete; backup retained at $backup"
+    result=1
+    fm_afk_launch_log "rollback could not switch to away batch version $version; it is retained for the return catch-up"
   fi
   return "$result"
 }
@@ -465,7 +494,7 @@ fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend>
 }
 
 fm_afk_launch_start() {
-  local captain_target captain_backend backup had_afk=0 result
+  local captain_target captain_backend version afk_content='' had_afk=0 result
   if [ -e "$FM_AFK_LAUNCH_STATE/.afk-return-catchup" ]; then
     fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
     return 1
@@ -480,8 +509,7 @@ fm_afk_launch_start() {
 
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
-    fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" 1
+    fm_afk_launch_versions_sweep
     if ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to refresh away-mode flag"
       return 1
@@ -490,15 +518,17 @@ fm_afk_launch_start() {
     return 0
   fi
 
-  backup=$(mktemp -d "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.XXXXXX") || return 1
+  fm_afk_launch_versions_prepare
   if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
     had_afk=1
-    cp "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
+    afk_content=$(cat "$FM_AFK_LAUNCH_STATE/.afk" 2>/dev/null) || return 1
   fi
-  if ! away_ledger_snapshot "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$backup"; then
-    rm -rf "$backup"; return 1
-  fi
+  version=$(away_ledger_version_publish "$FM_AFK_LAUNCH_STATE" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged") || {
+      fm_afk_launch_log "could not publish the pre-launch away batch version"
+      return 1
+    }
   if ! fm_afk_launch_reconcile; then
     result=1
   else
@@ -526,18 +556,19 @@ fm_afk_launch_start() {
         ;;
     esac
   fi
+  # On success the published version is deliberately RETAINED: this entry has
+  # just retired the previous session's unit from the live paths, so that version
+  # is the only surviving copy of any line it still owed captain chat. The return
+  # catch-up folds it and retires it, so nothing is discarded before
+  # acknowledgement.
   if [ "$result" -ne 0 ]; then
-    fm_afk_launch_restore_backup "$backup" "$had_afk" || result=1
-  else
-    rm -rf "$backup" || result=1
+    fm_afk_launch_rollback "$version" "$had_afk" "$afk_content" || result=1
   fi
-  fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged"
   return "$result"
 }
 
 fm_afk_launch_start_native() {
-  local backup had_afk=0 result=0
+  local version afk_content='' had_afk=0 result=0
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   if [ -e "$FM_AFK_LAUNCH_STATE/.afk-return-catchup" ]; then
     fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
@@ -545,21 +576,22 @@ fm_afk_launch_start_native() {
   fi
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
-    fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" 1
+    fm_afk_launch_versions_sweep
     fm_afk_launch_flag_write || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0
   fi
-  backup=$(mktemp -d "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.XXXXXX") || return 1
+  fm_afk_launch_versions_prepare
   if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
     had_afk=1
-    cp "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
+    afk_content=$(cat "$FM_AFK_LAUNCH_STATE/.afk" 2>/dev/null) || return 1
   fi
-  if ! away_ledger_snapshot "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$backup"; then
-    rm -rf "$backup"; return 1
-  fi
+  version=$(away_ledger_version_publish "$FM_AFK_LAUNCH_STATE" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged") || {
+      fm_afk_launch_log "could not publish the pre-launch away batch version"
+      return 1
+    }
   fm_afk_launch_reconcile || result=1
   if [ "$result" -eq 0 ]; then
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" "$had_afk"; then
@@ -573,13 +605,14 @@ fm_afk_launch_start_native() {
   if [ "$result" -eq 0 ]; then
     fm_afk_launch_record_write none - native || result=1
   fi
+  # On success the published version is deliberately RETAINED: this entry has
+  # just retired the previous session's unit from the live paths, so that version
+  # is the only surviving copy of any line it still owed captain chat. The return
+  # catch-up folds it and retires it, so nothing is discarded before
+  # acknowledgement.
   if [ "$result" -ne 0 ]; then
-    fm_afk_launch_restore_backup "$backup" "$had_afk" || result=1
-  else
-    rm -rf "$backup" || result=1
+    fm_afk_launch_rollback "$version" "$had_afk" "$afk_content" || result=1
   fi
-  fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged"
   return "$result"
 }
 
