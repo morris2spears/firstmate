@@ -1,13 +1,13 @@
 // Firstmate's home-persistent Pi transcript presentation toggle.
 //
-// Verified against Pi 0.81.1 and 0.82.0, which expose built-in ToolDefinitions, per-slot
-// renderers, renderShell: "self", session_start replacement reasons,
+// Verified against Pi 0.81.1 through 0.82.1, which expose built-in ToolDefinitions,
+// per-slot renderers, renderShell: "self", session_start replacement reasons,
 // ExtensionUIContext.setToolsExpanded(), setWorkingVisible(), and
 // setHiddenThinkingLabel(). The focused tests pin those assumptions but never reject a
-// newer Pi solely for its version. The collapsed-thinking and operational-user
-// presentation adapters probe the exact API they patch and degrade independently with a
-// diagnostic (see installCalmPresentationAdapter below) if a future Pi removes it; Pi
-// still exposes no global renderer for arbitrary built-in or custom rows.
+// newer Pi solely for its version. The assistant, tool-row, operational-user, and
+// non-conversation row presentation adapters probe the exact API they patch and degrade
+// independently with a diagnostic (see installCalmPresentationAdapter below) if a future Pi
+// removes it.
 // docs/configuration.md owns the home-local Calm preference contract.
 import { randomUUID } from "node:crypto";
 import {
@@ -21,6 +21,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
+  ExtensionContext,
   ToolDefinition,
   ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
@@ -36,7 +37,20 @@ import {
 import { Box, Container, getKeybindings, type Component } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { installCalmAssistantLayout } from "./lib/fm-calm-assistant-layout.ts";
+import {
+  installCalmBranchSummaryLayout,
+  installCalmCacheNoticeLayout,
+  installCalmCompactionSummaryLayout,
+  installCalmCustomEntryLayout,
+  installCalmCustomMessageLayout,
+  installCalmLeadingSpacerLayout,
+  installCalmSkillInvocationLayout,
+} from "./lib/fm-calm-nonconversation-layout.ts";
 import { installCalmOperationalUserLayout } from "./lib/fm-calm-operational-user-layout.ts";
+import {
+  installCalmToolErrorTurnBoundary,
+  installCalmToolLayout,
+} from "./lib/fm-calm-tool-layout.ts";
 import {
   calmPresentationHides,
   calmPresentationIsActive,
@@ -87,9 +101,24 @@ function installCalmPresentationAdapter(name: string, install: () => void): void
   }
 }
 
+function isTrustedInteractiveContext(
+  ctx: Pick<ExtensionContext, "isProjectTrusted" | "mode">,
+): boolean {
+  return ctx.mode === "tui" && ctx.isProjectTrusted();
+}
+
 export default function (pi: ExtensionAPI) {
   installCalmPresentationAdapter("collapsed-thinking", installCalmAssistantLayout);
+  installCalmPresentationAdapter("tool-row", installCalmToolLayout);
+  installCalmPresentationAdapter("tool-error-turn", installCalmToolErrorTurnBoundary);
   installCalmPresentationAdapter("operational-user-row", installCalmOperationalUserLayout);
+  installCalmPresentationAdapter("skill-invocation-row", installCalmSkillInvocationLayout);
+  installCalmPresentationAdapter("compaction-summary-row", installCalmCompactionSummaryLayout);
+  installCalmPresentationAdapter("branch-summary-row", installCalmBranchSummaryLayout);
+  installCalmPresentationAdapter("custom-message-row", installCalmCustomMessageLayout);
+  installCalmPresentationAdapter("custom-entry-row", installCalmCustomEntryLayout);
+  installCalmPresentationAdapter("cache-notice-row", installCalmCacheNoticeLayout);
+  installCalmPresentationAdapter("hidden-row-spacing", installCalmLeadingSpacerLayout);
 
   let exportRendering = false;
   let removeTerminalInputHandler: (() => void) | undefined;
@@ -124,6 +153,17 @@ export default function (pi: ExtensionAPI) {
       active: calmPresentationIsActive(),
       stockExportRendering: exportRendering,
     });
+  };
+  const redrawTranscript = (ctx: ExtensionContext): void => {
+    const expanded = ctx.ui.getToolsExpanded();
+    ctx.ui.setToolsExpanded(!expanded);
+    ctx.ui.setToolsExpanded(expanded);
+  };
+  const applyPresentation = (ctx: ExtensionContext, active: boolean): void => {
+    ctx.ui.setWorkingVisible(!active);
+    ctx.ui.setHiddenThinkingLabel(active ? "" : undefined);
+    ctx.ui.setStatus("firstmate-calm", undefined);
+    redrawTranscript(ctx);
   };
 
   registerFirstmateSyntheticPresentation(pi);
@@ -238,13 +278,16 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     exportRendering = false;
-    setCalmPresentation(loadCalmPreference());
     setCalmStockExportRendering(false);
-    publishPresentationState();
-    ctx.ui.setWorkingVisible(true);
-    ctx.ui.setHiddenThinkingLabel(calmPresentationIsActive() ? "" : undefined);
-    ctx.ui.setStatus("firstmate-calm", undefined);
     removeTerminalInputHandler?.();
+    removeTerminalInputHandler = undefined;
+
+    const trustedInteractive = isTrustedInteractiveContext(ctx);
+    setCalmPresentation(trustedInteractive && loadCalmPreference());
+    publishPresentationState();
+    if (!trustedInteractive) return;
+
+    applyPresentation(ctx, calmPresentationIsActive());
     removeTerminalInputHandler = ctx.ui.onTerminalInput((data) => {
       if (!getKeybindings().matches(data, "tui.input.submit")) return;
 
@@ -264,9 +307,7 @@ export default function (pi: ExtensionAPI) {
         exportRendering = false;
         setCalmStockExportRendering(false);
         publishPresentationState();
-        const expanded = ctx.ui.getToolsExpanded();
-        ctx.ui.setToolsExpanded(!expanded);
-        ctx.ui.setToolsExpanded(expanded);
+        redrawTranscript(ctx);
       }, 0);
     });
   });
@@ -274,17 +315,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("calm", {
     description: "Toggle Firstmate's supported conversation-only transcript presentation.",
     handler: async (_args, ctx) => {
+      if (!isTrustedInteractiveContext(ctx)) {
+        ctx.ui.notify("Calm is available only in a trusted interactive Pi session.", "warning");
+        return;
+      }
+
       const active = !calmPresentationIsActive();
       persistCalmPreference(active);
       setCalmPresentation(active);
       publishPresentationState();
-      ctx.ui.setWorkingVisible(true);
-      ctx.ui.setHiddenThinkingLabel(active ? "" : undefined);
-      ctx.ui.setStatus("firstmate-calm", undefined);
-
-      const expanded = ctx.ui.getToolsExpanded();
-      ctx.ui.setToolsExpanded(!expanded);
-      ctx.ui.setToolsExpanded(expanded);
+      applyPresentation(ctx, active);
     },
   });
 }

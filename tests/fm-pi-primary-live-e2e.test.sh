@@ -71,6 +71,24 @@ wait_for_exact_line() {
   return 1
 }
 
+wait_for_exact_line_without() {
+  local expected=$1 forbidden=$2 attempts=${3:-240} i=0 pane
+  while [ "$i" -lt "$attempts" ]; do
+    pane=$(capture)
+    if printf '%s\n' "$pane" | grep -Fq "$forbidden"; then
+      printf '%s\n' "$pane" >&2
+      return 2
+    fi
+    if printf '%s\n' "$pane" | grep -Fxq " $expected"; then
+      return 0
+    fi
+    sleep 0.25
+    i=$((i + 1))
+  done
+  capture >&2
+  return 1
+}
+
 lab_pid_is_safe() {
   local pid=$1 command
   command=$(ps -p "$pid" -o command= 2>/dev/null || true)
@@ -252,7 +270,9 @@ mkdir -p "$PROJECT/.pi/extensions/lib"
 cp "$ROOT/.pi/extensions/fm-calm.ts" "$PROJECT/.pi/extensions/fm-calm.ts"
 cp "$ROOT/.pi/extensions/fm-primary-pi-watch.ts" "$PROJECT/.pi/extensions/fm-primary-pi-watch.ts"
 cp "$ROOT/.pi/extensions/lib/fm-calm-assistant-layout.ts" "$PROJECT/.pi/extensions/lib/fm-calm-assistant-layout.ts"
+cp "$ROOT/.pi/extensions/lib/fm-calm-nonconversation-layout.ts" "$PROJECT/.pi/extensions/lib/fm-calm-nonconversation-layout.ts"
 cp "$ROOT/.pi/extensions/lib/fm-calm-operational-user-layout.ts" "$PROJECT/.pi/extensions/lib/fm-calm-operational-user-layout.ts"
+cp "$ROOT/.pi/extensions/lib/fm-calm-tool-layout.ts" "$PROJECT/.pi/extensions/lib/fm-calm-tool-layout.ts"
 cp "$ROOT/.pi/extensions/lib/fm-calm-visibility.ts" "$PROJECT/.pi/extensions/lib/fm-calm-visibility.ts"
 cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$PROJECT/.pi/extensions/lib/fm-operational-input.ts"
 cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$PROJECT/.pi/extensions/fm-primary-turnend-guard.ts"
@@ -273,25 +293,21 @@ while [ "$i" -lt 120 ]; do
 done
 [ -f "$HOME_DIR/state/.pi-turnend-extension-loaded" ] || fail "Pi turn-end extension did not load"
 [ -f "$HOME_DIR/state/.pi-watch-extension-loaded" ] || fail "Pi watcher extension did not load"
-wait_for_text "(openai-codex)" 120 || fail "Pi did not reach its ready composer"
+# Pi's ready composer footer names the pinned model; 0.82.x prints it without the
+# provider prefix this probe used to match, so pin the model id itself.
+wait_for_text "gpt-5.6-sol" 120 || fail "Pi did not reach its ready composer"
 sleep 1
 
 send_prompt "/calm"
 sleep 0.2
-send_prompt "Reply exactly CALM_LIVE_WORKING_VISIBLE"
-i=0
-while [ "$i" -lt 240 ]; do
-  pane=$(capture)
-  if printf '%s\n' "$pane" | grep -Fq "Working..."; then
-    break
-  fi
-  sleep 0.05
-  i=$((i + 1))
-done
-printf '%s\n' "$pane" | grep -Fq "Working..." \
-  || fail "Calm hid Pi's built-in Working row on the credentialed provider path"
-wait_for_exact_line "CALM_LIVE_WORKING_VISIBLE" 120 \
-  || fail "Pi did not settle the Calm Working-row provider probe"
+send_prompt "Reply exactly CALM_LIVE_REPLY"
+calm_working_rc=0
+wait_for_exact_line_without "CALM_LIVE_REPLY" "Working..." 240 || calm_working_rc=$?
+case "$calm_working_rc" in
+  0) ;;
+  2) fail "Calm rendered Pi's built-in Working row on the credentialed provider path" ;;
+  *) fail "Pi did not settle the Calm hidden-working provider probe" ;;
+esac
 pane=$(capture)
 printf '%s\n' "$pane" | grep -Fq "calm transcript" \
   && fail "Calm added a persistent Calm status row on the credentialed provider path"
@@ -336,4 +352,4 @@ wait_for_text "PI_EXIT=0" 60 || fail "Pi did not exit cleanly"
 wait_pid_dead "$watcher_pid" || fail "watcher child survived clean Pi exit"
 wait_pid_dead "$arm_pid" || fail "arm child survived clean Pi exit"
 
-printf 'ok - Pi %s live E2E covered native Calm Working visibility, Ahoy first/later messages, legacy transcripts, near misses, and watcher continuity\n' "$PI_VERSION"
+printf 'ok - Pi %s live E2E covered native Calm working suppression, Ahoy first/later messages, legacy transcripts, near misses, and watcher continuity\n' "$PI_VERSION"
