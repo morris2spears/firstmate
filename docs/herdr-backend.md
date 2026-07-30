@@ -55,7 +55,9 @@ Closing its last tab can remove the workspace, and the next spawn recreates it.
 
 ## Optional presentation spaces
 
-Create local gitignored `config/herdr-presentation-spaces` to request a disposable one-task workspace for each new crewmate or scout.
+Create local gitignored `config/herdr-presentation-spaces` to opt out of the flat per-home layout; [`configuration.md`](configuration.md#runtime-backend-configbackend--fm_backend) owns the file's value schema.
+An empty file or the value `task` requests a disposable one-task workspace for each new crewmate or scout, the layout this section describes.
+The value `project` instead requests one shared workspace per project; the [Project workspaces](#project-workspaces) section owns that layout.
 The setting is inherited into secondmate homes through the normal configuration-convergence owner.
 A secondmate agent itself always stays in its ordinary parent workspace; only children launched by that home are eligible.
 An absent or unconverged setting keeps the flat default.
@@ -126,6 +128,36 @@ Operational compromises:
 `tests/fm-herdr-session-cleanup.test.sh` covers every discovery, ownership, topology, process, locking, revalidation, focus, retirement, and continue-on-error boundary.
 `tests/fm-herdr-session-cleanup-e2e.test.sh` covers the restored-shell cleanup in a guarded non-default named lab; [`verification/runtime-backends.md`](verification/runtime-backends.md#per-home-and-presentation-topology) owns the active versioned evidence.
 
+## Project workspaces
+
+The `project` presentation value groups every crewmate and scout for one project into a single durable workspace, so several agents on the same project sit together with room for the captain's own tabs, such as a dev server, alongside them.
+The workspace label is `<project-basename> · p:<token>`, using the same visible non-authoritative correlator suffix as per-task projections; the label deliberately lacks the `└ ` child prefix so no per-task grammar can match it.
+Tasks for different projects land in different workspaces, and a secondmate agent itself keeps its ordinary parent placement.
+
+![Two Herdr project workspaces, each holding its project's task tabs next to the captain's own dev-server tab](images/herdr-project-spaces.png)
+
+The container identity lives in a per-home, per-project journal at `state/.herdr-project-spaces/<slug>-<hash>`, keyed by the canonical project path.
+The first spawn for a project creates the workspace with a fresh random 128-bit token, records a version 1 attempt before the create, and binds the exact returned `workspace_id` as version 2 after the create converges.
+Later spawns adopt only when the exact recorded `workspace_id` is live, its label is byte-identical to the recorded token-bearing label, and that token suffix is unique across the named session.
+A bare project-named label is never adoption authority, so a captain-made workspace named after the same project can never be adopted, unlike the per-home `firstmate` label find this deliberately strengthens.
+An adopted workspace never carries a seeded-tab id, so the created-versus-adopted prune gate carries over unchanged and no adopted tab can ever be pruned.
+
+Every non-provable state degrades safely and loudly.
+A recorded workspace that is gone, which is normal after its last tab closed, is recreated with a new token.
+A renamed label, duplicated token, duplicated workspace id, malformed journal, missing focus snapshot, or unavailable session lock warns and uses the ordinary flat layout without touching the journal or any workspace.
+A version 1 journal marks a crashed create whose possible orphan workspace is warned about and never adopted by token or label.
+A respawn with existing task metadata must first pass the same duplicate-launch guard as presentation recovery, because a live task pane can sit in a workspace the flat duplicate-label check would never inspect.
+
+Cleanup closes only the exact recorded task pane through the lock-serialized focus-preserving projected path and never calls `workspace close`, so the captain's own tabs and other tasks in the shared space always survive a task's teardown.
+When a project-space task's recorded endpoint identities disagree with each other, teardown warns, closes nothing, and skips the ordinary backend kill as well, because an inexact close in a shared workspace could take the captain's own tab.
+Herdr itself removes the workspace when its overall last tab closes, and the next spawn for that project recreates it; keeping any other tab there, such as a dev server, keeps the workspace alive indefinitely.
+The per-project journal is durable across tasks, is retired by no lifecycle path, and never authorizes send, capture, ownership, worktree return, or recovery.
+Project workspaces are not moved by the presentation ordering path and appear in Herdr's natural creation order.
+Like per-task projections, tabs in project workspaces are outside the home-workspace label recovery sweep; recorded task metadata remains the sole endpoint authority.
+
+`tests/fm-backend-herdr-project-spaces.test.sh` covers mode parsing, journal validation, provable adoption, every collision and fallback path, and the teardown close routing.
+`tests/fm-backend-herdr-project-spaces-e2e.test.sh` proves shared placement, cross-project separation, captain-tab survival, and cleanup against real Herdr in a guarded lab session.
+
 ## Default-tab prune safety
 
 `herdr workspace create` seeds one default tab.
@@ -150,6 +182,7 @@ herdr_tab_id=<tab-id>
 herdr_pane_id=<pane-id>
 ```
 
+A task placed in a shared per-project workspace additionally records `herdr_project_space=1`, which routes only its teardown pane close through the focus-preserving projected path.
 A Herdr pane id contains a colon, so the adapter splits `window=` on the first colon only.
 The recorded pane is the operational fast path.
 Workspace and tab ids support verification and cleanup but are not inferred from mutable labels during normal operation.
@@ -275,6 +308,8 @@ tests/fm-backend-herdr-prune-safety-e2e.test.sh
 tests/fm-backend-herdr-respawn-idem-e2e.test.sh
 tests/fm-backend-herdr-workspace-per-home-e2e.test.sh
 tests/fm-backend-herdr-presentation-e2e.test.sh
+tests/fm-backend-herdr-project-spaces.test.sh
+tests/fm-backend-herdr-project-spaces-e2e.test.sh
 tests/fm-backend-herdr-eventwait-smoke.test.sh
 tests/fm-herdr-session-cleanup.test.sh
 tests/fm-herdr-session-cleanup-e2e.test.sh

@@ -27,8 +27,16 @@
 #   A backend spawn refusal (missing dependency, version gate, unauthenticated
 #   socket, or unsupported secondmate mode) is terminal for that selected backend;
 #   callers must surface it instead of silently retrying another backend.
-#   Herdr additionally supports a default-off presentation-only layout when the
-#   local config/herdr-presentation-spaces flag exists. A clean fresh task first
+#   Herdr additionally supports two default-off presentation layouts selected
+#   by the local config/herdr-presentation-spaces file's first non-empty line
+#   (fm_backend_herdr_presentation_mode): an empty file or "task" keeps the
+#   original disposable one-task projection below; "project" instead places
+#   every crewmate/scout for one project in a shared per-project workspace
+#   adopted or created through fm_backend_herdr_project_container_ensure under
+#   the same session presentation lock, with an existing endpoint first passing
+#   the same duplicate-launch guard as presentation recovery, and every
+#   non-provable adoption falling back loudly to the flat layout. In the
+#   per-task layout, a clean fresh task first
 #   writes state/<id>.herdr-presentation atomically, then creates a disposable
 #   workspace containing only the ordinary task pane. A successful clean create
 #   upgrades its attempt journal with exact home, session, workspace, tab, pane,
@@ -115,7 +123,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -971,7 +979,11 @@ case "$BACKEND" in
     fi
     HERDR_PRESENTATION_JOURNAL=$(fm_backend_herdr_projection_journal_path "$STATE" "$ID")
     HERDR_PROJECTED=0
-    if [ "$KIND" != secondmate ] && [ -f "$CONFIG/herdr-presentation-spaces" ]; then
+    HERDR_PROJECT_CONTAINER=0
+    HERDR_PROJECT_CONTAINER_RAW=
+    HERDR_PRESENTATION_MODE=off
+    [ "$KIND" = secondmate ] || HERDR_PRESENTATION_MODE=$(fm_backend_herdr_presentation_mode "$CONFIG")
+    if [ "$HERDR_PRESENTATION_MODE" != off ]; then
       HERDR_SES=$(fm_backend_herdr_session)
       HERDR_PARENT_LABEL=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_workspace_label)
       if [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; then
@@ -1015,6 +1027,33 @@ case "$BACKEND" in
           esac
         else
           spawn_herdr_presentation_order_lock_release
+        fi
+      elif [ "$HERDR_PRESENTATION_MODE" = project ]; then
+        # Per-project shared container (docs/herdr-backend.md "Project
+        # workspaces"): adopt or create this project's own workspace under the
+        # session presentation lock, then continue on the ordinary flat
+        # create_task path against that container. Runs for fresh spawns AND
+        # respawns; an existing endpoint must first be positively dead or
+        # agent-free (the same duplicate-launch guard as presentation
+        # recovery), because a live task tab may sit in a workspace the flat
+        # dup-label check would never inspect.
+        if [ -e "$STATE/$ID.meta" ] || [ -L "$STATE/$ID.meta" ]; then
+          herdr_projection_existing_meta_allows_flat "$STATE/$ID.meta" || exit 1
+        fi
+        if ! fm_backend_herdr_server_ensure "$HERDR_SES"; then
+          echo "warning: herdr project workspace could not ensure its session server; using the ordinary flat layout" >&2
+        elif spawn_herdr_presentation_order_lock_acquire "$HERDR_SES"; then
+          set +e
+          HERDR_PROJECT_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_project_container_ensure \
+            "$HERDR_SES" "$STATE" "$PROJ_ABS")
+          HERDR_PROJECT_STATUS=$?
+          set -e
+          spawn_herdr_presentation_order_lock_release
+          if [ "$HERDR_PROJECT_STATUS" -eq 0 ] && [ -n "$HERDR_PROJECT_CONTAINER_RAW" ]; then
+            HERDR_PROJECT_CONTAINER=1
+          fi
+        else
+          echo "warning: herdr project workspace focus lock unavailable; using the ordinary flat layout" >&2
         fi
       elif [ ! -e "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ]; then
         # Session lock path resolution and exact parent binding both need a
@@ -1073,8 +1112,15 @@ case "$BACKEND" in
       fi
     fi
     if [ "$HERDR_PROJECTED" -ne 1 ]; then
-      HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS") || exit 1
-      # fm_backend_herdr_container_ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>"
+      if [ "$HERDR_PROJECT_CONTAINER" = 1 ]; then
+        # The project container ensure above already resolved the shared
+        # per-project workspace with the same "<session>:<workspace_id>\t<seeded>"
+        # contract (seeded empty when it ADOPTED the existing project space).
+        HERDR_CONTAINER_RAW=$HERDR_PROJECT_CONTAINER_RAW
+      else
+        HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS") || exit 1
+      fi
+      # The container echo is "<session>:<workspace_id>\t<seeded_default_tab_id>"
       # (the second field empty when this call ADOPTED a pre-existing workspace
       # rather than creating a fresh one). Split on the guaranteed single tab
       # character; the seeded tab id is threaded through to create_task
@@ -1454,6 +1500,10 @@ META_WINDOW=$T
     echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"
     echo "herdr_tab_id=$HERDR_TAB_ID"
     echo "herdr_pane_id=$HERDR_PANE_ID"
+    # Written only for a task placed in a shared per-project workspace, so
+    # teardown routes its pane close through the focus-preserving projected
+    # path (the shared space can hold the captain's own tabs).
+    [ "${HERDR_PROJECT_CONTAINER:-0}" != 1 ] || echo "herdr_project_space=1"
   fi
   if [ "$BACKEND" = zellij ]; then
     echo "zellij_session=$ZELLIJ_SES"

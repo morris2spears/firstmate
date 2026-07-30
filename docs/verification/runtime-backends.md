@@ -230,6 +230,29 @@ HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
 
 Observed guarantee: one exact home-local, journal-correlated, one-tab and one-pane childless idle shell was closed after restoration while the exact non-target focus and default fleet session remained unchanged, and a repeat run was a no-op.
 
+The per-project shared-workspace suite ran on 2026-07-29 against Herdr 0.7.5 protocol 17 on macOS:
+
+```sh
+HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
+  tests/fm-backend-herdr-project-spaces-e2e.test.sh
+```
+
+Observed guarantees:
+
+```text
+ok - real herdr E2E: the first task creates the 'alpha-app · p:<token>' project workspace
+ok - real herdr E2E: a second task for the same project adopts the same project workspace
+ok - real herdr E2E: the created workspace's seeded default tab was pruned and only task tabs remain
+ok - real herdr E2E: a task for a different project lands in its own project workspace
+ok - real herdr E2E: tearing down one task closes only its own pane; the sibling task and the captain's tab survive
+ok - real herdr E2E: the last task's teardown leaves the captain's tab and the shared workspace alive
+ok - real herdr E2E: a binding pointing at the captain's own workspace is refused loudly and falls back flat, touching nothing
+ok - real herdr E2E: with the flag absent the flat per-home layout is unchanged
+ok - real herdr E2E: a --secondmate spawn keeps its per-home placement untouched by project mode
+```
+
+The same run's session teardown passed the default-session tripwire, and the collision case bound a journal to a captain-made workspace id whose bare `beta-app` label was refused because it did not match the recorded token-bearing label.
+
 ### Composer and operational input
 
 Real captures verified these active distinctions:
