@@ -297,10 +297,52 @@ test_return_failed_stop_leaves_away_versions_untouched() {
   pass "a failed stop never mutates away batch versions; acknowledgement retires them"
 }
 
+
+# Retirement is part of acknowledgement, so a version that could not be removed
+# keeps the gate open instead of reporting a clear catch-up over content the next
+# pass would fold again. The retry must not duplicate that evidence either.
+test_return_keeps_the_gate_until_versions_retire() {
+  local dir out rc=0 vdir count
+  dir="$TMP_ROOT/retire-fault"
+  install_runner "$dir"
+  vdir="$dir/home/state/tg-away-versions/v.1700000000-stuck"
+  mkdir -p "$vdir"
+  printf 'blocked: retained and not yet acknowledged\n' > "$vdir/escalations"
+  printf 'escalations\n' > "$vdir/manifest"
+  : > "$vdir/.complete"
+  chmod 500 "$vdir"
+
+  out=$(run_return "$dir" begin) || rc=$?
+  [ "$rc" -eq 3 ] || fail "a failed away batch retirement must gate the catch-up (rc=$rc): $out"
+  [ -e "$dir/home/state/.afk-return-catchup" ] \
+    || fail "a failed retirement left no gate behind"
+  case "$out" in
+    *'away batch records could not be retired'*) ;;
+    *) fail "a failed retirement must surface a lifecycle blocker: $out" ;;
+  esac
+  [ -e "$vdir/.complete" ] || fail "the version must survive a failed retirement intact"
+
+  rc=0
+  out=$(run_return "$dir" check) || rc=$?
+  [ "$rc" -eq 3 ] || fail "check must keep gating while retirement still fails (rc=$rc): $out"
+  count=$(grep -c 'retained and not yet acknowledged' "$dir/home/state/.afk-return-catchup")
+  [ "$count" -eq 1 ] \
+    || fail "re-folding the same surviving version must not duplicate its evidence (got $count)"
+
+  chmod 700 "$vdir"
+  rc=0
+  out=$(run_return "$dir" check) || rc=$?
+  [ "$rc" -eq 0 ] || fail "check must close the gate once retirement succeeds (rc=$rc): $out"
+  [ ! -e "$dir/home/state/tg-away-versions" ] \
+    || fail "an acknowledged catch-up must leave no away batch version behind"
+  pass "the return gate stays open until whole-version retirement succeeds, without duplicating evidence"
+}
+
 test_return_gate_orders_catchup_before_bearings
 test_return_folds_accepted_away_digest_before_retiring_it
 test_return_evidence_never_duplicates_a_digested_line
 test_return_failed_stop_leaves_away_versions_untouched
+test_return_keeps_the_gate_until_versions_retire
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
 test_away_reentry_refuses_pending_return_gate

@@ -127,11 +127,12 @@ print_blockers() {  # <file>
 clear_delivery_artifacts() {
   # Retire the complete owned unit and every away batch version through the
   # ledger owner. This is the ACKNOWLEDGEMENT boundary: it only runs once the
-  # catch-up evidence above has folded in the live digests and every retained
-  # version, and only once the gate has closed with no blocker left, so no
-  # actionable escalation text is dropped here and nothing survives to be
-  # presented a second time. The text-free <id>.status delivery evidence is
-  # deliberately kept.
+  # catch-up evidence has folded in the live digests and every retained version
+  # and no blocker is left, and it runs BEFORE the gate is removed - its status
+  # decides whether the gate may close at all. A version that survived retirement
+  # would otherwise be folded again by the next catch-up and presented as fresh
+  # work, so a failure here keeps the gate open instead. The text-free
+  # <id>.status delivery evidence is deliberately kept.
   local result=0
   away_ledger_retire_batch "$STATE" "$STATE/.subsuper-escalations" \
     "$STATE/.subsuper-inject-wedged" || result=1
@@ -220,6 +221,15 @@ return_reconcile() {
   fi
 
   scan_open_blockers > "$blockers"
+  # Retirement is part of acknowledgement, so it is attempted BEFORE the gate can
+  # close and a failure gates the catch-up exactly like an unresolved blocker.
+  # Re-running is safe and does not duplicate: the gate preserves this evidence
+  # and append_evidence dedupes exact records, so the next pass folds the same
+  # surviving version into the same records it already published.
+  if [ "$lifecycle_ok" -eq 1 ] && [ ! -s "$blockers" ] && ! clear_delivery_artifacts; then
+    append_evidence lifecycle 'away batch records could not be retired; retry catch-up before ordinary work' "$evidence"
+    lifecycle_ok=0
+  fi
   if [ "$lifecycle_ok" -ne 1 ] || [ -s "$blockers" ]; then
     write_gate "$evidence" "$blockers" || { rm -f "$evidence" "$blockers"; return 1; }
     printf 'fm-afk-return: catch-up must finish before the captain request\n' >&2
@@ -232,7 +242,6 @@ return_reconcile() {
 
   print_evidence "$evidence"
   rm -f "$GATE"
-  clear_delivery_artifacts
   rm -f "$evidence" "$blockers"
   printf 'fm-afk-return: catch-up clear; ordinary captain work may proceed\n'
   return 0

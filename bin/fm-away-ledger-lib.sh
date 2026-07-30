@@ -34,9 +34,12 @@
 #
 # Earlier record shapes - the bare arrival epoch of the pre-ledger form, and the
 # five- and six-field forms that predate the attempt ordinal and the retry
-# schedule - are migrated in place on read, so an in-place daemon upgrade during a
-# live away session keeps its counts instead of failing closed and repeating
-# already-delivered lines in captain chat.
+# schedule - are normalised by away_ledger_parse and migrated in place by the LIVE
+# read (away_ledger_read), so an in-place daemon upgrade during a live away
+# session keeps its counts instead of failing closed and repeating
+# already-delivered lines in captain chat. A read of a published immutable version
+# goes through away_ledger_peek instead, which never writes; that migration
+# happens only while a successor version is being constructed.
 #
 # The invariant accounted <= confirmed <= reserved holds at every transition, and
 # an unparseable record is reported as `unknown`, which callers must treat as
@@ -116,14 +119,17 @@ away_ledger_open() {  # <buf>
   away_ledger_write "$1" "$(away_ledger_mint_id)" 0 0 0 0 0 none
 }
 
-# Print "<batch-id> <reserved> <confirmed> <accounted> <attempt> <retry-after>
-# <delivery-id>", or the single word `unknown` when the record is absent,
-# malformed, or violates the accounted <= confirmed <= reserved invariant. Every
-# earlier record shape is migrated in place rather than rejected:
+# PURE parse: print "<needs-migration> <batch-id> <reserved> <confirmed>
+# <accounted> <attempt> <retry-after> <delivery-id>", or the single word
+# `unknown` when the record is absent, malformed, or violates the
+# accounted <= confirmed <= reserved invariant. Writes NOTHING, so it is the only
+# record reader safe to point at a published immutable version. Every earlier
+# record shape is normalised here and flagged as needing migration rather than
+# rejected:
 #   1 field   the pre-ledger bare arrival epoch  -> minted identity, zero counts
 #   5 fields  id reserved confirmed accounted did -> attempt 0, retry-after 0
 #   6 fields  ... attempt did                     -> retry-after 0
-away_ledger_read() {  # <buf>
+away_ledger_parse() {  # <buf>
   local buf=$1 raw f1 f2 f3 f4 f5 f6 f7 extra
   local id reserved confirmed accounted attempt retry did epoch nonce migrated=0
   raw=$(head -n 1 "${buf}.since" 2>/dev/null || true)
@@ -153,6 +159,30 @@ away_ledger_read() {  # <buf>
     id="$epoch-$(away_ledger_hash "$$-${RANDOM:-0}-$epoch")"
     migrated=1
   fi
+  printf '%s %s %s %s %s %s %s %s\n' \
+    "$migrated" "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" "$did"
+}
+
+# The read-only record view: the normalised record with no migration write at
+# all. Every reader that must not mutate its subject - the return catch-up's fold
+# of a published immutable version above all - goes through this, never through
+# away_ledger_read.
+away_ledger_peek() {  # <buf>
+  local rec
+  rec=$(away_ledger_parse "$1")
+  [ "$rec" != unknown ] || { printf 'unknown\n'; return 0; }
+  printf '%s\n' "${rec#* }"
+}
+
+# The LIVE record view: parse, and migrate an earlier record shape in place so an
+# in-place daemon upgrade during a live away session keeps its counts. Only ever
+# pointed at a live buffer, never at a version directory - a published version is
+# immutable, and a successor version is where a migrated record belongs.
+away_ledger_read() {  # <buf>
+  local buf=$1 rec migrated id reserved confirmed accounted attempt retry did
+  rec=$(away_ledger_parse "$buf")
+  [ "$rec" != unknown ] || { printf 'unknown\n'; return 0; }
+  IFS=' ' read -r migrated id reserved confirmed accounted attempt retry did <<< "$rec"
   if [ "$migrated" -eq 1 ]; then
     away_ledger_write "$buf" "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" "$did" \
       || { printf 'unknown\n'; return 0; }
@@ -365,11 +395,34 @@ away_ledger_retire_working_records() {  # <state> [preserve-digests]
 #                      switch is still pending and is replayed, so an
 #                      interrupted switch converges instead of leaving the live
 #                      unit half-installed.
+#   .owner.lock        the store's own owner lock. Publishing, switching,
+#                      materialising, and retiring all run while exactly one
+#                      process holds it, so the two away entry paths (the
+#                      launcher and a direct daemon start, which share no other
+#                      lock) can never interleave.
 #
 # Nothing is ever copied or merged INTO a published version, and no individual
 # file is ever merged into the live unit: a switch installs one version's whole
 # unit or leaves the live unit entirely alone, so a version's sidecar counts can
 # never be paired with a foreign buffer.
+#
+# A published version is immutable in the strict sense: every reader of one goes
+# through away_ledger_peek, which parses without ever writing, so not even the
+# legacy-record-shape migration can touch it. That migration belongs to successor
+# construction instead - away_ledger_version_publish normalises the record inside
+# its private staging copy - so versions always carry a current-shape record and
+# the live sidecar the copy came from is left exactly as the daemon owns it.
+#
+# The daemon's OWN in-session transitions (escalate_add's append, reserve,
+# confirm, release, digest_record) deliberately remain in-place atomic writes to
+# the live unit rather than a successor version per transition, and this is the
+# accepted design rather than an omission: the daemon is the sole writer of that
+# unit for the whole session, and the refuse-while-live guard below means no
+# version content can ever land under it, so a successor directory per escalation
+# would add a full unit copy per append without closing a reachable
+# cross-pairing or lost-append path. Version boundaries are therefore the
+# lifecycle transactions - away entry, crash rollback - where a SECOND writer
+# would otherwise touch the unit.
 #
 # A switch is only ever performed while no live away daemon holds the
 # supervise-daemon lock - checked inside this owner (away_ledger_daemon_live)
@@ -435,6 +488,55 @@ away_ledger_daemon_live() {  # <state>
   kill -0 "$pid" 2>/dev/null
 }
 
+# The store's own owner lock. Every mutation of the store - publishing a version,
+# switching the active pointer, materialising it, retiring a version - happens
+# while exactly one process holds it, so two away entries (the launcher and a
+# direct daemon start, which do not share the launcher's lock) can never
+# interleave a publication with a pointer switch. A lock whose recorded pid is
+# gone is reclaimed; an incomplete lock is given a bounded grace first, so a
+# racing acquirer's own half-written lock is never ripped out from under it.
+away_ledger_lock_acquire() {  # <versions-dir>
+  local dir=$1 lock="$1/.owner.lock" attempt=0 incomplete=0 pid
+  (umask 077; mkdir -p "$dir" 2>/dev/null) || return 1
+  while [ "$attempt" -lt 200 ]; do
+    attempt=$((attempt + 1))
+    if mkdir "$lock" 2>/dev/null; then
+      if ! printf '%s\n' "$$" > "$lock/pid" 2>/dev/null; then
+        rm -rf -- "$lock" 2>/dev/null
+        return 1
+      fi
+      return 0
+    fi
+    pid=$(head -n 1 "$lock/pid" 2>/dev/null || true)
+    case "$pid" in
+      ''|*[!0-9]*)
+        incomplete=$((incomplete + 1))
+        if [ "$incomplete" -lt 20 ]; then
+          sleep 0.05
+          continue
+        fi
+        rm -rf -- "$lock" 2>/dev/null
+        incomplete=0
+        continue
+        ;;
+    esac
+    incomplete=0
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf -- "$lock" 2>/dev/null
+      continue
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+away_ledger_lock_release() {  # <versions-dir>
+  local lock="$1/.owner.lock"
+  [ "$(head -n 1 "$lock/pid" 2>/dev/null || true)" = "$$" ] || return 0
+  rm -rf -- "$lock" 2>/dev/null
+  return 0
+}
+
 # Same-directory mktemp plus mv, so a reader never sees a half-written pointer.
 # The temp lives under the store's own .pointer. prefix, so it can never be
 # mistaken for a version and is swept by away_ledger_version_gc.
@@ -466,10 +568,21 @@ away_ledger_pointer_read() {  # <pointer-file>
 # failure or a crash at any point leaves only staging behind and never a
 # partially published version a later caller could activate.
 away_ledger_version_publish() {  # <state> <buf> <wedge>
-  local state=$1 buf=$2 wedge=$3 dir staging name digest_dir slot artifact i
-  local -a artifacts slots
+  local state=$1 buf=$2 wedge=$3 dir rc
   dir=$(away_ledger_versions_dir "$state")
   fmx_private_artifact_dir_prepare "$dir" >/dev/null 2>&1 || return 1
+  away_ledger_lock_acquire "$dir" || return 1
+  _away_ledger_version_publish_locked "$state" "$buf" "$wedge"
+  rc=$?
+  away_ledger_lock_release "$dir"
+  return "$rc"
+}
+
+_away_ledger_version_publish_locked() {  # <state> <buf> <wedge>
+  local state=$1 buf=$2 wedge=$3 dir staging name digest_dir slot artifact i rec
+  local migrated id reserved confirmed accounted attempt retry did
+  local -a artifacts slots
+  dir=$(away_ledger_versions_dir "$state")
   staging=$(umask 077; mktemp -d "$dir/.staging.XXXXXX" 2>/dev/null) || return 1
   artifacts=("$buf" "${buf}.since" "$wedge")
   slots=(escalations escalations.since wedge)
@@ -497,6 +610,23 @@ away_ledger_version_publish() {  # <state> <buf> <wedge>
       return 1
     fi
   fi
+  # A successor version is the ONE place an earlier record shape is normalised:
+  # the migration lands in this private staging copy, never in the live sidecar it
+  # was read from and never in an already-published version.
+  if [ -e "$staging/escalations.since" ]; then
+    rec=$(away_ledger_parse "$staging/escalations")
+    if [ "$rec" = unknown ]; then
+      rm -rf -- "$staging" 2>/dev/null
+      return 1
+    fi
+    IFS=' ' read -r migrated id reserved confirmed accounted attempt retry did <<< "$rec"
+    if [ "$migrated" -eq 1 ] \
+      && ! away_ledger_write "$staging/escalations" "$id" "$reserved" "$confirmed" \
+        "$accounted" "$attempt" "$retry" "$did"; then
+      rm -rf -- "$staging" 2>/dev/null
+      return 1
+    fi
+  fi
   while IFS= read -r slot; do
     [ -n "$slot" ] || continue
     if [ ! -e "$staging/$slot" ]; then
@@ -504,6 +634,11 @@ away_ledger_version_publish() {  # <state> <buf> <wedge>
       return 1
     fi
   done < "$staging/manifest"
+  if [ -e "$staging/escalations.since" ] \
+    && [ "$(away_ledger_parse "$staging/escalations")" = unknown ]; then
+    rm -rf -- "$staging" 2>/dev/null
+    return 1
+  fi
   if ! : > "$staging/.complete" 2>/dev/null; then
     rm -rf -- "$staging" 2>/dev/null
     return 1
@@ -556,15 +691,22 @@ away_ledger_version_gc() {  # <state>
 # while a live daemon holds the lock (rc 3); either way every version and the
 # live unit are left exactly as they were.
 away_ledger_version_activate() {  # <state> <buf> <wedge> <name>
-  local state=$1 buf=$2 wedge=$3 name=$4 dir vdir
+  local state=$1 buf=$2 wedge=$3 name=$4 dir vdir rc
   vdir=$(away_ledger_version_path "$state" "$name") || return 1
   away_ledger_version_is_complete "$vdir" || return 1
   if away_ledger_daemon_live "$state"; then
     return 3
   fi
   dir=$(away_ledger_versions_dir "$state")
-  away_ledger_pointer_write "$dir" active "$name" || return 1
-  away_ledger_version_apply_pending "$state" "$buf" "$wedge"
+  away_ledger_lock_acquire "$dir" || return 1
+  if away_ledger_pointer_write "$dir" active "$name"; then
+    _away_ledger_version_apply_locked "$state" "$buf" "$wedge"
+    rc=$?
+  else
+    rc=1
+  fi
+  away_ledger_lock_release "$dir"
+  return "$rc"
 }
 
 # Replay a switch whose materialisation has not completed. Idempotent: with no
@@ -572,6 +714,17 @@ away_ledger_version_activate() {  # <state> <buf> <wedge> <name>
 # before daemon start so an interrupted switch converges; it refuses (rc 3)
 # while a daemon is live, so it can never race the daemon's own writes.
 away_ledger_version_apply_pending() {  # <state> <buf> <wedge>
+  local state=$1 buf=$2 wedge=$3 dir rc
+  dir=$(away_ledger_versions_dir "$state")
+  [ -d "$dir" ] || return 0
+  away_ledger_lock_acquire "$dir" || return 1
+  _away_ledger_version_apply_locked "$state" "$buf" "$wedge"
+  rc=$?
+  away_ledger_lock_release "$dir"
+  return "$rc"
+}
+
+_away_ledger_version_apply_locked() {  # <state> <buf> <wedge>
   local state=$1 buf=$2 wedge=$3 dir name applied vdir
   dir=$(away_ledger_versions_dir "$state")
   [ -d "$dir" ] || return 0
@@ -631,12 +784,15 @@ away_ledger_version_retire() {  # <state> <name>
   local state=$1 name=$2 dir vdir pointer current result=0
   vdir=$(away_ledger_version_path "$state" "$name") || return 1
   dir=$(away_ledger_versions_dir "$state")
+  [ -d "$dir" ] || return 0
+  away_ledger_lock_acquire "$dir" || return 1
   for pointer in active active.applied; do
     current=$(away_ledger_pointer_read "$dir/$pointer" 2>/dev/null || true)
     [ "$current" = "$name" ] || continue
-    rm -f -- "$dir/$pointer" || result=1
+    rm -f -- "$dir/$pointer" 2>/dev/null || result=1
   done
-  rm -rf -- "$vdir" || result=1
+  rm -rf -- "$vdir" 2>/dev/null || result=1
+  away_ledger_lock_release "$dir"
   return "$result"
 }
 
@@ -645,13 +801,44 @@ away_ledger_version_retire() {  # <state> <name>
 # durable evidence by then, so nothing retired here can resurface as a duplicate
 # delivery, and nothing is retired while a catch-up is still pending.
 away_ledger_versions_retire_all() {  # <state>
-  local dir result=0
+  local dir name result=0
   dir=$(away_ledger_versions_dir "$1")
   [ -d "$dir" ] || return 0
-  rm -f -- "$dir/active" "$dir/active.applied" "$dir"/.pointer.* || result=1
-  rm -rf -- "$dir"/v.* "$dir"/.staging.* || result=1
+  away_ledger_lock_acquire "$dir" || return 1
+  rm -f -- "$dir/active" "$dir/active.applied" "$dir"/.pointer.* 2>/dev/null || result=1
+  rm -rf -- "$dir"/v.* "$dir"/.staging.* 2>/dev/null || result=1
+  # Removal is only acknowledged when the store is provably empty of versions and
+  # pointers: a caller that keeps a gate open on this status must not be told the
+  # catch-up is settled while a version survives to be folded again.
+  while IFS= read -r name; do
+    [ -z "$name" ] || result=1
+  done <<EOF
+$(away_ledger_version_names "$1")
+EOF
+  [ ! -e "$dir/active" ] || result=1
+  away_ledger_lock_release "$dir"
   rmdir "$dir" 2>/dev/null || true
   return "$result"
+}
+
+# The ONE entry-boundary transaction every away entry goes through - the launcher
+# and a direct daemon start alike - printing the name of the version it captured.
+# Sweep what was never published, replay an interrupted pointer switch (the only
+# moment a version's content may reach the live paths, and refused by the owner
+# while a daemon is live), then capture the predecessor unit as one complete
+# immutable version.
+#
+# A caller retires the live unit ONLY after this has succeeded, so no entry path
+# can delete a crashed session's un-flushed escalation lines with no surviving
+# copy - the evidence-loss class this store exists to close. Because the capture
+# lives here rather than in one caller, a future entry path cannot skip it by
+# omission.
+away_ledger_entry_capture() {  # <state> <buf> <wedge>
+  local state=$1 buf=$2 wedge=$3 rc=0
+  away_ledger_version_gc "$state" || true
+  away_ledger_version_apply_pending "$state" "$buf" "$wedge" || rc=$?
+  [ "$rc" -ne 1 ] || return 1
+  away_ledger_version_publish "$state" "$buf" "$wedge"
 }
 
 # Print the lines of <buf> that no digest has accounted for yet, one per line -
@@ -659,11 +846,16 @@ away_ledger_versions_retire_all() {  # <state>
 # buffer whenever the record is absent or `unknown`, so an unreadable ledger
 # over-reports to the visible catch-up instead of dropping a captain-relevant
 # line.
+#
+# Reads through away_ledger_peek, never away_ledger_read: this runs against
+# published immutable versions as well as the live buffer, and a migrating read
+# would both break that immutability and - if the migration write failed - report
+# `unknown` and re-offer lines the version's own digests already carry.
 away_ledger_unaccounted_lines() {  # <buf>
   local buf=$1 rec accounted=0 n
   [ -s "$buf" ] || return 0
   if [ -f "${buf}.since" ]; then
-    rec=$(away_ledger_read "$buf" 2>/dev/null || true)
+    rec=$(away_ledger_peek "$buf" 2>/dev/null || true)
     if [ -n "$rec" ] && [ "$rec" != unknown ]; then
       IFS=' ' read -r _ _ _ accounted _ _ _ <<< "$rec"
       away_ledger_is_count "$accounted" || accounted=0

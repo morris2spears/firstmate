@@ -153,7 +153,20 @@ fm_afk_start_main() {
 
   # Fresh start: clear the previous away session's stale delivery artifacts
   # before the new daemon can surface them (fix for the leaked-artifact defect).
+  #
+  # A direct start is an away entry like any other, so it goes through the SAME
+  # owner-controlled entry-boundary transaction the launcher uses: sweep, replay
+  # an interrupted active-pointer switch, and capture the predecessor unit as one
+  # immutable version FIRST. Without that capture this clear would delete a
+  # crashed session's un-flushed escalation lines with no surviving copy, so a
+  # failed capture refuses the start instead of clearing anything.
   if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
+    if ! away_ledger_entry_capture "$FM_AFK_STATE" \
+        "$FM_AFK_STATE/.subsuper-escalations" \
+        "$FM_AFK_STATE/.subsuper-inject-wedged" >/dev/null; then
+      echo "afk: could not capture the prior away batch as an immutable version; refusing to clear it" >&2
+      return 1
+    fi
     fm_afk_clear_stale_artifacts "$FM_AFK_STATE" "$had_afk"
   fi
 

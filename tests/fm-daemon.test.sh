@@ -23,6 +23,28 @@ fi
 
 TMP_ROOT=$(fm_test_tmproot fm-daemon-tests)
 
+test_afk_start_refuses_to_clear_an_uncaptured_away_batch() {
+  local dir state out status
+  dir=$(make_supercase afk-start-uncapturable-batch)
+  state="$dir/state"
+  printf 'blocked: crashed away session, never flushed\n' > "$state/.subsuper-escalations"
+  printf '1700000000-abc 0 0 0 0 0 none\n' > "$state/.subsuper-escalations.since"
+  # The version store path is occupied by a regular file, so the entry-boundary
+  # capture cannot publish the predecessor unit as an immutable version.
+  printf 'not a directory\n' > "$state/tg-away-versions"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] \
+    || fail "a direct away start must refuse when the prior batch cannot be captured"
+  assert_not_contains "$out" "starting supervise daemon" \
+    "a direct away start continued into daemon startup without capturing the prior batch"
+  assert_grep 'blocked: crashed away session, never flushed' "$state/.subsuper-escalations" \
+    "a direct away start cleared un-flushed escalation lines with no surviving version"
+  pass "a direct away start refuses to clear a prior away batch it could not capture"
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written() {
   local dir state out status
   dir=$(make_supercase afk-start-flag-unwritable)
@@ -1766,6 +1788,7 @@ test_inject_msg_defers_on_unrecognized_composer_state() {
 }
 
 test_afk_start_refuses_when_flag_cannot_be_written
+test_afk_start_refuses_to_clear_an_uncaptured_away_batch
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home

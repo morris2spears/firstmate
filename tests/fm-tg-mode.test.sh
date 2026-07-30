@@ -1097,6 +1097,150 @@ test_away_no_adoption_or_merge_apis_remain() {
   pass "no adoption or per-file merge API survives in bin/"
 }
 
+# Enforcement, not behaviour: the version store has exactly one writer, and the
+# migrating record read is never pointed at a version or staging directory. Both
+# are the invariants the immutability of a published version rests on, so they are
+# checked structurally rather than left to review.
+test_away_only_the_owner_writes_the_version_store() {
+  local hits
+  hits=$(grep -rn -E '(>>?[[:space:]]*"?[^|]*|cp |mv |rm |mkdir |chmod |touch )tg-away-versions' \
+    "$ROOT/bin" 2>/dev/null | grep -v '/fm-away-ledger-lib\.sh:' | grep -v '^[^:]*:[0-9]*:#' || true)
+  [ -z "$hits" ] \
+    || fail "only the away ledger owner may write the version store: $hits"
+  hits=$(grep -rn -E 'away_ledger_read "\$(vdir|staging)' "$ROOT/bin" 2>/dev/null || true)
+  [ -z "$hits" ] \
+    || fail "the migrating record read must never be pointed at a version or staging directory: $hits"
+  pass "the version store has a single writer and no migrating read inside a version"
+}
+
+# The record reader splits in two on purpose: away_ledger_peek must never write,
+# because it is the reader pointed at published immutable versions, while
+# away_ledger_read keeps migrating an earlier record shape in place for the LIVE
+# buffer the daemon owns.
+test_away_peek_never_writes_and_read_migrates_only_live() {
+  local home state buf before rec
+  home=$(make_home away-peek-pure)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: from a pre-ledger session\n' > "$buf"
+  printf '1700000000\n' > "$buf.since"
+  before=$(cat "$buf.since")
+
+  rec=$(away_ledger_peek "$buf")
+  [ "$rec" != unknown ] || fail "peek must normalise a pre-ledger record rather than fail closed"
+  [ "$(cat "$buf.since")" = "$before" ] \
+    || fail "peek must never write the record it read"
+  case "$rec" in
+    *' 0 0 0 0 0 none') ;;
+    *) fail "peek must report zeroed counts for a pre-ledger record: $rec" ;;
+  esac
+
+  rec=$(away_ledger_read "$buf")
+  [ "$rec" != unknown ] || fail "the live read must migrate a pre-ledger record"
+  [ "$(cat "$buf.since")" != "$before" ] \
+    || fail "the live read must still migrate an earlier record shape in place"
+  pass "the pure record read never writes, and only the live read migrates"
+}
+
+# Migration belongs to successor construction: publishing normalises the record
+# inside its own private staging copy, so the version carries a current-shape
+# record and the live sidecar it was copied from is left exactly as it was.
+test_away_version_publish_migrates_into_the_successor_only() {
+  local home state buf version vdir
+  home=$(make_home away-publish-migrates)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: owed since before the ledger\n' > "$buf"
+  printf '1700000000\n' > "$buf.since"
+
+  version=$(away_ledger_version_publish "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "publishing must succeed over an earlier record shape"
+  vdir="$state/tg-away-versions/$version"
+  [ "$(cat "$buf.since")" = 1700000000 ] \
+    || fail "publishing must not migrate the live sidecar it copied"
+  [ "$(awk '{print NF}' "$vdir/escalations.since")" = 7 ] \
+    || fail "the successor version must carry a current-shape record: $(cat "$vdir/escalations.since")"
+  [ "$(away_ledger_peek "$vdir/escalations")" != unknown ] \
+    || fail "the successor version's record must be readable without migration"
+  pass "an earlier record shape is migrated only into the successor version"
+}
+
+# The fold at return is strictly read-only, including over a version that
+# preserved an earlier record shape - the case a migrating read would have
+# rewritten inside a published version.
+test_away_fold_versions_never_mutates_a_legacy_version() {
+  local home state buf vdir before out
+  home=$(make_home away-fold-immutable)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  vdir="$state/tg-away-versions/v.1700000000-legacy"
+  (umask 077; mkdir -p "$vdir")
+  printf 'blocked: legacy shape, still owed\n' > "$vdir/escalations"
+  printf '1700000000\n' > "$vdir/escalations.since"
+  printf 'escalations\n' > "$vdir/manifest"
+  : > "$vdir/.complete"
+  before=$(cat "$vdir/escalations.since")
+
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding a legacy-shape version must succeed"
+  assert_contains "$out" 'blocked: legacy shape, still owed' \
+    "a legacy-shape version's owed line must still reach the catch-up"
+  [ "$(cat "$vdir/escalations.since")" = "$before" ] \
+    || fail "the fold must never write inside a published immutable version"
+  pass "the return fold never mutates a published version, whatever record shape it holds"
+}
+
+# One entry-boundary transaction owns capture-before-clear, so no away entry path
+# can delete a crashed session's un-flushed lines with no surviving copy.
+test_away_entry_capture_keeps_the_predecessor_before_a_clear() {
+  local home state buf version out
+  home=$(make_home away-entry-capture)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  seed_live_unit "$state"
+
+  version=$(away_ledger_entry_capture "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "the entry-boundary capture must succeed"
+  assert_present "$buf" "capture must leave the live unit for the caller to clear"
+  away_ledger_retire_batch "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    || fail "retiring the live unit must succeed"
+  assert_absent "$buf" "the live unit must be gone after the entry clear"
+
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding the captured version must succeed"
+  assert_contains "$out" 'blocked: still owed to captain chat' \
+    "the captured version must still hold what the entry clear removed"
+  [ "$(away_ledger_version_names "$state")" = "$version" ] \
+    || fail "the capture must leave exactly the version it published"
+  pass "the entry boundary captures the predecessor before any clear removes it"
+}
+
+# Retirement is acknowledgement: it must report failure while any version
+# survives, so a caller cannot close its gate over content that will be folded
+# again.
+test_away_versions_retire_all_refuses_while_a_version_survives() {
+  local home state buf version rc=0
+  home=$(make_home away-retire-fault)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  seed_live_unit "$state"
+  version=$(away_ledger_version_publish "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "publishing must succeed"
+  chmod 500 "$state/tg-away-versions/$version"
+
+  away_ledger_versions_retire_all "$state" || rc=$?
+  expect_code 1 "$rc" "retirement must report failure while a version cannot be removed"
+  [ "$(away_ledger_version_names "$state")" = "$version" ] \
+    || fail "the unremovable version must still be listed as retained"
+
+  chmod 700 "$state/tg-away-versions/$version"
+  away_ledger_versions_retire_all "$state" \
+    || fail "retirement must succeed once the version can be removed"
+  [ -z "$(away_ledger_version_names "$state")" ] \
+    || fail "acknowledged retirement must leave no version behind"
+  pass "whole-version retirement reports failure until the store is provably empty"
+}
+
 # An uncertain outcome poisons the batch for the phone: confirmation can only ever
 # extend a contiguous proven prefix, so a later line is never sent (which would
 # risk a duplicate of the uncertain one) and never presented as delivered.
@@ -1490,6 +1634,12 @@ test_away_version_switch_is_refused_while_a_daemon_is_live
 test_away_version_switch_installs_the_whole_unit_and_replays
 test_away_fold_versions_emits_each_escalation_once
 test_away_no_adoption_or_merge_apis_remain
+test_away_only_the_owner_writes_the_version_store
+test_away_peek_never_writes_and_read_migrates_only_live
+test_away_version_publish_migrates_into_the_successor_only
+test_away_fold_versions_never_mutates_a_legacy_version
+test_away_entry_capture_keeps_the_predecessor_before_a_clear
+test_away_versions_retire_all_refuses_while_a_version_survives
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_client_exit_125_is_never_proven_local
 test_away_delivery_refuses_untracked_sends

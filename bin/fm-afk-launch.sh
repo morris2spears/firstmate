@@ -99,21 +99,16 @@ fm_afk_launch_versions_sweep() {
   return 0
 }
 
-# Make the version store consistent BEFORE a daemon can be started: sweep, then
-# replay an interrupted active-pointer switch. This is the only point in the
-# launcher where a version's content may reach the live paths, and the owner
-# itself refuses the switch (rc 3) if a daemon is live, so no post-start switch
-# is possible even by mistake. A refusal is not a fault - the version stays
-# published and the return catch-up folds it.
-fm_afk_launch_versions_prepare() {
-  local rc=0
-  fm_afk_launch_versions_sweep
-  away_ledger_version_apply_pending "$FM_AFK_LAUNCH_STATE" \
+# The entry-boundary transaction, owned by the ledger: sweep, replay an
+# interrupted active-pointer switch, and capture the predecessor unit as one
+# immutable version whose name is printed. This is the only point in the launcher
+# where a version's content may reach the live paths, and the owner itself refuses
+# the switch (rc 3) if a daemon is live, so no post-start switch is possible even
+# by mistake. The stale-artifact clear below runs only once this has succeeded.
+fm_afk_launch_entry_capture() {
+  away_ledger_entry_capture "$FM_AFK_LAUNCH_STATE" \
     "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" || rc=$?
-  [ "$rc" -ne 1 ] \
-    || fm_afk_launch_log "could not finish an interrupted away batch version switch"
-  return 0
+    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged"
 }
 
 fm_afk_launch_lock_owned() {
@@ -518,17 +513,14 @@ fm_afk_launch_start() {
     return 0
   fi
 
-  fm_afk_launch_versions_prepare
   if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
     had_afk=1
     afk_content=$(cat "$FM_AFK_LAUNCH_STATE/.afk" 2>/dev/null) || return 1
   fi
-  version=$(away_ledger_version_publish "$FM_AFK_LAUNCH_STATE" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged") || {
-      fm_afk_launch_log "could not publish the pre-launch away batch version"
-      return 1
-    }
+  version=$(fm_afk_launch_entry_capture) || {
+    fm_afk_launch_log "could not capture the pre-launch away batch as an immutable version"
+    return 1
+  }
   if ! fm_afk_launch_reconcile; then
     result=1
   else
@@ -581,17 +573,14 @@ fm_afk_launch_start_native() {
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0
   fi
-  fm_afk_launch_versions_prepare
   if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
     had_afk=1
     afk_content=$(cat "$FM_AFK_LAUNCH_STATE/.afk" 2>/dev/null) || return 1
   fi
-  version=$(away_ledger_version_publish "$FM_AFK_LAUNCH_STATE" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged") || {
-      fm_afk_launch_log "could not publish the pre-launch away batch version"
-      return 1
-    }
+  version=$(fm_afk_launch_entry_capture) || {
+    fm_afk_launch_log "could not capture the pre-launch away batch as an immutable version"
+    return 1
+  }
   fm_afk_launch_reconcile || result=1
   if [ "$result" -eq 0 ]; then
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" "$had_afk"; then
