@@ -400,30 +400,55 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 # Reclaim every leftover rollback-backup directory matching <backup-glob>: a
 # backup only survives past its own transaction when away_ledger_restore
 # reported a failure and the caller (fm-afk-launch.sh) deliberately kept it
-# rather than risk a partial restore. Any digest text such a backup holds is
-# merged into the live digest directory - never overwriting an existing
-# delivery's file, since delivery ids are unique per attempt - so it still
-# reaches captain chat or the return fold instead of aging out silently in an
-# orphaned copy, and the backup itself is then removed. <exclude>, when given,
-# skips one path even if it matches the glob - the caller's own in-flight
-# backup, which is not yet an orphan and must not be consumed before its own
-# transaction resolves. Called at the next lifecycle entry (away launch) and
-# at return, so no copy of actionable escalation text can outlive recovery.
-away_ledger_reclaim_backups() {  # <state> <backup-glob> [exclude]
-  local state=$1 pattern=$2 exclude=${3:-} backup digest_dir f base result=0
+# rather than risk a partial restore. Every artifact such a backup holds -
+# digest text, the escalation buffer, its ledger sidecar, and the wedge marker
+# - is merged into the live unit, never overwriting anything already live (a
+# live copy is either current or was already reconciled, so an orphaned
+# backup's copy can only ever fill a gap, never take precedence), so nothing
+# it holds ages out silently in an orphaned copy. The backup is removed only
+# once every one of its artifacts has been reconciled onto the live unit or
+# was already redundant with it; a partial failure anywhere leaves the
+# complete backup in place for the next reclaim attempt rather than discarding
+# a copy that was never actually merged. <exclude>, when given, skips one path
+# even if it matches the glob - the caller's own in-flight backup, which is
+# not yet an orphan and must not be consumed before its own transaction
+# resolves. Called before a new transaction begins and after return's fold, so
+# no copy of actionable escalation text can outlive recovery, and never while
+# a transaction is open, so a rollback can never erase what reclaim merged in.
+away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [exclude]
+  local state=$1 buf=$2 wedge=$3 pattern=$4 exclude=${5:-}
+  local backup digest_dir artifact base f ok result=0
   digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
     [ -z "$exclude" ] || [ "$backup" != "$exclude" ] || continue
+    ok=1
     if [ -d "$backup/tg-away-digest" ]; then
-      mkdir -p "$digest_dir" || { result=1; continue; }
-      for f in "$backup/tg-away-digest"/*.items; do
-        [ -f "$f" ] || continue
-        base=${f##*/}
-        [ -e "$digest_dir/$base" ] || cp -p "$f" "$digest_dir/$base" || result=1
-      done
+      if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
+        for f in "$backup/tg-away-digest"/*.items; do
+          [ -f "$f" ] || continue
+          base=${f##*/}
+          if [ -e "$digest_dir/$base" ]; then
+            :
+          elif ! cp -p "$f" "$digest_dir/$base"; then
+            ok=0
+          fi
+        done
+      else
+        ok=0
+      fi
     fi
-    rm -rf "$backup" || result=1
+    for artifact in "$buf" "${buf}.since" "$wedge"; do
+      base=${artifact##*/}
+      if [ -e "$backup/$base" ] && [ ! -e "$artifact" ]; then
+        cp -p "$backup/$base" "$artifact" || ok=0
+      fi
+    done
+    if [ "$ok" -eq 1 ]; then
+      rm -rf "$backup" || result=1
+    else
+      result=1
+    fi
   done
   return "$result"
 }

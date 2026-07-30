@@ -883,7 +883,7 @@ test_away_lifecycle_retires_tg_working_records() {
 # fold any digest text such a backup holds into the live digest directory
 # rather than let it age out silently, then remove the orphaned backup.
 test_away_reclaim_backups_folds_orphaned_digest_text() {
-  local home state backup live
+  local home state backup live mode
   home=$(make_home away-reclaim-backups)
   state="$home/state"
   backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
@@ -891,7 +891,8 @@ test_away_reclaim_backups_folds_orphaned_digest_text() {
   printf 'blocked: stranded by an interrupted restore\n' \
     > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
 
-  away_ledger_reclaim_backups "$state" "$state/.afk-launch-backup.*" \
+  away_ledger_reclaim_backups "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*" \
     || fail "reclaim must succeed when the live digest directory is writable"
 
   live="$state/tg-away-digest/1700000000-abc-a0-0-x.items"
@@ -899,8 +900,101 @@ test_away_reclaim_backups_folds_orphaned_digest_text() {
     || fail "reclaim must fold the orphaned backup's digest text into the live digest directory"
   [ "$(cat "$live" 2>/dev/null)" = 'blocked: stranded by an interrupted restore' ] \
     || fail "reclaim must preserve the orphaned digest's exact text"
+  if [ "$(uname)" = Darwin ]; then
+    mode=$(stat -f %Lp "$state/tg-away-digest" 2>/dev/null)
+  else
+    mode=$(stat -c %a "$state/tg-away-digest" 2>/dev/null)
+  fi
+  [ "$mode" = 700 ] \
+    || fail "reclaim must create the live digest directory as a private 0700 dir (got: $mode)"
   assert_absent "$backup" "reclaim must remove the orphaned backup once its digest text is folded in"
   pass "reclaim folds an orphaned rollback backup's digest text and removes the backup"
+}
+
+# A backup can also hold the escalation buffer, its ledger sidecar, and the
+# wedge marker - the artifacts an interrupted away_ledger_restore may have left
+# missing on the live unit. Reclaim must fill those gaps too, never just the
+# digest text, so a batch that was never digested is not silently discarded.
+test_away_reclaim_backups_fills_missing_buffer_and_sidecar() {
+  local home state backup buf
+  home=$(make_home away-reclaim-buffer)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: never digested before the crash\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+  printf 'wedged\n' > "$backup/.subsuper-inject-wedged"
+
+  away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    "$state/.afk-launch-backup.*" \
+    || fail "reclaim must succeed when the live artifacts are simply missing"
+
+  [ "$(cat "$buf" 2>/dev/null)" = 'blocked: never digested before the crash' ] \
+    || fail "reclaim must fill in a missing escalation buffer from the backup"
+  [ -f "${buf}.since" ] \
+    || fail "reclaim must fill in a missing ledger sidecar from the backup"
+  [ -f "$state/.subsuper-inject-wedged" ] \
+    || fail "reclaim must fill in a missing wedge marker from the backup"
+  assert_absent "$backup" "reclaim must remove the backup once every gap is filled"
+  pass "reclaim fills a missing buffer, sidecar, and wedge marker from an orphaned backup"
+}
+
+# Reclaim must never overwrite a buffer, sidecar, or wedge marker that is
+# already live - only an orphaned backup's digest text is proven safe to
+# merge; anything already present on the live unit has already been
+# reconciled (or is the current session's own) and must win.
+test_away_reclaim_backups_never_overwrites_a_live_buffer() {
+  local home state backup buf
+  home=$(make_home away-reclaim-buffer-no-clobber)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'live buffer\n' > "$buf"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'stale backup buffer\n' > "$backup/.subsuper-escalations"
+
+  away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    "$state/.afk-launch-backup.*" \
+    || fail "reclaim must succeed"
+
+  [ "$(cat "$buf" 2>/dev/null)" = 'live buffer' ] \
+    || fail "reclaim must never overwrite an existing live escalation buffer"
+  assert_absent "$backup" "reclaim must still remove the orphaned backup"
+  pass "reclaim never overwrites a live escalation buffer with an orphaned backup's copy"
+}
+
+# A copy failure partway through a backup's reconciliation must never destroy
+# the backup: the whole point of retaining it is recovery, so a merge that
+# cannot fully complete must leave the complete backup in place for the next
+# reclaim attempt rather than deleting it once some (but not all) of its
+# artifacts were folded in.
+test_away_reclaim_backups_keeps_backup_on_partial_merge_failure() {
+  local home state backup live
+  home=$(make_home away-reclaim-partial-failure)
+  state="$home/state"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  mkdir -p "$backup/tg-away-digest"
+  printf 'blocked: first item\n' > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+  printf 'blocked: second item\n' > "$backup/tg-away-digest/1700000000-abc-a0-1-y.items"
+
+  (
+    cp() {
+      case "$2" in
+        *1700000000-abc-a0-1-y.items) return 1 ;;
+        *) command cp "$@" ;;
+      esac
+    }
+    away_ledger_reclaim_backups "$state" "$state/.subsuper-escalations" \
+      "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*"
+  ) && fail "reclaim must report failure when any artifact fails to merge"
+
+  live="$state/tg-away-digest/1700000000-abc-a0-0-x.items"
+  [ -f "$live" ] \
+    || fail "reclaim must still merge the items that copied successfully"
+  [ -d "$backup" ] \
+    || fail "reclaim must keep the whole backup when any of its artifacts failed to merge"
+  [ -f "$backup/tg-away-digest/1700000000-abc-a0-1-y.items" ] \
+    || fail "the backup's unmerged item must survive for the next reclaim attempt"
+  pass "reclaim keeps the complete backup when only part of it could be merged"
 }
 
 # A live delivery id's digest file must never be clobbered by a reclaim: if the
@@ -910,13 +1004,14 @@ test_away_reclaim_backups_never_overwrites_a_live_digest() {
   local home state backup
   home=$(make_home away-reclaim-no-clobber)
   state="$home/state"
-  mkdir -p "$state/tg-away-digest"
+  (umask 077; mkdir -p "$state/tg-away-digest")
   printf 'live copy\n' > "$state/tg-away-digest/1700000000-abc-a0-0-x.items"
   backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
   mkdir -p "$backup/tg-away-digest"
   printf 'stale backup copy\n' > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
 
-  away_ledger_reclaim_backups "$state" "$state/.afk-launch-backup.*" \
+  away_ledger_reclaim_backups "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*" \
     || fail "reclaim must succeed"
 
   [ "$(cat "$state/tg-away-digest/1700000000-abc-a0-0-x.items" 2>/dev/null)" = 'live copy' ] \
@@ -1314,6 +1409,9 @@ test_away_off_mid_batch_never_repeats_delivered_events
 test_away_lifecycle_retires_tg_working_records
 test_away_reclaim_backups_folds_orphaned_digest_text
 test_away_reclaim_backups_never_overwrites_a_live_digest
+test_away_reclaim_backups_fills_missing_buffer_and_sidecar
+test_away_reclaim_backups_never_overwrites_a_live_buffer
+test_away_reclaim_backups_keeps_backup_on_partial_merge_failure
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_client_exit_125_is_never_proven_local
 test_away_delivery_refuses_untracked_sends

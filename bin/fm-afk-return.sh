@@ -177,7 +177,8 @@ return_reconcile() {
   # Reclaim any digest text stranded in a leftover launch-rollback backup (an
   # interrupted away_ledger_restore keeps its backup rather than risk a partial
   # mix) so it folds in below instead of aging out in an orphaned copy.
-  away_ledger_reclaim_backups "$STATE" "$STATE/.afk-launch-backup.*" 2>/dev/null || true
+  away_ledger_reclaim_backups "$STATE" "$STATE/.subsuper-escalations" \
+    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || true
   # An accepted away batch has already been receipted and its buffer truncated, so
   # the ledger owner's private digests are the only local copy of those events.
   # Fold them in BEFORE anything retires them.
