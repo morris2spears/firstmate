@@ -988,6 +988,319 @@ fm_backend_herdr_container_ensure() {  # <cwd-for-a-fresh-workspace>
   printf '%s:%s\t%s' "$session" "$FM_BACKEND_HERDR_WS_ID" "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID"
 }
 
+# --- per-project shared workspaces (docs/herdr-backend.md "Project workspaces") ---
+#
+# The third presentation layout: every crewmate/scout for one project lands in
+# ONE durable workspace labeled after that project, instead of the flat home
+# workspace or a disposable one-task projection. The container is identified by
+# a per-home, per-project journal under state/.herdr-project-spaces/ binding
+# the canonical project path to an exact workspace_id plus a random 128-bit
+# token that also rides the workspace label as " · p:<token>". Adoption
+# requires the exact recorded workspace_id AND the exact recorded token-bearing
+# label, unique across the named session - a bare label match (e.g. a
+# captain-made workspace named after the same project) is NEVER adoption
+# authority, unlike the per-home "firstmate" label find. Every non-provable
+# state falls back loudly to the ordinary flat layout or a fresh create; the
+# journal, token, and label never authorize send, capture, task ownership,
+# Treehouse return, closure, deletion, or recovery.
+
+# fm_backend_herdr_presentation_mode: resolve the layout selected by the local
+# config/herdr-presentation-spaces file. Prints exactly one of:
+#   off     - file absent: the default flat per-home workspace layout.
+#   task    - file present with an empty body or the literal value "task": the
+#             disposable one-task projection. Empty-body compatibility keeps
+#             every pre-existing presence-flag file behaving byte-identically.
+#   project - file present with the literal value "project": one shared
+#             per-project workspace, adopted or created through the project
+#             container journal below.
+# The value is the file's first non-empty line, trimmed of surrounding
+# whitespace. Any other value warns and resolves to task: presence already
+# meant the projection before values existed, so an unrecognized value must
+# not silently change the captain's layout to flat.
+fm_backend_herdr_presentation_mode() {  # <config-dir>
+  local config=${1:-} value
+  if [ -z "$config" ] || [ ! -f "$config/herdr-presentation-spaces" ]; then
+    printf 'off'
+    return 0
+  fi
+  value=$(awk 'NF { print; exit }' "$config/herdr-presentation-spaces" 2>/dev/null \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  case "$value" in
+    ''|task) printf 'task' ;;
+    project) printf 'project' ;;
+    *)
+      echo "warning: unrecognized herdr-presentation-spaces value '$value'; using the disposable per-task layout" >&2
+      printf 'task'
+      ;;
+  esac
+}
+
+FM_BACKEND_HERDR_PROJECT_JOURNAL_DIR=".herdr-project-spaces"
+
+# fm_backend_herdr_project_identity: one canonical physical path per project,
+# so symlinked spellings of the same checkout share one journal and one space.
+fm_backend_herdr_project_identity() {  # <project-path>
+  [ -d "$1" ] || return 1
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+
+# fm_backend_herdr_project_name: the human label component - the project
+# directory's basename with control characters stripped, never empty.
+fm_backend_herdr_project_name() {  # <canonical-project-path>
+  local name
+  name=$(basename "$1" 2>/dev/null | tr -d '[:cntrl:]')
+  [ -n "$name" ] || name=project
+  printf '%s' "$name"
+}
+
+# fm_backend_herdr_project_workspace_label: "<project> · p:<token>", the same
+# non-authoritative visible-correlator suffix format as the per-task
+# projection labels (Herdr exposes no verified hidden persistent field). The
+# leading component deliberately lacks the per-task "└ " prefix so the
+# session-start restored-child cleanup grammar can never match it.
+fm_backend_herdr_project_workspace_label() {  # <canonical-project-path> <projection-id>
+  printf '%s · p:%s' "$(fm_backend_herdr_project_name "$1")" "$2"
+}
+
+# fm_backend_herdr_project_journal_path: state/.herdr-project-spaces/<slug>-<hash>,
+# one file per canonical project path in THIS home's own state dir. The slug
+# keeps the file human-recognizable; the path hash is the identity.
+fm_backend_herdr_project_journal_path() {  # <state-dir> <canonical-project-path>
+  local state=$1 project=$2 hash slug
+  [ -n "$state" ] && [ -n "$project" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    hash=$(printf '%s' "$project" | shasum -a 256 2>/dev/null | awk '{print $1}')
+  elif command -v sha256sum >/dev/null 2>&1; then
+    hash=$(printf '%s' "$project" | sha256sum 2>/dev/null | awk '{print $1}')
+  else
+    return 1
+  fi
+  [ -n "$hash" ] || return 1
+  slug=$(fm_backend_herdr_project_name "$project" | tr -c 'A-Za-z0-9._-' '-')
+  slug=${slug%-}
+  slug=${slug:0:40}
+  [ -n "$slug" ] || slug=project
+  printf '%s/%s/%s-%s' "$state" "$FM_BACKEND_HERDR_PROJECT_JOURNAL_DIR" "$slug" "${hash:0:16}"
+}
+
+# fm_backend_herdr_project_journal_write: atomically publish one project
+# container journal. Version 1 (no workspace_id) records a create attempt
+# before the workspace exists; version 2 binds the exact created workspace_id.
+# The caller serializes writers through the session presentation lock.
+fm_backend_herdr_project_journal_write() {  # <journal> <canonical-project-path> <session> <token> <label> [workspace-id]
+  local journal=$1 project=$2 session=$3 token=$4 label=$5 workspace=${6:-} dir tmp
+  dir=$(dirname "$journal")
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp "$dir/.write.XXXXXX") || return 1
+  chmod 0600 "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! {
+    if [ -n "$workspace" ]; then printf 'version=2\n'; else printf 'version=1\n'; fi
+    printf 'project=%s\n' "$project"
+    printf 'session=%s\n' "$session"
+    printf 'projection_id=%s\n' "$token"
+    printf 'label=%s\n' "$label"
+    [ -z "$workspace" ] || printf 'workspace_id=%s\n' "$workspace"
+  } > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$journal"
+}
+
+# fm_backend_herdr_project_journal_snapshot: strictly validate one project
+# container journal against <canonical-project-path> without sourcing shell
+# code, mirroring the per-task journal snapshot. Sets the
+# FM_BACKEND_HERDR_PROJECT_JOURNAL_* globals for same-process callers; any
+# structural deviation (wrong line count, duplicate or missing key, symlink,
+# token shape, project or recomputed-label mismatch) fails.
+fm_backend_herdr_project_journal_snapshot() {  # <journal> <canonical-project-path>
+  local journal=$1 project=$2 lines expected_label
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_VERSION=""
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_SESSION=""
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_PROJECTION_ID=""
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_LABEL=""
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_WORKSPACE_ID=""
+  [ -f "$journal" ] && [ ! -L "$journal" ] || return 1
+  lines=$(wc -l < "$journal" 2>/dev/null | tr -d '[:space:]')
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_VERSION=$(fm_backend_herdr_projection_journal_field "$journal" version) || return 1
+  [ "$(fm_backend_herdr_projection_journal_field "$journal" project)" = "$project" ] || return 1
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_SESSION=$(fm_backend_herdr_projection_journal_field "$journal" session) || return 1
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_PROJECTION_ID=$(fm_backend_herdr_projection_journal_field "$journal" projection_id) || return 1
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_LABEL=$(fm_backend_herdr_projection_journal_field "$journal" label) || return 1
+  case "$FM_BACKEND_HERDR_PROJECT_JOURNAL_SESSION" in
+    ''|*[[:space:]]*) return 1 ;;
+  esac
+  [ "${#FM_BACKEND_HERDR_PROJECT_JOURNAL_PROJECTION_ID}" -eq 22 ] || return 1
+  case "$FM_BACKEND_HERDR_PROJECT_JOURNAL_PROJECTION_ID" in
+    *[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  expected_label=$(fm_backend_herdr_project_workspace_label "$project" "$FM_BACKEND_HERDR_PROJECT_JOURNAL_PROJECTION_ID")
+  [ "$FM_BACKEND_HERDR_PROJECT_JOURNAL_LABEL" = "$expected_label" ] || return 1
+  case "$FM_BACKEND_HERDR_PROJECT_JOURNAL_VERSION:$lines" in
+    1:5) return 0 ;;
+    2:6) ;;
+    *) return 1 ;;
+  esac
+  FM_BACKEND_HERDR_PROJECT_JOURNAL_WORKSPACE_ID=$(fm_backend_herdr_projection_journal_field "$journal" workspace_id) || return 1
+  case "$FM_BACKEND_HERDR_PROJECT_JOURNAL_WORKSPACE_ID" in
+    ''|*[[:space:]]*) return 1 ;;
+  esac
+  return 0
+}
+
+# fm_backend_herdr_project_container_ensure: adopt or create THIS home's
+# shared workspace for <project-path> inside <session>, called by fm-spawn.sh
+# under the session presentation lock. Echoes the same
+# "<session>:<workspace_id>\t<seeded_default_tab_id>" contract as
+# fm_backend_herdr_container_ensure (the seeded field is EMPTY for an adopted
+# workspace, so the created-versus-adopted prune gate carries over untouched),
+# letting the ordinary fm_backend_herdr_create_task path run unchanged.
+#
+# Adoption is provable or it does not happen:
+#   - a valid version 2 journal whose exact workspace_id is live, whose label
+#     is byte-identical to the recorded token-bearing label, and whose token
+#     suffix is unique across the named session -> ADOPT (exact id authority;
+#     the label agreement is a required corroborator, never the finder).
+#   - the recorded workspace_id absent from the session -> the container was
+#     legitimately removed (closing its last tab removes a workspace); CREATE
+#     a fresh workspace with a NEW token and rebind the journal.
+#   - a renamed label, a duplicated token suffix, or a duplicated workspace id
+#     -> not provably firstmate's own container; warn loudly and return 2 so
+#     the caller uses the ordinary flat layout WITHOUT touching the journal or
+#     any workspace.
+#   - a version 1 journal (a create attempt that never bound) -> a prior crash
+#     may have left an orphan workspace; warn loudly and CREATE fresh rather
+#     than adopt anything by token or label.
+#   - a malformed journal -> warn loudly and return 2, preserving the file for
+#     inspection.
+# Returns 0 with the container on stdout, or 2 for every fall-back-to-flat
+# outcome (its warning already printed). It never closes, deletes, renames,
+# moves, or reuses an existing workspace, and a create failure after the
+# workspace exists degrades to flat while the version 1 journal quarantines
+# the attempt.
+fm_backend_herdr_project_container_ensure() {  # <session> <state-dir> <project-path>
+  local session=$1 state=$2 project_raw=$3
+  local project journal token label wsid list count out seeded_tab seeded_pane focus_before name
+  fm_backend_herdr_version_check || return 2
+  fm_backend_herdr_server_ensure "$session" || return 2
+  project=$(fm_backend_herdr_project_identity "$project_raw") || {
+    echo "warning: herdr project workspace could not resolve the project path exactly; using the ordinary flat layout" >&2
+    return 2
+  }
+  name=$(fm_backend_herdr_project_name "$project")
+  journal=$(fm_backend_herdr_project_journal_path "$state" "$project") || {
+    echo "warning: herdr project workspace could not derive a journal path for '$name'; using the ordinary flat layout" >&2
+    return 2
+  }
+  list=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || {
+    echo "warning: herdr project workspace could not list workspaces; using the ordinary flat layout" >&2
+    return 2
+  }
+  printf '%s' "$list" | jq -e '(.result.workspaces | type) == "array"' >/dev/null 2>&1 || {
+    echo "warning: herdr project workspace could not parse the workspace list; using the ordinary flat layout" >&2
+    return 2
+  }
+
+  if [ -e "$journal" ] || [ -L "$journal" ]; then
+    if ! fm_backend_herdr_project_journal_snapshot "$journal" "$project"; then
+      echo "warning: malformed herdr project workspace journal for '$name'; using the ordinary flat layout and preserving it for inspection" >&2
+      return 2
+    fi
+    if [ "$FM_BACKEND_HERDR_PROJECT_JOURNAL_SESSION" != "$session" ]; then
+      echo "warning: herdr project workspace journal for '$name' binds a different named session; creating a fresh project workspace here" >&2
+    elif [ "$FM_BACKEND_HERDR_PROJECT_JOURNAL_VERSION" = 1 ]; then
+      echo "warning: herdr project workspace journal for '$name' records an unbound create attempt; a prior crash may have left an orphan workspace needing manual cleanup - creating a fresh project workspace" >&2
+    else
+      wsid=$FM_BACKEND_HERDR_PROJECT_JOURNAL_WORKSPACE_ID
+      token=$FM_BACKEND_HERDR_PROJECT_JOURNAL_PROJECTION_ID
+      label=$FM_BACKEND_HERDR_PROJECT_JOURNAL_LABEL
+      count=$(printf '%s' "$list" | jq -r --arg id "$wsid" \
+        '[.result.workspaces[]? | select(.workspace_id == $id)] | length' 2>/dev/null)
+      case "$count" in
+        0)
+          : # the recorded workspace is gone (last tab closed); create fresh below
+          ;;
+        1)
+          if printf '%s' "$list" | jq -e --arg id "$wsid" --arg wlabel "$label" --arg suffix " · p:$token" '
+            (.result.workspaces) as $spaces
+            | ([$spaces[] | select(.workspace_id == $id and .label == $wlabel)] | length) == 1
+            and ([$spaces[] | select((.label | type) == "string" and (.label | endswith($suffix)))] | length) == 1
+            and ([$spaces[] | select(.workspace_id == $id and (.label | type) == "string" and (.label | endswith($suffix)))] | length) == 1
+          ' >/dev/null 2>&1; then
+            printf '%s:%s\t' "$session" "$wsid"
+            return 0
+          fi
+          echo "warning: the recorded herdr project workspace for '$name' was renamed or its token is duplicated; not provably firstmate's own container - using the ordinary flat layout and touching nothing" >&2
+          return 2
+          ;;
+        *)
+          echo "warning: the recorded herdr project workspace id for '$name' is ambiguous in session '$session'; using the ordinary flat layout and touching nothing" >&2
+          return 2
+          ;;
+      esac
+    fi
+  fi
+
+  token=$(fm_backend_herdr_projection_id) || {
+    echo "warning: could not generate a herdr project workspace token for '$name'; using the ordinary flat layout" >&2
+    return 2
+  }
+  label=$(fm_backend_herdr_project_workspace_label "$project" "$token")
+  # Focus safety: a completely empty session has nothing to preserve (and its
+  # first workspace focuses regardless); otherwise an exact snapshot is
+  # required before the create, exactly like the per-task projection.
+  focus_before=$(fm_backend_herdr_projection_focus_snapshot "$session") || focus_before=
+  if [ -z "$focus_before" ]; then
+    count=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null \
+      | jq -r '.result.workspaces | length' 2>/dev/null)
+    if [ "$count" != 0 ]; then
+      echo "warning: herdr project workspace create could not capture exact active focus; using the ordinary flat layout" >&2
+      return 2
+    fi
+  fi
+  fm_backend_herdr_project_journal_write "$journal" "$project" "$session" "$token" "$label" || {
+    echo "warning: could not record the herdr project workspace attempt for '$name'; using the ordinary flat layout" >&2
+    return 2
+  }
+  if ! out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$project" --label "$label" --no-focus 2>/dev/null); then
+    [ -z "$focus_before" ] || fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "project workspace create" || true
+    echo "warning: herdr project workspace create failed for '$name'; using the ordinary flat layout" >&2
+    return 2
+  fi
+  wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
+  seeded_tab=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
+  seeded_pane=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null)
+  if [ -n "$focus_before" ] \
+     && ! fm_backend_herdr_projection_focus_restore "$session" "$focus_before" "project workspace create"; then
+    fm_backend_herdr_projection_cleanup_exact "$session" "" "$seeded_pane"
+    echo "warning: herdr project workspace create did not preserve exact active focus for '$name'; using the ordinary flat layout" >&2
+    return 2
+  fi
+  if [ -z "$wsid" ] || [ -z "$seeded_tab" ] || [ -z "$seeded_pane" ]; then
+    echo "warning: herdr project workspace create returned incomplete IDs for '$name'; using the ordinary flat layout (a partial workspace may need manual cleanup)" >&2
+    return 2
+  fi
+  list=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || list=
+  if ! printf '%s' "$list" | jq -e --arg id "$wsid" --arg wlabel "$label" --arg suffix " · p:$token" '
+    (.result.workspaces // null) as $spaces
+    | ($spaces | type) == "array"
+    and ([$spaces[] | select(.workspace_id == $id)] | length) == 1
+    and ([$spaces[] | select(.workspace_id == $id and .label == $wlabel)] | length) == 1
+    and ([$spaces[] | select((.label | type) == "string" and (.label | endswith($suffix)))] | length) == 1
+  ' >/dev/null 2>&1; then
+    fm_backend_herdr_projection_cleanup_exact "$session" "" "$seeded_pane"
+    echo "warning: herdr project workspace create did not converge to one exact container for '$name'; using the ordinary flat layout" >&2
+    return 2
+  fi
+  fm_backend_herdr_project_journal_write "$journal" "$project" "$session" "$token" "$label" "$wsid" || {
+    fm_backend_herdr_projection_cleanup_exact "$session" "" "$seeded_pane"
+    echo "warning: could not bind the herdr project workspace journal for '$name'; using the ordinary flat layout" >&2
+    return 2
+  }
+  printf '%s:%s\t%s' "$session" "$wsid" "$seeded_tab"
+  return 0
+}
+
 # fm_backend_herdr_pane_agent_state: classify <pane_id> in <session> as one of
 # dead|no-agent|live|unknown, purely from the JSON body of two read-only
 # calls - never from process exit status, since a business-logic "not found"

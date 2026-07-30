@@ -7,8 +7,9 @@
 # spawn on codex too, primary config/backlog-backend=manual makes that home
 # hand-edit backlog files too, primary config/backend pins that home's local
 # runtime-backend default for future spawns, and primary
-# config/herdr-presentation-spaces enables the same default-off Herdr presentation
-# projection). It also pushes the one primary-authoritative shared
+# config/herdr-presentation-spaces selects the same default-off Herdr
+# presentation layout, per-task or per-project). It also pushes the one
+# primary-authoritative shared
 # captain-preference file, data/captain-shared.md, into each secondmate home's
 # data/ as a read-only copy.
 #

@@ -45,6 +45,11 @@
 # Projected closes share the presentation-order lock, refuse to close the
 # captain's active tab, and restore the exact response-derived pre-close tab
 # if Herdr's last-pane cleanup focuses an unrelated neighboring workspace.
+# A task recorded with herdr_project_space=1 (a shared per-project workspace,
+# docs/herdr-backend.md "Project workspaces") closes its exact pane through
+# that same lock-serialized focus-preserving path, because the shared space
+# can hold the captain's own tabs; its durable per-project journal is never
+# retired by teardown and `workspace close` is never called.
 # Secondmates (kind=secondmate in meta) are retired explicitly. Normal
 # teardown refuses while their home has in-flight crewmate meta files; --force
 # is the approved discard path that prevalidates child removal targets, discards
@@ -1180,32 +1185,63 @@ if [ "$BACKEND" = herdr ] \
   fi
 fi
 
-if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
-  # shellcheck source=bin/fm-wake-lib.sh
-  . "$SCRIPT_DIR/fm-wake-lib.sh"
-  HERDR_PRESENTATION_FOCUS_LOCK=
-  HERDR_PRESENTATION_FOCUS_LOCK_HELD=0
-  HERDR_PRESENTATION_FOCUS_LOCK_ATTEMPT=0
-  if HERDR_PRESENTATION_FOCUS_LOCK=$(fm_backend_herdr_presentation_session_lock_path "$HERDR_PRESENTATION_SESSION"); then
-    while [ "$HERDR_PRESENTATION_FOCUS_LOCK_ATTEMPT" -lt 50 ]; do
-      if fm_lock_try_acquire "$HERDR_PRESENTATION_FOCUS_LOCK"; then
-        HERDR_PRESENTATION_FOCUS_LOCK_HELD=1
+# A task recorded in a shared per-project workspace closes its exact pane
+# through the same lock-serialized, focus-preserving projected path: the
+# workspace may hold the captain's own tabs (a dev server) and other tasks, so
+# a last-pane focus jump or an active-tab close must be refused exactly like a
+# presentation cleanup. The per-project journal is durable and is never
+# retired here; teardown never closes a workspace.
+HERDR_PROJECT_SPACE_TASK=0
+HERDR_PROJECT_SPACE_UNSAFE=0
+if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" != 1 ] && [ "$BACKEND" = herdr ] \
+   && [ "$(meta_value "$META" herdr_project_space)" = 1 ]; then
+  fm_backend_source herdr || true
+  HERDR_PRESENTATION_SESSION=$(meta_value "$META" herdr_session)
+  HERDR_PRESENTATION_PANE=$(meta_value "$META" herdr_pane_id)
+  if [ -n "$HERDR_PRESENTATION_SESSION" ] \
+     && [ -n "$HERDR_PRESENTATION_PANE" ] \
+     && [ "$T" = "$HERDR_PRESENTATION_SESSION:$HERDR_PRESENTATION_PANE" ]; then
+    HERDR_PROJECT_SPACE_TASK=1
+  else
+    # The recorded endpoint identities disagree, so no pane can be closed
+    # exactly. A plain kill here would close an unverified pane in a shared
+    # workspace holding the captain's own tabs; refuse instead.
+    HERDR_PROJECT_SPACE_UNSAFE=1
+    echo "warning: herdr project-workspace metadata for $ID is inconsistent; refusing an inexact pane close and leaving its shared project workspace untouched" >&2
+  fi
+fi
+
+herdr_focus_safe_pane_close() {  # <session> <pane>
+  local session=$1 pane=$2 lock lock_held=0 attempt=0
+  if lock=$(fm_backend_herdr_presentation_session_lock_path "$session"); then
+    while [ "$attempt" -lt 50 ]; do
+      if fm_lock_try_acquire "$lock"; then
+        lock_held=1
         break
       fi
       sleep 0.1
-      HERDR_PRESENTATION_FOCUS_LOCK_ATTEMPT=$((HERDR_PRESENTATION_FOCUS_LOCK_ATTEMPT + 1))
+      attempt=$((attempt + 1))
     done
   fi
-  if [ "$HERDR_PRESENTATION_FOCUS_LOCK_HELD" = 1 ]; then
+  if [ "$lock_held" = 1 ]; then
     fm_backend_herdr_projection_close_pane_focus_preserving \
-      "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_PANE" 2>/dev/null || true
-    HERDR_PRESENTATION_FOCUS_LOCK_HELD=0
-    fm_lock_release "$HERDR_PRESENTATION_FOCUS_LOCK" || true
+      "$session" "$pane" 2>/dev/null || true
+    fm_lock_release "$lock" || true
   else
     echo "warning: herdr presentation focus lock unavailable; refusing a concurrent focus-unsafe pane close" >&2
   fi
-elif [ "$BACKEND" != orca ]; then
+}
+
+if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ] || [ "$HERDR_PROJECT_SPACE_TASK" = 1 ]; then
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$SCRIPT_DIR/fm-wake-lib.sh"
+  herdr_focus_safe_pane_close "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_PANE"
+elif [ "$BACKEND" != orca ] && [ "$HERDR_PROJECT_SPACE_UNSAFE" != 1 ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
+fi
+if [ "$HERDR_PROJECT_SPACE_TASK" = 1 ] \
+   && [ "$(fm_backend_herdr_pane_agent_state "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_PANE")" != dead ]; then
+  echo "warning: exact herdr task-pane close could not be confirmed for $ID; its shared project workspace was left untouched" >&2
 fi
 if [ "$HERDR_PRESENTATION_RETIRE_CANDIDATE" = 1 ]; then
   if [ "$(fm_backend_herdr_pane_agent_state "$HERDR_PRESENTATION_SESSION" "$HERDR_PRESENTATION_PANE")" = dead ]; then
