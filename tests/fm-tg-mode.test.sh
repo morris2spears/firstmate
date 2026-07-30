@@ -1132,6 +1132,45 @@ test_away_ledger_migrates_older_record_shapes() {
   pass "the ledger owner migrates older record shapes in place and still fails closed"
 }
 
+# The retry schedule must stay armed even in the documented immediate-batching
+# mode, where housekeeping flushes on every tick: a non-positive delay would spin
+# the whole reserve/attempt/spool/release cycle and mint an evidence file per tick.
+test_away_retry_throttle_survives_immediate_batching() {
+  local home state tg injected retry_after evidence_count
+  home=$(make_home away-retry-throttle)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: client offline under immediate batching'
+
+  (
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FM_ESCALATE_BATCH_SECS=0 FM_TG_AWAY_RETRY_SECS=0 \
+      FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+
+  retry_after=$(away_ledger_read "$state/.subsuper-escalations" | cut -d' ' -f6)
+  [ "$retry_after" -gt 0 ] \
+    || fail "a retired proven-local attempt must arm a positive retry schedule (got: $retry_after)"
+  evidence_count=$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')
+
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FM_ESCALATE_BATCH_SECS=0 FM_TG_AWAY_RETRY_SECS=0 \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "the still-wedged receipt must leave escalate_flush unconfirmed"
+
+  assert_grep 'Telegram delivery deferred' "$injected" \
+    "an armed retry schedule must defer the next tick's attempt"
+  assert_absent "$home/tg-sent.log" "a deferred tick must not contact the phone"
+  [ "$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')" -eq "$evidence_count" ] \
+    || fail "a deferred tick must not mint another evidence record"
+  pass "the proven-local retry schedule stays bounded under immediate batching"
+}
+
 test_supervision_instructions_carry_tg_cadence() {
   local home out
   home="$TMP_ROOT/sup-instructions"; mkdir -p "$home/config"
@@ -1194,6 +1233,7 @@ test_away_delivery_refuses_malformed_counts
 test_away_proven_local_failure_retries_the_same_lines
 test_away_unwritable_ledger_leaves_the_id_retryable
 test_away_ledger_migrates_older_record_shapes
+test_away_retry_throttle_survives_immediate_batching
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence
 

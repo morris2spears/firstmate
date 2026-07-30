@@ -685,12 +685,21 @@ telegram_away_send_file() {  # <spool-file>
 }
 
 # How long a retired proven-local attempt waits before the same lines may be
-# offered to the phone again. Defaults to one batch window, so a persistent local
-# failure retries on that cadence instead of once per housekeeping tick.
+# offered to the phone again. ALWAYS positive: FM_TG_AWAY_RETRY_SECS wins only when
+# it supplies a positive bound of its own, otherwise the batch window is used and a
+# non-positive or malformed window falls back to the default. Immediate batching
+# (FM_ESCALATE_BATCH_SECS=0) therefore keeps flushing every tick as documented
+# while a persistent local failure still re-attempts on a bounded cadence instead
+# of once per tick.
 telegram_away_retry_secs() {
-  local secs=${FM_TG_AWAY_RETRY_SECS:-${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}}
-  away_ledger_is_count "$secs" || secs=$ESCALATE_BATCH_SECS_DEFAULT
-  printf '%s\n' "$secs"
+  local secs
+  for secs in "${FM_TG_AWAY_RETRY_SECS:-}" "${FM_ESCALATE_BATCH_SECS:-}"; do
+    if away_ledger_is_count "$secs" && [ "$secs" -gt 0 ]; then
+      printf '%s\n' "$secs"
+      return 0
+    fi
+  done
+  printf '%s\n' "$ESCALATE_BATCH_SECS_DEFAULT"
 }
 
 telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <batch-id>
