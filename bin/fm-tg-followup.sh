@@ -154,16 +154,17 @@ fi
 STRIPPED=$(printf '%s' "$TEXT" | tr -d '[:space:]')
 [ -n "$STRIPPED" ] || { echo "fm-tg-followup: refusing to send an empty follow-up" >&2; exit 2; }
 
-TG_BIN=${FMTG_TG_BIN:-$HOME/dev/phone-inbox/tg}
-if [ ! -f "$TG_BIN" ] || [ ! -x "$TG_BIN" ]; then
-  echo "fm-tg-followup: phone-inbox tg client not runnable at $TG_BIN" >&2
-  exit 1
-fi
-
 # The text travels on stdin only; tg owns the Telegram message limit.
-# fmtg_send_stdin keeps every firstmate outbound path on this same client.
+# fmtg_send_stdin keeps every firstmate outbound path on this same client and
+# owns resolving/validating it, so this script only classifies the result: 127 is
+# specifically "no runnable client", everything else is a rejected send.
 if ! printf '%s' "$TEXT" | fmtg_send_stdin; then
-  echo "fm-tg-followup: tg send failed; link kept for retry" >&2
+  RC=$?
+  if [ "$RC" -eq 127 ]; then
+    echo "fm-tg-followup: phone-inbox tg client not runnable at $(fmtg_tg_bin)" >&2
+  else
+    echo "fm-tg-followup: tg send failed; link kept for retry" >&2
+  fi
   exit 1
 fi
 

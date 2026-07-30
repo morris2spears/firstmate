@@ -606,6 +606,64 @@ test_away_delivery_acceptance_does_not_duplicate_alert_in_chat() {
   pass "accepted away alerts reach Telegram once without duplicating their contents in captain chat"
 }
 
+test_away_batch_never_resends_accepted_events() {
+  local home state tg injected sends
+  home=$(make_home away-grown-batch)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+
+  # First event: Telegram accepts it, but the in-session receipt is wedged, so
+  # the buffer and its batch identity are preserved for retry.
+  printf 'stale persisted 300s (possible wedge): fm-task-3\n' > "$state/.subsuper-escalations"
+  printf '1700000010\n' > "$state/.subsuper-escalations.since"
+  (
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+  assert_grep 'fm-task-3' "$home/tg-sent.log" "the first event must reach the phone"
+
+  # A second event appends while the receipt is still wedged. The phone must
+  # receive ONLY the new event, never a repeat of the accepted one.
+  printf 'needs-decision: approve privileged cutover\n' >> "$state/.subsuper-escalations"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "the grown away batch must flush once the receipt lands"
+  sends=$(grep -c '^---$' "$home/tg-sent.log")
+  [ "$sends" -eq 2 ] || fail "the grown batch must reach the phone once per new event (got $sends sends)"
+  [ "$(grep -c 'fm-task-3' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "an already-accepted away event must never be sent to the phone twice"
+  assert_grep 'approve privileged cutover' "$home/tg-sent.log" \
+    "the newly appended event must reach the phone"
+  assert_no_grep 'approve privileged cutover' "$injected" \
+    "an accepted away alert must not be duplicated into captain chat"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "the confirmed receipt must clear the away buffer"
+
+  # A later failure must not repeat the events Telegram already delivered.
+  printf 'blocked: credential needed\n' > "$state/.subsuper-escalations"
+  printf '1700000020\n' > "$state/.subsuper-escalations.since"
+  (
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave the second batch unconfirmed"
+  printf 'paused 600s (awaiting external): fm-task-9\n' >> "$state/.subsuper-escalations"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 escalate_flush "$state"
+  ) || fail "a failed Telegram send must still complete the in-session fallback"
+  assert_grep 'fm-task-9' "$injected" \
+    "the undelivered event must reach the in-session fallback"
+  assert_no_grep 'credential needed' "$injected" \
+    "the fallback must not repeat an event Telegram already delivered"
+  pass "an away batch that grows while the receipt is wedged never re-sends accepted events"
+}
+
 test_supervision_instructions_carry_tg_cadence() {
   local home out
   home="$TMP_ROOT/sup-instructions"; mkdir -p "$home/config"
@@ -657,6 +715,7 @@ test_away_delivery_is_inert_outside_away_mode
 test_away_delivery_is_accepted_once_and_records_no_content
 test_away_delivery_failure_classes_and_safe_chat_fallback
 test_away_delivery_acceptance_does_not_duplicate_alert_in_chat
+test_away_batch_never_resends_accepted_events
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence
 
