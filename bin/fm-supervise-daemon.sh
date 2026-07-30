@@ -684,9 +684,18 @@ telegram_away_send_file() {  # <spool-file>
   fmtg_send_stdin < "$1"
 }
 
+# How long a retired proven-local attempt waits before the same lines may be
+# offered to the phone again. Defaults to one batch window, so a persistent local
+# failure retries on that cadence instead of once per housekeeping tick.
+telegram_away_retry_secs() {
+  local secs=${FM_TG_AWAY_RETRY_SECS:-${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}}
+  away_ledger_is_count "$secs" || secs=$ESCALATE_BATCH_SECS_DEFAULT
+  printf '%s\n' "$secs"
+}
+
 telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <batch-id>
   local state=$1 body=$2 offset=${3:-} total=${4:-} accounted=${5:-} batch_id=${6:-}
-  local buf rec led_id led_reserved led_confirmed led_accounted led_attempt led_did
+  local buf rec led_id led_reserved led_confirmed led_accounted led_attempt led_retry led_did
   local delivery_id dir base record status now rc alert spool
   if [ "${FM_TG_AWAY_EXEC:-live}" = discard ] || ! afk_active "$state" || ! fmtg_enabled "$FM_HOME"; then
     printf 'off|none\n'
@@ -697,7 +706,11 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
     || { printf 'unavailable|none\n'; return 0; }
   rec=$(away_ledger_read "$buf")
   [ "$rec" != unknown ] || { printf 'unavailable|none\n'; return 0; }
-  IFS=' ' read -r led_id led_reserved led_confirmed led_accounted led_attempt led_did <<< "$rec"
+  IFS=' ' read -r led_id led_reserved led_confirmed led_accounted led_attempt led_retry led_did <<< "$rec"
+  if ! away_ledger_retry_due "$led_retry"; then
+    printf 'deferred|%s\n' "$led_did"
+    return 0
+  fi
   if [ "$batch_id" != "$led_id" ] \
     || [ "$offset" -ne "$led_reserved" ] || [ "$offset" -ne "$led_confirmed" ] \
     || [ "$accounted" -ne "$led_accounted" ] || [ "$total" -le "$offset" ]; then
@@ -733,18 +746,20 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
     return 0
   fi
 
+  # No durable ownership, no attempt: publishing an outcome here would tombstone a
+  # delivery id that never reserved or sent anything, and the ledger write that
+  # would retire it is the very write that just failed. Leaving the id untouched
+  # lets the next flush retry cleanly once the state dir is writable again, while
+  # this flush still reports the outcome in session.
   if ! away_ledger_reserve "$buf" "$total" "$delivery_id"; then
-    now=$(_now)
-    printf 'unavailable %s ledger_unwritable\n' "$now" \
-      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    printf 'unavailable|%s\n' "$delivery_id"
+    printf 'unavailable|none\n'
     return 0
   fi
 
   now=$(_now)
   if ! printf 'attempting %s\n' "$now" \
     | fmx_private_artifact_publish_stdin_once "$dir" "$base" 600 2>/dev/null; then
-    away_ledger_release "$buf" "$offset" "$delivery_id"
+    away_ledger_release "$buf" "$offset" "$delivery_id" "$(telegram_away_retry_secs)"
     printf 'unavailable|%s\n' "$delivery_id"
     return 0
   fi
@@ -756,7 +771,7 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
   if ! spool=$(away_ledger_spool_create "$state") \
     || ! printf '%s' "$alert" > "$spool" 2>/dev/null; then
     rm -f -- "${spool:-}" 2>/dev/null || true
-    away_ledger_release "$buf" "$offset" "$delivery_id"
+    away_ledger_release "$buf" "$offset" "$delivery_id" "$(telegram_away_retry_secs)"
     now=$(_now)
     printf 'failed %s sender_spool_unavailable\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
@@ -778,13 +793,13 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
       telegram_away_settle_accepted "$state" "$buf" "$delivery_id" "$offset" "$total" "$accounted"
       ;;
     125)  # proven local: the watchdog never started the client
-      away_ledger_release "$buf" "$offset" "$delivery_id"
+      away_ledger_release "$buf" "$offset" "$delivery_id" "$(telegram_away_retry_secs)"
       printf 'failed %s sender_watchdog_unavailable\n' "$now" \
         | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
       printf 'failed|%s\n' "$delivery_id"
       ;;
     127)  # proven local: there is no runnable client to send with
-      away_ledger_release "$buf" "$offset" "$delivery_id"
+      away_ledger_release "$buf" "$offset" "$delivery_id" "$(telegram_away_retry_secs)"
       printf 'unavailable %s sender_missing\n' "$now" \
         | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
       printf 'unavailable|%s\n' "$delivery_id"
@@ -884,17 +899,17 @@ telegram_away_recover() {  # <state> <buf> <reserved> <confirmed> <delivery-id>
 # in-session submit is confirmed.
 escalate_flush() {  # <state>
   local state=$1 buf n body msg rec recovery tg_result tg_status tg_id
-  local batch_id reserved confirmed accounted attempt did pending_body chat_body chat_pending
+  local batch_id reserved confirmed accounted attempt retry did pending_body chat_body chat_pending
   local prior_note pointer
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
   n=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
   body=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  batch_id=none; reserved=0; confirmed=0; accounted=0; attempt=0; did=none
+  batch_id=none; reserved=0; confirmed=0; accounted=0; attempt=0; retry=0; did=none
   tg_status=''; tg_id=none
   rec=$(away_ledger_read "$buf")
   if [ "$rec" != unknown ]; then
-    IFS=' ' read -r batch_id reserved confirmed accounted attempt did <<< "$rec"
+    IFS=' ' read -r batch_id reserved confirmed accounted attempt retry did <<< "$rec"
     # A batch only ever grows, so a reservation past its line total means the
     # ledger does not describe this buffer.
     [ "$reserved" -le "$n" ] || rec=unknown
@@ -904,11 +919,11 @@ escalate_flush() {  # <state>
     if [ "$recovery" != settled ]; then
       rec=$(away_ledger_read "$buf")
       [ "$rec" = unknown ] \
-        || IFS=' ' read -r batch_id reserved confirmed accounted attempt did <<< "$rec"
+        || IFS=' ' read -r batch_id reserved confirmed accounted attempt retry did <<< "$rec"
     fi
   fi
   if [ "$rec" = unknown ]; then
-    tg_status=unknown; batch_id=none; reserved=0; confirmed=0; accounted=0; attempt=0; did=none
+    tg_status=unknown; batch_id=none; reserved=0; confirmed=0; accounted=0; attempt=0; retry=0; did=none
   elif [ "$n" -gt "$reserved" ] && [ "$confirmed" -eq "$reserved" ]; then
     pending_body=$(tail -n "+$((reserved + 1))" "$buf" 2>/dev/null \
       | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
@@ -917,7 +932,7 @@ escalate_flush() {  # <state>
     tg_id=${tg_result#*|}
     rec=$(away_ledger_read "$buf")
     [ "$rec" = unknown ] \
-      || IFS=' ' read -r batch_id reserved confirmed accounted attempt did <<< "$rec"
+      || IFS=' ' read -r batch_id reserved confirmed accounted attempt retry did <<< "$rec"
   elif [ "$confirmed" -ge "$n" ]; then
     tg_id=$did
     tg_status=accepted
@@ -947,6 +962,9 @@ escalate_flush() {  # <state>
       ;;
     failed|unavailable)
       msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery %s; the captain was not contacted there.%s Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "$tg_status" "$prior_note")
+      ;;
+    deferred)
+      msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery deferred; an earlier attempt provably never left this machine and its retry is scheduled, so the captain was not contacted there yet.%s Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "$prior_note")
       ;;
     unknown)
       msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery unavailable; the away batch ledger is unreadable so nothing was sent to the phone. Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")

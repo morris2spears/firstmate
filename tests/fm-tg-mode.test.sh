@@ -557,7 +557,7 @@ test_away_delivery_is_accepted_once_and_records_no_content() {
   # same id, settle from the existing accepted evidence, and never produce a
   # second phone alert.
   away_ledger_write "$state/.subsuper-escalations" \
-    "$(printf '%s' "$first_id" | cut -d- -f1-2)" 0 0 0 0 none \
+    "$(printf '%s' "$first_id" | cut -d- -f1-2)" 0 0 0 0 0 none \
     || fail "could not rewind the ledger for the repeat-delivery case"
   out=$(away_deliver "$home" "$state" "$tg")
   second_id=${out#*|}
@@ -772,7 +772,7 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
   chmod 0700 "$state/tg-away-delivery"
   printf 'attempting 1700000030\n' > "$state/tg-away-delivery/$did.status"
   chmod 0600 "$state/tg-away-delivery/$did.status"
-  printf '1700000030-abcdef0123456789 1 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
+  printf '1700000030-abcdef0123456789 1 0 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
   (
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
@@ -792,7 +792,7 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
   did='1700000035-abcdef0123456789-0-fedcba9876543210'
   printf 'accepted 1700000035\n' > "$state/tg-away-delivery/$did.status"
   chmod 0600 "$state/tg-away-delivery/$did.status"
-  printf '1700000035-abcdef0123456789 1 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
+  printf '1700000035-abcdef0123456789 1 0 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
   (
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
@@ -806,7 +806,7 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
   # (b) reserved with no evidence at all: the claim is released and the line is
   # offered to the phone.
   printf 'blocked: crashed before the send\n' > "$state/.subsuper-escalations"
-  printf '1700000040-fedcba9876543210 1 0 0 0 none\n' > "$state/.subsuper-escalations.since"
+  printf '1700000040-fedcba9876543210 1 0 0 0 0 none\n' > "$state/.subsuper-escalations.since"
   (
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
@@ -963,7 +963,7 @@ test_away_delivery_refuses_untracked_sends() {
 # retired attempt keeps its evidence, the ordinal advances, and the very same lines
 # reach the phone on the next flush once the client is back.
 test_away_proven_local_failure_retries_the_same_lines() {
-  local home state tg injected first_evidence
+  local home state tg injected first_evidence ledger
   home=$(make_home away-proven-local-retry)
   state="$home/state"
   tg=$(make_fake_tg "$home")
@@ -976,7 +976,7 @@ test_away_proven_local_failure_retries_the_same_lines() {
   (
     inject_msg() { return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
-      FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
+      FM_TG_AWAY_RETRY_SECS=3600 FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
   ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
   assert_absent "$home/tg-sent.log" "a missing client cannot have sent anything"
   ledger_field "$state" 2 0 "a proven-local failure must release its reservation"
@@ -985,7 +985,27 @@ test_away_proven_local_failure_retries_the_same_lines() {
   grep -Eq '^unavailable [0-9]+ sender_missing$' "$first_evidence" \
     || fail "the retired attempt must keep its durable evidence"
 
-  # The client comes back. The same buffer, unchanged, must now reach the phone.
+  # The retry is scheduled, not immediate: while the backoff is unelapsed the flush
+  # neither contacts the phone nor mints another evidence record.
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FM_TG_AWAY_RETRY_SECS=3600 FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "the still-wedged receipt must leave escalate_flush unconfirmed"
+  assert_absent "$home/tg-sent.log" "a deferred retry must not contact the phone"
+  assert_grep 'Telegram delivery deferred' "$injected" \
+    "a deferred retry must say so in the in-session fallback"
+  [ "$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "a deferred retry must not mint another evidence record per tick"
+  ledger_field "$state" 5 1 "a deferred retry must not advance the attempt ordinal"
+
+  # The client comes back and the schedule elapses. The same buffer, unchanged,
+  # must now reach the phone.
+  ledger=$(away_ledger_read "$state/.subsuper-escalations")
+  # shellcheck disable=SC2086
+  set -- $ledger
+  away_ledger_write "$state/.subsuper-escalations" "$1" "$2" "$3" "$4" "$5" 0 "$7" \
+    || fail "could not elapse the retry schedule"
   (
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
@@ -1037,6 +1057,79 @@ test_away_delivery_refuses_malformed_counts() {
   ledger_field "$state" 2 0 "a malformed call must not mutate the ledger"
   ledger_field "$state" 5 0 "a malformed call must not retire an attempt"
   pass "away delivery refuses malformed counts before any send or ledger write"
+}
+
+# A ledger write that fails before any attempt must not tombstone the delivery id:
+# nothing was reserved and nothing was sent, so the next flush has to be able to
+# retry cleanly once the state directory is writable again.
+test_away_unwritable_ledger_leaves_the_id_retryable() {
+  local home state tg injected
+  home=$(make_home away-unwritable-ledger)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: state dir full'
+
+  # A read-only state dir makes the sidecar mktemp/mv fail, so the reservation
+  # cannot be recorded.
+  chmod 0500 "$state"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "an unwritable ledger must leave escalate_flush unconfirmed"
+  chmod 0755 "$state"
+
+  assert_absent "$home/tg-sent.log" "an unreserved attempt must never reach the phone"
+  assert_grep 'blocked: state dir full' "$injected" \
+    "the unsent event must reach the visible in-session fallback"
+  if [ -d "$state/tg-away-delivery" ] && ls "$state/tg-away-delivery"/*.status >/dev/null 2>&1; then
+    fail "no attempt was made, so no delivery evidence may tombstone that id"
+  fi
+
+  # Writable again: the same lines must now reach the phone.
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "the retry after a writable ledger must complete the away flush"
+  assert_grep 'state dir full' "$home/tg-sent.log" \
+    "an unreserved attempt must stay retryable once the ledger is writable"
+  pass "an unwritable ledger never tombstones an id that made no attempt"
+}
+
+# An in-place daemon upgrade during a live away session must migrate the older
+# ledger shapes instead of failing closed and repeating delivered lines in chat.
+test_away_ledger_migrates_older_record_shapes() {
+  local home state buf rec
+  home=$(make_home away-ledger-migration)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: one\nblocked: two\n' > "$buf"
+
+  # Round-5 shape: id reserved confirmed accounted delivery-id.
+  printf '1700000050-abcdef0123456789 1 1 1 1700000050-abcdef0123456789-0-aaaaaaaaaaaaaaaa\n' \
+    > "$buf.since"
+  rec=$(away_ledger_read "$buf")
+  [ "$rec" != unknown ] || fail "the five-field ledger must migrate, not fail closed"
+  [ "$rec" = '1700000050-abcdef0123456789 1 1 1 0 0 1700000050-abcdef0123456789-0-aaaaaaaaaaaaaaaa' ] \
+    || fail "the five-field ledger must keep its counts and default the new fields (got: $rec)"
+  [ "$(away_ledger_read "$buf")" = "$rec" ] \
+    || fail "the migrated ledger must persist in place"
+
+  # Round-6 shape: ... attempt delivery-id.
+  printf '1700000060-abcdef0123456789 2 2 2 3 1700000060-abcdef0123456789-a3-0-bbbbbbbbbbbbbbbb\n' \
+    > "$buf.since"
+  rec=$(away_ledger_read "$buf")
+  [ "$rec" = '1700000060-abcdef0123456789 2 2 2 3 0 1700000060-abcdef0123456789-a3-0-bbbbbbbbbbbbbbbb' ] \
+    || fail "the six-field ledger must keep its attempt ordinal (got: $rec)"
+
+  # A genuinely malformed record still fails closed.
+  printf '1700000070-abcdef0123456789 2 2\n' > "$buf.since"
+  [ "$(away_ledger_read "$buf")" = unknown ] \
+    || fail "a malformed ledger must still fail closed"
+  pass "the ledger owner migrates older record shapes in place and still fails closed"
 }
 
 test_supervision_instructions_carry_tg_cadence() {
@@ -1099,6 +1192,8 @@ test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_delivery_refuses_untracked_sends
 test_away_delivery_refuses_malformed_counts
 test_away_proven_local_failure_retries_the_same_lines
+test_away_unwritable_ledger_leaves_the_id_retryable
+test_away_ledger_migrates_older_record_shapes
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence
 

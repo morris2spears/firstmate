@@ -4,7 +4,7 @@
 # One away batch is the buffer state/.subsuper-escalations plus ONE ledger record
 # in its state/.subsuper-escalations.since sidecar:
 #
-#   <arrival-epoch>-<nonce> <reserved> <confirmed> <accounted> <attempt> <last-delivery-id>
+#   <arrival-epoch>-<nonce> <reserved> <confirmed> <accounted> <attempt> <retry-after> <last-delivery-id>
 #
 #   arrival-epoch  keeps the batch-age semantics the daemon's batching needs.
 #   nonce          makes the identity minted-once, so no later batch can ever
@@ -26,7 +26,17 @@
 #                  phone again under a fresh id while the retired attempt's
 #                  evidence stays durable and auditable. An ambiguous outcome
 #                  never advances it, so it can never be retried.
+#   retry-after    the epoch before which this batch may not be offered to the
+#                  phone again. Set when a proven-local failure retires an attempt,
+#                  so a persistent local failure retries on a bounded schedule
+#                  instead of once per housekeeping tick; cleared by acceptance.
 #   delivery-id    the most recent delivery this batch attempted.
+#
+# Earlier record shapes - the bare arrival epoch of the pre-ledger form, and the
+# five- and six-field forms that predate the attempt ordinal and the retry
+# schedule - are migrated in place on read, so an in-place daemon upgrade during a
+# live away session keeps its counts instead of failing closed and repeating
+# already-delivered lines in captain chat.
 #
 # The invariant accounted <= confirmed <= reserved holds at every transition, and
 # an unparseable record is reported as `unknown`, which callers must treat as
@@ -79,13 +89,13 @@ away_ledger_mint_id() {
 
 # Atomically replace the whole record. Same-directory mktemp plus mv, so a reader
 # never sees a half-written ledger.
-away_ledger_write() {  # <buf> <batch-id> <reserved> <confirmed> <accounted> <attempt> <delivery-id>
-  local buf=$1 id=$2 reserved=$3 confirmed=$4 accounted=$5 attempt=$6 did=$7 file tmp
-  away_ledger_is_count "$reserved" "$confirmed" "$accounted" "$attempt" || return 1
+away_ledger_write() {  # <buf> <batch-id> <reserved> <confirmed> <accounted> <attempt> <retry-after> <delivery-id>
+  local buf=$1 id=$2 reserved=$3 confirmed=$4 accounted=$5 attempt=$6 retry=$7 did=$8 file tmp
+  away_ledger_is_count "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" || return 1
   file="${buf}.since"
   tmp=$(umask 077; mktemp "${file}.XXXXXX" 2>/dev/null) || return 1
-  if ! printf '%s %s %s %s %s %s\n' \
-      "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$did" \
+  if ! printf '%s %s %s %s %s %s %s\n' \
+      "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" "$did" \
       > "$tmp" 2>/dev/null \
     || ! mv -f "$tmp" "$file" 2>/dev/null; then
     rm -f -- "$tmp"
@@ -96,29 +106,37 @@ away_ledger_write() {  # <buf> <batch-id> <reserved> <confirmed> <accounted> <at
 
 # Start the ledger for a brand new batch: a fresh identity and nothing delivered.
 away_ledger_open() {  # <buf>
-  away_ledger_write "$1" "$(away_ledger_mint_id)" 0 0 0 0 none
+  away_ledger_write "$1" "$(away_ledger_mint_id)" 0 0 0 0 0 none
 }
 
-# Print "<batch-id> <reserved> <confirmed> <accounted> <attempt> <delivery-id>",
-# or the single word `unknown` when the record is absent, malformed, or violates
-# the accounted <= confirmed <= reserved invariant. A bare epoch (the pre-ledger
-# form) is upgraded in place to a minted identity with zero counts, which is
-# exactly "nothing delivered yet".
+# Print "<batch-id> <reserved> <confirmed> <accounted> <attempt> <retry-after>
+# <delivery-id>", or the single word `unknown` when the record is absent,
+# malformed, or violates the accounted <= confirmed <= reserved invariant. Every
+# earlier record shape is migrated in place rather than rejected:
+#   1 field   the pre-ledger bare arrival epoch  -> minted identity, zero counts
+#   5 fields  id reserved confirmed accounted did -> attempt 0, retry-after 0
+#   6 fields  ... attempt did                     -> retry-after 0
 away_ledger_read() {  # <buf>
-  local buf=$1 raw id reserved confirmed accounted attempt did extra epoch nonce
+  local buf=$1 raw f1 f2 f3 f4 f5 f6 f7 extra
+  local id reserved confirmed accounted attempt retry did epoch nonce migrated=0
   raw=$(head -n 1 "${buf}.since" 2>/dev/null || true)
-  IFS=' ' read -r id reserved confirmed accounted attempt did extra <<< "$raw"
-  if [ -z "${id:-}" ] || [ -n "${extra:-}" ]; then printf 'unknown\n'; return 0; fi
-  if [ -z "${reserved:-}" ] && [ -z "${confirmed:-}" ] && [ -z "${accounted:-}" ] \
-    && [ -z "${attempt:-}" ] && [ -z "${did:-}" ]; then
-    reserved=0; confirmed=0; accounted=0; attempt=0; did=none
-  elif [ -z "${reserved:-}" ] || [ -z "${confirmed:-}" ] || [ -z "${accounted:-}" ] \
-    || [ -z "${attempt:-}" ] || [ -z "${did:-}" ]; then
+  IFS=' ' read -r f1 f2 f3 f4 f5 f6 f7 extra <<< "$raw"
+  if [ -z "${f1:-}" ] || [ -n "${extra:-}" ]; then printf 'unknown\n'; return 0; fi
+  id=$f1; reserved=${f2:-}; confirmed=${f3:-}; accounted=${f4:-}
+  if [ -z "${f2:-}" ]; then
+    reserved=0; confirmed=0; accounted=0; attempt=0; retry=0; did=none; migrated=1
+  elif [ -z "${f3:-}" ] || [ -z "${f4:-}" ] || [ -z "${f5:-}" ]; then
     printf 'unknown\n'; return 0
+  elif [ -z "${f6:-}" ]; then
+    attempt=0; retry=0; did=$f5; migrated=1
+  elif [ -z "${f7:-}" ]; then
+    attempt=$f5; retry=0; did=$f6; migrated=1
+  else
+    attempt=$f5; retry=$f6; did=$f7
   fi
   epoch=${id%%-*}
   nonce=${id#*-}
-  away_ledger_is_count "$epoch" "$reserved" "$confirmed" "$accounted" "$attempt" \
+  away_ledger_is_count "$epoch" "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" \
     || { printf 'unknown\n'; return 0; }
   case "$did" in ''|*[!0-9a-zA-Z-]*) printf 'unknown\n'; return 0 ;; esac
   if [ "$accounted" -gt "$confirmed" ] || [ "$confirmed" -gt "$reserved" ]; then
@@ -126,10 +144,14 @@ away_ledger_read() {  # <buf>
   fi
   if [ -z "$nonce" ] || [ "$nonce" = "$id" ]; then
     id="$epoch-$(away_ledger_hash "$$-${RANDOM:-0}-$epoch")"
-    away_ledger_write "$buf" "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$did" \
+    migrated=1
+  fi
+  if [ "$migrated" -eq 1 ]; then
+    away_ledger_write "$buf" "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" "$did" \
       || { printf 'unknown\n'; return 0; }
   fi
-  printf '%s %s %s %s %s %s\n' "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$did"
+  printf '%s %s %s %s %s %s %s\n' \
+    "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" "$did"
 }
 
 # The batch's arrival epoch, for age-based batching. Non-zero when there is no
@@ -149,21 +171,30 @@ away_ledger_epoch() {  # <buf>
 # caller can leave the ledger internally inconsistent.
 away_ledger_transition() {  # <buf> reserved|confirmed|accounted <value> [delivery-id]
   local buf=$1 field=$2 value=$3 did=${4:-}
-  local rec id reserved confirmed accounted attempt current
+  local rec id reserved confirmed accounted attempt retry current
   away_ledger_is_count "$value" || return 1
   rec=$(away_ledger_read "$buf")
   [ "$rec" != unknown ] || return 1
-  IFS=' ' read -r id reserved confirmed accounted attempt current <<< "$rec"
+  IFS=' ' read -r id reserved confirmed accounted attempt retry current <<< "$rec"
   [ -n "$did" ] || did=$current
   case "$field" in
     reserved) reserved=$value ;;
-    confirmed) confirmed=$value ;;
+    confirmed) confirmed=$value; retry=0 ;;
     accounted) accounted=$value ;;
     *) return 1 ;;
   esac
   [ "$confirmed" -le "$reserved" ] || confirmed=$reserved
   [ "$accounted" -le "$confirmed" ] || accounted=$confirmed
-  away_ledger_write "$buf" "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$did"
+  away_ledger_write "$buf" "$id" "$reserved" "$confirmed" "$accounted" "$attempt" "$retry" "$did"
+}
+
+# Whether the batch may be offered to the phone right now: false while a retired
+# proven-local attempt's retry schedule has not yet elapsed.
+away_ledger_retry_due() {  # <retry-after>
+  local retry=${1:-0}
+  away_ledger_is_count "$retry" || return 1
+  [ "$retry" -eq 0 ] && return 0
+  [ "$(away_ledger_now)" -ge "$retry" ]
 }
 
 # Claim lines for the phone BEFORE the network call.
@@ -171,21 +202,27 @@ away_ledger_reserve() {  # <buf> <reserved> <delivery-id>
   away_ledger_transition "$1" reserved "$2" "$3"
 }
 
-# Retire an attempt that PROVABLY never left the box: give its claim back and
-# advance the attempt ordinal in the same atomic write, so the very same lines can
-# be offered to the phone again under a fresh delivery id while the retired
-# attempt's evidence record stays durable and auditable. This is the only
-# transition that advances the ordinal, so an ambiguous outcome - which keeps its
-# claim - can never be retried.
-away_ledger_release() {  # <buf> <reserved> <delivery-id>
-  local buf=$1 reserved=$2 did=$3 rec id r c a attempt current
+# Retire an attempt that PROVABLY never left the box: give its claim back, advance
+# the attempt ordinal, and arm the retry schedule, all in the same atomic write, so
+# the very same lines can be offered to the phone again under a fresh delivery id
+# once <retry-delay-secs> has elapsed, while the retired attempt's evidence record
+# stays durable and auditable. This is the only transition that advances the
+# ordinal, so an ambiguous outcome - which keeps its claim - can never be retried,
+# and the schedule keeps a persistent local failure from re-attempting (and minting
+# a fresh evidence record) on every housekeeping tick.
+away_ledger_release() {  # <buf> <reserved> <delivery-id> [retry-delay-secs]
+  local buf=$1 reserved=$2 did=$3 delay=${4:-0}
+  local rec id r c a attempt retry current
   away_ledger_is_count "$reserved" || return 1
+  away_ledger_is_count "$delay" || delay=0
   rec=$(away_ledger_read "$buf")
   [ "$rec" != unknown ] || return 1
-  IFS=' ' read -r id r c a attempt current <<< "$rec"
+  IFS=' ' read -r id r c a attempt retry current <<< "$rec"
   [ -n "$did" ] || did=$current
   [ "$reserved" -ge "$c" ] || reserved=$c
-  away_ledger_write "$buf" "$id" "$reserved" "$c" "$a" "$((attempt + 1))" "$did"
+  retry=0
+  [ "$delay" -le 0 ] || retry=$(( $(away_ledger_now) + delay ))
+  away_ledger_write "$buf" "$id" "$reserved" "$c" "$a" "$((attempt + 1))" "$retry" "$did"
 }
 
 # Record evidence-proven Telegram acceptance for the range (<from>, <to>].
@@ -194,11 +231,11 @@ away_ledger_release() {  # <buf> <reserved> <delivery-id>
 # means an unresolved send, and the caller must not offer this batch to the phone
 # again until that reservation is resolved.
 away_ledger_confirm() {  # <buf> <from> <to> <delivery-id>
-  local buf=$1 from=$2 to=$3 did=$4 rec id reserved confirmed accounted attempt current
+  local buf=$1 from=$2 to=$3 did=$4 rec id reserved confirmed accounted attempt retry current
   away_ledger_is_count "$from" "$to" || return 1
   rec=$(away_ledger_read "$buf")
   [ "$rec" != unknown ] || return 1
-  IFS=' ' read -r id reserved confirmed accounted attempt current <<< "$rec"
+  IFS=' ' read -r id reserved confirmed accounted attempt retry current <<< "$rec"
   [ "$from" -eq "$confirmed" ] || return 1
   [ "$to" -ge "$confirmed" ] || return 1
   away_ledger_transition "$buf" confirmed "$to" "$did"
