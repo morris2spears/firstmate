@@ -1160,6 +1160,43 @@ test_away_reclaim_backups_group_adoption_is_atomic_per_file() {
   pass "group adoption writes atomically and rolls back a partial group without a partial live write"
 }
 
+# The rollback list must be quoted correctly for a live buffer/sidecar path
+# containing a space - an unquoted, word-split rollback would silently no-op
+# on such a path and leave an already-committed live buffer with no sidecar,
+# exactly the partial state the atomic rollback exists to prevent. The backup
+# itself lives under a separate, space-free directory here so the test
+# isolates the rollback's own path handling from the unrelated, pre-existing
+# word-splitting in the backup-glob loop.
+test_away_reclaim_backups_group_rollback_survives_a_path_with_a_space() {
+  local live glob_dir backup buf rc
+  live=$(mktemp -d "${TMPDIR:-/tmp}/fm tg live.XXXXXX")
+  glob_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-tg-glob.XXXXXX")
+  buf="$live/.subsuper-escalations"
+  backup=$(mktemp -d "$glob_dir/.afk-launch-backup.XXXXXX")
+  printf 'blocked: adopted buffer line\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+
+  rc=0
+  (
+    cp() {
+      case "$2" in
+        (*.subsuper-escalations.since) return 1 ;;
+        (*) command cp "$@" ;;
+      esac
+    }
+    away_ledger_reclaim_backups "$live" "$buf" "$live/.subsuper-inject-wedged" \
+      "$glob_dir/.afk-launch-backup.*"
+  ) || rc=$?
+  [ "$rc" -eq 1 ] \
+    || fail "a mid-group copy failure with a space-containing live path must report status 1 (got: $rc)"
+  [ ! -e "$buf" ] \
+    || fail "rollback must remove an already-committed buffer even when its path contains a space"
+  [ -f "$backup/.subsuper-escalations" ] \
+    || fail "the rolled-back buffer must remain in the backup under a space-containing live path"
+  rm -rf "$live" "$glob_dir"
+  pass "group adoption rollback correctly quotes a live path containing a space"
+}
+
 # A `.consumed` marker left by an interrupted away_ledger_fold_retained_backups
 # removal must never be treated as an ordinary unreconciled backup by reclaim -
 # it already had its evidence published, so reclaim must only retry removing
@@ -1796,6 +1833,7 @@ test_away_reclaim_backups_returns_zero_when_nothing_to_reclaim
 test_away_reclaim_backups_returns_failure_on_real_copy_error
 test_away_reclaim_backups_digests_only_defers_the_group
 test_away_reclaim_backups_group_adoption_is_atomic_per_file
+test_away_reclaim_backups_group_rollback_survives_a_path_with_a_space
 test_away_reclaim_backups_never_adopts_a_consumed_marker
 test_away_reclaim_backups_staging_temp_falls_inside_the_cleanup_sweep
 test_away_fold_retained_backups_folds_only_undigested_lines

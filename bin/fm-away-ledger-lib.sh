@@ -466,7 +466,8 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-only]
   local state=$1 buf=$2 wedge=$3 pattern=$4 digests_only=${5:-0}
   local backup digest_dir artifact base f ok real_fail group_clear_to_adopt group_ok
-  local dir tmp committed result=0 deferred=0
+  local dir tmp result=0 deferred=0
+  local -a committed
   digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
@@ -501,14 +502,14 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-
       fi
       if [ "$group_clear_to_adopt" -eq 1 ]; then
         group_ok=1
-        committed=''
+        committed=()
         for artifact in "$buf" "${buf}.since" "$wedge"; do
           base=${artifact##*/}
           [ -e "$backup/$base" ] || continue
           dir=${artifact%/*}
           if tmp=$(umask 077; mktemp "$dir/${base}.reclaim.XXXXXX" 2>/dev/null) \
             && cp -p "$backup/$base" "$tmp" 2>/dev/null && mv -f "$tmp" "$artifact" 2>/dev/null; then
-            committed="$committed $artifact"
+            committed+=("$artifact")
           else
             rm -f -- "${tmp:-}" 2>/dev/null
             group_ok=0; ok=0; real_fail=1
@@ -528,7 +529,7 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-
           # whatever this call already committed live, so the live unit stays
           # exactly as absent as it was before adoption began and the backup
           # remains the single complete copy.
-          rm -f $committed 2>/dev/null
+          [ "${#committed[@]}" -eq 0 ] || rm -f -- "${committed[@]}" 2>/dev/null
         fi
       else
         ok=0
@@ -563,16 +564,16 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-
 # are printed, one whitespace-joined line per backup, tagged so the caller can
 # label it distinctly from the live buffer's own evidence.
 #
-# Publication and removal are atomic per backup, but the commit point is the
-# rename to a `.consumed` marker, not the final removal: `rm -rf` unlinks in
-# unspecified order, so a failure partway through (e.g. an undeletable
-# subdirectory after the buffer file is already gone) must never be allowed to
-# both destroy content and suppress its evidence. The same-directory `mv` that
-# marks a backup consumed is a single atomic filesystem operation, so by the
-# time evidence is printed the backup is already durably marked done; a
-# `.consumed` remnant left behind by a subsequent removal failure carries no
-# unpublished content, and a later call recognizes it by name and retries only
-# the removal, never re-printing.
+# Evidence is printed BEFORE the backup is ever touched, so a crash at any
+# point afterward - mid-rename, mid-removal, or between the two - can never
+# discard content that was never published: the worst it can leave behind is
+# a `.consumed` marker (or the original backup, untouched) for a later call to
+# retry, and any re-print that results is a harmless duplicate a caller's own
+# dedupe absorbs (as it does at return). The same-directory `mv` to a
+# `.consumed` marker is still the removal's own commit point, so `rm -rf`
+# unlinking in unspecified order can never both destroy content and suppress
+# already-published evidence: a later call recognizes the marker by name and
+# retries only the removal, never re-reading or re-printing its content.
 away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
   local state=$1 buf=$2 wedge=$3 pattern=$4
   local backup bbuf accounted rec n body wedge_body digest_dir f base ok consumed result=0
@@ -625,10 +626,10 @@ away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
     wedge_body=''
     [ -s "$backup/${wedge##*/}" ] && wedge_body=$(head -1 "$backup/${wedge##*/}" 2>/dev/null)
 
+    [ -z "$body" ] || printf '%s\n' "$body"
+    [ -z "$wedge_body" ] || printf 'wedge: %s\n' "$wedge_body"
     consumed="${backup}.consumed"
     if mv "$backup" "$consumed" 2>/dev/null; then
-      [ -z "$body" ] || printf '%s\n' "$body"
-      [ -z "$wedge_body" ] || printf 'wedge: %s\n' "$wedge_body"
       rm -rf "$consumed" || result=1
     else
       result=1
