@@ -1087,6 +1087,73 @@ test_away_reclaim_backups_returns_failure_on_real_copy_error() {
   pass "reclaim returns the failure status, not deferred, on a real copy error"
 }
 
+# Adopting a backup's buffer/sidecar/wedge group is only safe when nothing
+# else can be writing those live paths. A live daemon is the sole writer of
+# the buffer and its sidecar with no shared lock, so digests-only mode must
+# defer the whole group - never adopting it, never even reporting it as a
+# real failure - while still merging digest text, which is always safe.
+test_away_reclaim_backups_digests_only_defers_the_group() {
+  local home state backup buf rc
+  home=$(make_home away-reclaim-digests-only)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: must not be adopted while a daemon owns this path\n' \
+    > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+  mkdir -p "$backup/tg-away-digest"
+  printf 'blocked: safe to merge regardless\n' \
+    > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+
+  rc=0
+  away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    "$state/.afk-launch-backup.*" 1 || rc=$?
+  [ "$rc" -eq 2 ] \
+    || fail "digests-only mode must report a deferred group as status 2, not a failure (got: $rc)"
+  [ ! -e "$buf" ] \
+    || fail "digests-only mode must never adopt the buffer while a daemon could own it"
+  [ -f "$backup/.subsuper-escalations" ] \
+    || fail "digests-only mode must leave the backup's buffer copy untouched"
+  [ -f "$state/tg-away-digest/1700000000-abc-a0-0-x.items" ] \
+    || fail "digests-only mode must still merge digest text, which is always safe"
+  pass "digests-only mode defers group adoption without treating it as a failure"
+}
+
+# Group adoption writes each artifact through the same same-directory
+# mktemp-then-mv pattern the ledger's own sidecar writer uses, so a reader can
+# never observe a half-copied file. Simulate a mid-group failure (the sidecar
+# copy fails after the buffer already landed) and confirm the live buffer is
+# never left holding a value with no matching sidecar copy attempt - the
+# failure must be reported, and the backup must retain what was not adopted.
+test_away_reclaim_backups_group_adoption_is_atomic_per_file() {
+  local home state backup buf rc
+  home=$(make_home away-reclaim-atomic-group)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: adopted buffer line\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+
+  rc=0
+  (
+    cp() {
+      case "$2" in
+        (*.subsuper-escalations.since) return 1 ;;
+        (*) command cp "$@" ;;
+      esac
+    }
+    away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
+      "$state/.afk-launch-backup.*"
+  ) || rc=$?
+  [ "$rc" -eq 1 ] \
+    || fail "a mid-group copy failure must report status 1 (got: $rc)"
+  [ -d "$backup" ] \
+    || fail "the backup must survive a mid-group adoption failure"
+  [ ! -e "${buf}.since" ] \
+    || fail "a failed sidecar copy must never leave a partial file at the live path"
+  pass "group adoption writes atomically and reports failure without a partial live write"
+}
+
 # away_ledger_fold_retained_backups must surface exactly the lines a retained
 # backup's own sidecar says are still undigested - never anything already
 # accounted for, which would duplicate content already delivered to Telegram -
@@ -1168,6 +1235,31 @@ test_away_fold_retained_backups_never_publishes_on_digest_merge_failure() {
   assert_absent "$state/tg-away-digest/1700000000-abc-a0-0-x.items" \
     "a failed merge must never leave a partial copy in the live digest directory"
   pass "fold_retained_backups never publishes or removes a backup on a digest-merge failure"
+}
+
+# The commit point is the rename to a `.consumed` marker, not the final `rm
+# -rf` - so a removal failure AFTER that rename must never re-emit the
+# already-published evidence on a later call, and a later call must simply
+# retry removing the marker until it succeeds.
+test_away_fold_retained_backups_recovers_a_consumed_marker_without_republishing() {
+  local home state backup consumed out rc
+  home=$(make_home away-fold-retained-consumed-marker)
+  state="$home/state"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: already published once\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+  consumed="${backup}.consumed"
+  mv "$backup" "$consumed"
+
+  rc=0
+  out=$(away_ledger_fold_retained_backups "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*") || rc=$?
+  [ "$rc" -eq 0 ] \
+    || fail "recovering a consumed marker must succeed once its removal is no longer blocked"
+  [ -z "$out" ] \
+    || fail "a consumed marker must never re-emit evidence already published in an earlier call"
+  assert_absent "$consumed" "a consumed marker must be removed once recovery succeeds"
+  pass "fold_retained_backups recovers a leftover consumed marker without republishing its evidence"
 }
 
 # A digest-merge failure inside a backup must never leave an already-adopted
@@ -1647,9 +1739,12 @@ test_away_reclaim_backups_keeps_backup_on_partial_merge_failure
 test_away_reclaim_backups_returns_deferred_not_failure_on_live_conflict
 test_away_reclaim_backups_returns_zero_when_nothing_to_reclaim
 test_away_reclaim_backups_returns_failure_on_real_copy_error
+test_away_reclaim_backups_digests_only_defers_the_group
+test_away_reclaim_backups_group_adoption_is_atomic_per_file
 test_away_fold_retained_backups_folds_only_undigested_lines
 test_away_fold_retained_backups_folds_wedge_evidence
 test_away_fold_retained_backups_never_publishes_on_digest_merge_failure
+test_away_fold_retained_backups_recovers_a_consumed_marker_without_republishing
 test_away_reclaim_backups_group_adoption_survives_a_sibling_digest_failure
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_client_exit_125_is_never_proven_local

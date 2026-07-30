@@ -481,7 +481,7 @@ fm_afk_launch_start() {
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
     fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*"
+      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" 1
     if ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to refresh away-mode flag"
       return 1
@@ -546,7 +546,7 @@ fm_afk_launch_start_native() {
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
     fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*"
+      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" 1
     fm_afk_launch_flag_write || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0

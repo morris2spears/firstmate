@@ -148,7 +148,7 @@ return_guard() {
 
 return_reconcile() {
   local evidence blockers drained wedge escalations away_items retained lifecycle_ok=1
-  local reclaim_rc=0 fold_retained_rc=0
+  local fold_retained_rc=0
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -172,15 +172,14 @@ return_reconcile() {
   # live-unit evidence below is gathered, so an adopted group (only possible
   # when the live unit was clear) is captured by those reads in this same pass
   # instead of being adopted and then destroyed by clear_delivery_artifacts
-  # with no evidence ever recorded. rc 2 means only a live conflict deferred a
-  # backup's group - the normal wait state, not a fault - so only rc 1 (a real
-  # copy/prepare/removal failure) is worth surfacing.
+  # with no evidence ever recorded. Its result is not decided here - a real
+  # copy/prepare/removal failure (rc 1) or a live conflict (rc 2) both leave a
+  # backup for away_ledger_fold_retained_backups below to retry, which is the
+  # authoritative pass: it retries the same digest merge and, on the common
+  # transient fault, fully resolves it, so the lifecycle blocker is decided
+  # once after that pass has had its turn rather than on this result alone.
   away_ledger_reclaim_backups "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || reclaim_rc=$?
-  if [ "$reclaim_rc" -eq 1 ]; then
-    append_evidence lifecycle 'a leftover away-mode rollback backup could not be fully reclaimed; retry catch-up before ordinary work' "$evidence"
-    lifecycle_ok=0
-  fi
+    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || true
 
   if [ -s "$STATE/.subsuper-inject-wedged" ]; then
     wedge=$(head -1 "$STATE/.subsuper-inject-wedged" 2>/dev/null || true)

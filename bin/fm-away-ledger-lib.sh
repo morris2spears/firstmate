@@ -435,17 +435,31 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 # of actionable escalation text can outlive recovery, and never while a
 # transaction is open, so a rollback can never erase what reclaim merged in.
 #
+# <digests-only>, when 1, never adopts a backup's buffer/sidecar/wedge group -
+# only digest text is merged. Callers pass 1 on a live-daemon refresh: the
+# daemon is the sole writer of the buffer and its sidecar with no shared lock
+# around them, so an adoption there would race a concurrent escalate_add (the
+# freshly appended line would be overwritten) and never be reserved, digested,
+# or reach captain chat. A backup with a group left untouched this way is
+# reported as deferred, exactly like a live-path conflict, since it is not a
+# fault - the group is simply not this call's to adopt.
+#
+# Group adoption itself writes each artifact through the same same-directory
+# mktemp-then-mv pattern away_ledger_write uses for the sidecar, so a reader
+# elsewhere can never observe a half-copied file.
+#
 # Return status distinguishes an ordinary wait state from a real fault:
 #   0  every backup was fully reconciled (or none matched the glob)
 #   2  deferred only - a live buffer/sidecar/wedge conflicts with at least one
-#      backup's group, so that backup was correctly left untouched; this is
-#      the normal state during an active away session and is not a failure
+#      backup's group (or digests-only mode left one untouched), so that
+#      backup was correctly left untouched; this is the normal state during
+#      an active away session and is not a failure
 #   1  a real copy, directory-prepare, or removal failure occurred; callers
 #      should surface this one, unlike the merely-deferred status above
-away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
-  local state=$1 buf=$2 wedge=$3 pattern=$4
+away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-only]
+  local state=$1 buf=$2 wedge=$3 pattern=$4 digests_only=${5:-0}
   local backup digest_dir artifact base f ok real_fail group_clear_to_adopt group_ok
-  local result=0 deferred=0
+  local dir tmp result=0 deferred=0
   digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
@@ -469,13 +483,22 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
     if [ -e "$backup/${buf##*/}" ] || [ -e "$backup/${buf##*/}.since" ] \
       || [ -e "$backup/${wedge##*/}" ]; then
       group_clear_to_adopt=0
-      [ -e "$buf" ] || [ -e "${buf}.since" ] || [ -e "$wedge" ] || group_clear_to_adopt=1
+      if [ "$digests_only" -ne 1 ]; then
+        [ -e "$buf" ] || [ -e "${buf}.since" ] || [ -e "$wedge" ] || group_clear_to_adopt=1
+      fi
       if [ "$group_clear_to_adopt" -eq 1 ]; then
         group_ok=1
         for artifact in "$buf" "${buf}.since" "$wedge"; do
           base=${artifact##*/}
           [ -e "$backup/$base" ] || continue
-          cp -p "$backup/$base" "$artifact" || { group_ok=0; ok=0; real_fail=1; }
+          dir=${artifact%/*}
+          if tmp=$(umask 077; mktemp "$dir/.${base}.reclaim.XXXXXX" 2>/dev/null) \
+            && cp -p "$backup/$base" "$tmp" 2>/dev/null && mv -f "$tmp" "$artifact" 2>/dev/null; then
+            :
+          else
+            rm -f -- "${tmp:-}" 2>/dev/null
+            group_ok=0; ok=0; real_fail=1
+          fi
         done
         # Consume the group from the backup as soon as it is fully adopted,
         # independent of any unrelated digest-merge outcome above, so a
@@ -519,17 +542,28 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
 # are printed, one whitespace-joined line per backup, tagged so the caller can
 # label it distinctly from the live buffer's own evidence.
 #
-# Publication and removal are atomic per backup: nothing is printed for a
-# backup unless that backup's digest merge AND its removal both succeed in
-# this same call, so an incomplete reconciliation can never duplicate
-# evidence on a later retry - it simply leaves that backup untouched, exactly
-# as far along as it was, for the next call to finish or retry from.
+# Publication and removal are atomic per backup, but the commit point is the
+# rename to a `.consumed` marker, not the final removal: `rm -rf` unlinks in
+# unspecified order, so a failure partway through (e.g. an undeletable
+# subdirectory after the buffer file is already gone) must never be allowed to
+# both destroy content and suppress its evidence. The same-directory `mv` that
+# marks a backup consumed is a single atomic filesystem operation, so by the
+# time evidence is printed the backup is already durably marked done; a
+# `.consumed` remnant left behind by a subsequent removal failure carries no
+# unpublished content, and a later call recognizes it by name and retries only
+# the removal, never re-printing.
 away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
   local state=$1 buf=$2 wedge=$3 pattern=$4
-  local backup bbuf accounted rec n body wedge_body digest_dir f base ok result=0
+  local backup bbuf accounted rec n body wedge_body digest_dir f base ok consumed result=0
   digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
+    case "$backup" in
+      *.consumed)
+        rm -rf "$backup" || result=1
+        continue
+        ;;
+    esac
     ok=1
     if [ -d "$backup/tg-away-digest" ]; then
       if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
@@ -570,9 +604,11 @@ away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
     wedge_body=''
     [ -s "$backup/${wedge##*/}" ] && wedge_body=$(head -1 "$backup/${wedge##*/}" 2>/dev/null)
 
-    if rm -rf "$backup"; then
+    consumed="${backup}.consumed"
+    if mv "$backup" "$consumed" 2>/dev/null; then
       [ -z "$body" ] || printf '%s\n' "$body"
       [ -z "$wedge_body" ] || printf 'wedge: %s\n' "$wedge_body"
+      rm -rf "$consumed" || result=1
     else
       result=1
     fi
