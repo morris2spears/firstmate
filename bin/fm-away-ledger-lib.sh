@@ -238,43 +238,110 @@ _away_ledger_mut_truncate() {  # <staging>
   return 0
 }
 
-_away_ledger_mut_chat() {  # <batch-id> <lines> attempting|confirmed <staging>
-  printf '%s %s %s\n' "$1" "$2" "$3" > "$4/chat" 2>/dev/null
+_away_ledger_mut_chat() {  # <batch-id> <confirmed> <attempt-from> <attempt-to> <staging>
+  printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" > "$5/chat" 2>/dev/null
 }
 
-# Record where this batch stands with captain chat, as a version transition, so
-# the fact survives a crash exactly like every other part of the unit.
-away_ledger_chat_mark() {  # <state> <batch-id> <lines> attempting|confirmed
-  local state=$1 id=$2 lines=$3 phase=$4
-  away_ledger_is_count "$lines" || return 1
-  case "$phase" in
-    attempting|confirmed) ;;
-    *) return 1 ;;
-  esac
-  case "$id" in
-    ''|*[!0-9a-zA-Z-]*) return 1 ;;
-  esac
-  away_ledger_transact "$state" "$state/.subsuper-escalations" \
-    "$(away_ledger_wedge_of "$state")" _away_ledger_mut_chat "$id" "$lines" "$phase"
-}
-
-# How many lines of <batch-id> captain chat PROVABLY already received: the
-# CONFIRMED PREFIX of the batch, printed as a count. A batch only ever grows, so
-# the prefix is monotonic and a later flush may only ever offer chat the lines
-# PAST it - an append landing between a confirmed submit and the truncation that
-# should have followed can no longer drag the already-delivered lines back into
-# captain chat. Only a confirmed submit counts; an interrupted attempt answers 0
-# so it retries in full rather than silently dropping an escalation.
-away_ledger_chat_delivered() {  # <state> <batch-id>
-  local id lines phase extra
-  IFS=' ' read -r id lines phase extra \
+# The in-session delivery receipt, parsed as INDEPENDENT fields:
+#
+#   <batch-id> <confirmed> <attempt-from> <attempt-to>
+#
+# `confirmed` is the monotonic prefix of the batch captain chat PROVABLY has, and
+# the attempt range is the suffix a submit is currently offering it. They are
+# separate on purpose: starting an attempt must never lower the confirmed prefix,
+# so an inject that fails (or a crash between the attempt record and the submit)
+# cannot drag already-delivered lines back into captain chat.
+#
+# The legacy 3-field "<id> <lines> attempting|confirmed" shape is read forward:
+# `confirmed` there counted only for the confirmed phase, and an `attempting`
+# record proved nothing.
+_away_ledger_chat_parse() {  # <state>  -> "<id> <confirmed> <from> <to>"
+  local id a b c extra
+  IFS=' ' read -r id a b c extra \
     < <(head -n 1 "$(away_ledger_chat_of "$1")" 2>/dev/null || true)
-  if [ -z "${extra:-}" ] && [ "${phase:-}" = confirmed ] && [ "${id:-}" = "$2" ] \
-    && away_ledger_is_count "${lines:-}"; then
-    printf '%s\n' "$lines"
-    return 0
+  [ -z "${extra:-}" ] || { printf 'none 0 0 0\n'; return 0; }
+  case "${id:-}" in
+    ''|*[!0-9a-zA-Z-]*) printf 'none 0 0 0\n'; return 0 ;;
+  esac
+  if [ -n "${c:-}" ]; then
+    if away_ledger_is_count "${a:-}" "${b:-}" "$c"; then
+      printf '%s %s %s %s\n' "$id" "$a" "$b" "$c"
+      return 0
+    fi
+  elif away_ledger_is_count "${a:-}"; then
+    case "${b:-}" in
+      confirmed) printf '%s %s 0 0\n' "$id" "$a"; return 0 ;;
+      attempting) printf '%s 0 0 %s\n' "$id" "$a"; return 0 ;;
+    esac
   fi
-  printf '0\n'
+  printf 'none 0 0 0\n'
+}
+
+# The receipt names its own batch, so it stays usable when the ledger sidecar
+# itself is unreadable: a caller with no id (or the placeholder `none`) adopts
+# the recorded identity rather than clobbering it with a nameless record.
+_away_ledger_chat_effective_id() {  # <recorded-id> <requested-id>
+  case "${2:-}" in
+    ''|none) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$2" ;;
+  esac
+}
+
+# Open an attempt on the (from, to] suffix. The confirmed prefix is carried
+# forward untouched for the same batch, so this transition can only ever add
+# information about what is in flight.
+away_ledger_chat_mark_attempt() {  # <state> <batch-id> <from> <to>
+  local state=$1 id=$2 from=$3 to=$4 rec rid rconfirmed rfrom rto confirmed
+  away_ledger_is_count "$from" "$to" || return 1
+  rec=$(_away_ledger_chat_parse "$state")
+  IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
+  id=$(_away_ledger_chat_effective_id "$rid" "$id")
+  case "$id" in
+    ''|none|*[!0-9a-zA-Z-]*) return 1 ;;
+  esac
+  confirmed=0
+  [ "$id" = "$rid" ] && confirmed=$rconfirmed
+  [ "$from" -ge "$confirmed" ] || from=$confirmed
+  away_ledger_transact "$state" "$state/.subsuper-escalations" \
+    "$(away_ledger_wedge_of "$state")" _away_ledger_mut_chat "$id" "$confirmed" "$from" "$to"
+}
+
+# A verified submit advances the confirmed prefix and closes the attempt. The
+# advance is monotonic: a stale or smaller count can never walk it back.
+away_ledger_chat_mark_confirmed() {  # <state> <batch-id> <to>
+  local state=$1 id=$2 to=$3 rec rid rconfirmed rfrom rto confirmed
+  away_ledger_is_count "$to" || return 1
+  rec=$(_away_ledger_chat_parse "$state")
+  IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
+  id=$(_away_ledger_chat_effective_id "$rid" "$id")
+  case "$id" in
+    ''|none|*[!0-9a-zA-Z-]*) return 1 ;;
+  esac
+  confirmed=$to
+  if [ "$id" = "$rid" ] && [ "$rconfirmed" -gt "$confirmed" ]; then
+    confirmed=$rconfirmed
+  fi
+  away_ledger_transact "$state" "$state/.subsuper-escalations" \
+    "$(away_ledger_wedge_of "$state")" _away_ledger_mut_chat "$id" "$confirmed" 0 0
+}
+
+# How many lines of <batch-id> captain chat PROVABLY already received. A batch
+# only ever grows, so the prefix is monotonic and a later flush may only ever
+# offer chat the lines PAST it. <batch-id> is optional: passing nothing (or the
+# placeholder `none` a caller uses when the sidecar is unreadable) answers for
+# whichever batch the receipt itself names, so an unreadable ledger over-reports
+# only the lines chat has NOT been shown.
+away_ledger_chat_delivered() {  # <state> [batch-id]
+  local rec rid rconfirmed rfrom rto
+  rec=$(_away_ledger_chat_parse "$1")
+  IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
+  [ "$rid" != none ] || { printf '0\n'; return 0; }
+  case "${2:-}" in
+    ''|none) ;;
+    "$rid") ;;
+    *) printf '0\n'; return 0 ;;
+  esac
+  printf '%s\n' "$rconfirmed"
 }
 
 _away_ledger_mut_wedge() {  # <text-file> <staging>

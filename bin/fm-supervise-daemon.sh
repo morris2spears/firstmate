@@ -1034,7 +1034,7 @@ escalate_flush() {  # <state>
       msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery deferred; an earlier attempt provably never left this machine and its retry is scheduled, so the captain was not contacted there yet.%s Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "$prior_note")
       ;;
     unknown)
-      msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery unavailable; the away batch ledger is unreadable so nothing was sent to the phone. Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
+      msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery unavailable; the away batch ledger is unreadable so nothing was sent to the phone.%s Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "$prior_note")
       ;;
     *)
       if [ -n "$prior_note" ]; then
@@ -1045,13 +1045,15 @@ escalate_flush() {  # <state>
       ;;
   esac
   # The in-session delivery state is recorded in the version before and after the
-  # submit. A truncation that fails AFTER a confirmed submit therefore cannot
-  # become a second delivery of the same batch into captain chat: the next flush
-  # sees the confirmed record above and retries only the bookkeeping.
-  away_ledger_chat_mark "$state" "$batch_id" "$n" attempting \
+  # submit, as independent fields: opening the attempt states which suffix is in
+  # flight and never lowers the confirmed prefix, and only a verified submit
+  # advances that prefix. So neither a failed inject nor a truncation that fails
+  # AFTER a confirmed submit can become a second delivery of the same lines into
+  # captain chat: the next flush starts past the confirmed prefix either way.
+  away_ledger_chat_mark_attempt "$state" "$batch_id" "$chat_start" "$n" \
     || log "WARN: could not record the in-session delivery attempt for this away batch"
   if inject_msg "$msg" "$state"; then
-    if ! away_ledger_chat_mark "$state" "$batch_id" "$n" confirmed; then
+    if ! away_ledger_chat_mark_confirmed "$state" "$batch_id" "$n"; then
       log "ERROR: in-session delivery confirmed but not recorded; a retry may repeat this batch in captain chat"
     fi
     away_ledger_truncate "$buf" || return 1

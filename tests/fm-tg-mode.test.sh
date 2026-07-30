@@ -1384,8 +1384,8 @@ test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate() {
   ) && fail "a failed truncation must still be reported as a flush failure"
   count=$(grep -c 'one event the captain already saw' "$injected")
   [ "$count" -eq 1 ] || fail "the first flush must inject exactly once (got $count)"
-  assert_grep confirmed "$state/.subsuper-chat-delivery" \
-    "a confirmed submit must be recorded in the unit before the truncation"
+  [ "$(away_ledger_chat_delivered "$state")" = 1 ] \
+    || fail "a confirmed submit must be recorded in the unit before the truncation"
 
   (
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
@@ -1438,6 +1438,88 @@ test_away_confirmed_chat_prefix_survives_a_growing_batch() {
     || fail "the line appended past the confirmed prefix must still reach captain chat"
   [ ! -s "$buf" ] || fail "the grown batch must be retired once its flush settles"
   pass "a confirmed in-session prefix is never repeated when the batch grows"
+}
+
+# Opening an attempt states which suffix is in flight; it must never lower the
+# confirmed prefix. Otherwise a failed inject on a grown batch would erase the
+# proof that the earlier lines already reached captain chat and re-deliver them.
+test_away_failed_inject_never_lowers_the_confirmed_chat_prefix() {
+  local home state buf injected count
+  home=$(make_home away-attempt-prefix)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event the captain already saw' \
+    || fail "the first append must succeed"
+
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    away_ledger_truncate() { return 1; }
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+
+  escalate_add "$state" 'blocked: second event arriving after the confirmed submit' \
+    || fail "the append onto the confirmed batch must succeed"
+  (
+    inject_msg() { return 1; }
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a refused inject must be reported as a flush failure"
+  [ "$(away_ledger_chat_delivered "$state")" = 1 ] \
+    || fail "an attempt that failed to submit must not lower the confirmed prefix"
+
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the retry after a refused inject must settle the batch"
+  count=$(grep -c 'first event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "a refused inject must not re-deliver the confirmed prefix (got $count)"
+  grep -F 'second event arriving after the confirmed submit' "$injected" >/dev/null \
+    || fail "the unconfirmed suffix must still reach captain chat"
+  pass "a refused inject never lowers the confirmed in-session prefix"
+}
+
+# The receipt names its own batch and lives beside the ledger, not inside it, so
+# a sidecar corrupted after a confirmed submit still fails OPEN (the unconfirmed
+# lines are surfaced) without repeating the prefix captain chat already has.
+test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix() {
+  local home state buf injected count
+  home=$(make_home away-corrupt-after-chat)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event the captain already saw' \
+    || fail "the first append must succeed"
+
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    away_ledger_truncate() { return 1; }
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+
+  escalate_add "$state" 'blocked: second event after the ledger went bad' \
+    || fail "the append onto the confirmed batch must succeed"
+  printf 'garbage\n' > "$buf.since"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "an unreadable ledger must still flush to the in-session fallback"
+
+  count=$(grep -c 'first event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "an unreadable ledger must not repeat the confirmed prefix (got $count)"
+  grep -F 'second event after the ledger went bad' "$injected" >/dev/null \
+    || fail "an unreadable ledger must still surface the unconfirmed lines"
+  pass "an unreadable ledger keeps the confirmed in-session prefix out of captain chat"
 }
 
 # The daemon's TERM/INT cleanup runs its final flush inside the same shell, so a
@@ -2094,6 +2176,8 @@ test_away_store_lock_steal_never_removes_a_new_owner
 test_away_refused_append_keeps_the_wake_re_derivable
 test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate
 test_away_confirmed_chat_prefix_survives_a_growing_batch
+test_away_failed_inject_never_lowers_the_confirmed_chat_prefix
+test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix
 test_away_store_lock_is_reentrant_for_its_own_holder
 test_away_diverged_live_unit_retains_its_predecessor
 test_away_lifecycle_sweeps_leaked_unit_staging_temps
