@@ -95,7 +95,30 @@ case "$provider" in
     # Only the author login and the comment identifier are read. A comment body
     # is arbitrary captain prose that would have to survive a wake line intact,
     # so firstmate fetches it from the forge when it handles the wake instead.
-    comments=$(gh pr view "$url" --json comments -q '.comments[] | [.author.login, .id] | @tsv' 2>/dev/null) || exit 0
+    #
+    # A comment only counts as the instruction behind this close if it was made
+    # at or after six hours before it. The captain comments and closes in one
+    # sitting, so six hours covers a distracted same-session close with margin
+    # while excluding an incidental early comment on a pull request that is only
+    # closed much later, after the work was superseded. There is no upper bound:
+    # a comment written after the close is always a fresh instruction on a
+    # closed pull request, however long after it lands. The window errs generous
+    # rather than tight because the two failures are not symmetric - a missed
+    # decline is silent and defeats the feature, while a stale relay is loud and
+    # firstmate reads the comment before it acts on it.
+    #
+    # The window arithmetic runs inside gh's own jq rather than in date(1),
+    # whose relative-time flags differ between the BSD and GNU builds firstmate
+    # has to run on. A null or unparseable closedAt makes fromdateiso8601 error,
+    # gh exits non-zero, and this poll stays silent, which is the safe
+    # direction.
+    #
+    # gh returns only the first 100 issue comments, oldest first, so on a pull
+    # request with more than 100 comments the captain's decline can fall outside
+    # the window gh reports. The close binding above makes that failure silent
+    # rather than wrong, which is again the safe direction; a paginated or
+    # reversed query is the follow-up if a pull request ever gets that long.
+    comments=$(gh pr view "$url" --json closedAt,comments -q '(.closedAt|fromdateiso8601) as $c | .comments[] | select((.createdAt|fromdateiso8601) >= ($c - 21600)) | [.author.login, .id] | @tsv' 2>/dev/null) || exit 0
     [ -n "$comments" ] || exit 0
     latest=
     while IFS=$'\t' read -r author comment_id _rest; do

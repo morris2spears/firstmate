@@ -72,11 +72,22 @@ case " $* " in
     [ "${FM_TEST_GH_LOGIN_FAIL:-0}" = 0 ] || exit 1
     [ -z "${FM_TEST_GH_LOGIN-}" ] || printf '%s\n' "$FM_TEST_GH_LOGIN"
     ;;
-  # One "<author-login>\t<comment-id>" line per comment, oldest first, exactly
-  # as the poll's jq selection renders gh's comment list.
-  *" comments "*)
+  # One "<author-login>\t<comment-id>\t<seconds-from-closedAt>" fixture line per
+  # comment, oldest first. The real query drops every comment made more than six
+  # hours before the close inside gh's own jq, so the fake applies that same
+  # window here and prints what the poll actually parses, a "<login>\t<id>" line
+  # per surviving comment. A missing offset field means the comment was made at
+  # the close. FM_TEST_GH_CLOSED_AT_FAIL models a null or unparseable closedAt,
+  # which makes fromdateiso8601 error and gh exit non-zero with no output.
+  *" closedAt,comments "*)
     [ "${FM_TEST_GH_COMMENTS_FAIL:-0}" = 0 ] || exit 1
-    [ -z "${FM_TEST_GH_COMMENTS-}" ] || printf '%s\n' "$FM_TEST_GH_COMMENTS"
+    [ "${FM_TEST_GH_CLOSED_AT_FAIL:-0}" = 0 ] || exit 1
+    [ -n "${FM_TEST_GH_COMMENTS-}" ] || exit 0
+    while IFS=$'\t' read -r login comment_id offset; do
+      [ -n "$login$comment_id" ] || continue
+      [ "${offset:-0}" -ge -21600 ] || continue
+      printf '%s\t%s\n' "$login" "$comment_id"
+    done <<< "$FM_TEST_GH_COMMENTS"
     ;;
   *" state "*)
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
@@ -3345,9 +3356,10 @@ test_gitlab_merged_poll_retires() {
   pass "GitHub and GitLab exact merged results share one retirement path"
 }
 
-# One "<login>\t<comment-id>" comment line, in the fake forge's wire shape.
+# One comment fixture line: login, comment identifier, and optionally when it
+# was made relative to the close, in seconds, defaulting to the close itself.
 comment_line() {
-  printf '%s\t%s' "$1" "$2"
+  printf '%s\t%s\t%s' "$1" "$2" "${3:-0}"
 }
 
 test_declined_pull_request_detection() {
@@ -3385,8 +3397,30 @@ $(comment_line "$captain" IC_second)
 $(comment_line "$bot" IC_bot2)" run_poll "$dir")
   [ "$out" = "declined 1 IC_second" ] || fail "newest captain comment was not selected: [$out]"
 
+  # Only a comment bound to the close carries the instruction behind it. One
+  # made well before the close is an incidental remark on work that was later
+  # superseded, and never a decline; one just inside the window is the captain
+  # closing what he was already commenting on, and one made after the close is a
+  # fresh instruction whenever it lands.
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_stale -604800)" run_poll "$dir")
+  [ -z "$out" ] || fail "comment from long before the close was relayed as a decline: [$out]"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_edge -21600)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_edge" ] || fail "comment inside the close window was not relayed: [$out]"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_after 2592000)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_after" ] || fail "comment made after the close was not relayed: [$out]"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_stale -604800)
+$(comment_line "$captain" IC_fresh -60)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_fresh" ] || fail "stale comment displaced the fresh one: [$out]"
+
   # Every unresolved identity or unreadable lookup stays silent, exactly as the
   # merge branch does, so a failure can never be read as an instruction.
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" FM_TEST_GH_CLOSED_AT_FAIL=1 \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "unreadable close timestamp still reported a decline"
   out=$(FM_TEST_GH_STATE=CLOSED \
     FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
   [ -z "$out" ] || fail "unresolved captain identity still reported a decline"
