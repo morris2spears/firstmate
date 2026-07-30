@@ -41,12 +41,17 @@
 # The invariant accounted <= confirmed <= reserved holds at every transition, and
 # an unparseable record is reported as `unknown`, which callers must treat as
 # fail-closed: nothing to the phone, everything to the visible in-session
-# escalation. Callers never keep their own counters and never delete a digest or
-# a ledger themselves - they query and transition this owner, so the away daemon,
-# away start, and away return all agree on one state machine.
+# escalation. Callers never keep their own counters and never retire a digest or
+# a ledger record themselves - they query and transition this owner, so the away
+# daemon, away start, and away return all agree on one state machine.
 #
 # All of it lives in the sidecar because every away lifecycle path already
-# retires, backs up, and restores that sidecar together with its buffer.
+# retires, backs up, and restores that sidecar together with its buffer. The one
+# path that touches the sidecar file directly is away launch's crash rollback,
+# which snapshots and restores the whole away artifact set (buffer, sidecar,
+# flag, wedge marker) as opaque bytes rather than reading or advancing counts -
+# so it cannot desynchronise the state machine, and clearing state on a fresh
+# away entry still goes through away_ledger_retire.
 
 FM_AWAY_LEDGER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-x-lib.sh
