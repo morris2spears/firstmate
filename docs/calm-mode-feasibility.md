@@ -103,7 +103,7 @@ $ npm exec --yes --package=typescript -- bash -c 'tests/fm-pi-primary-types.test
 ok - tracked Pi extensions pass strict no-emit typecheck against Pi 0.82.1
 
 $ bin/fm-doc-audience-check.sh
-fm-doc-audience-check: ok surfaces=57 local_links=156
+fm-doc-audience-check: ok surfaces=57 local_links=160
 
 $ bin/fm-test-run.sh --changed --base origin/main
 FM_TEST_SUMMARY total=48 failed=0 skipped_gate=8 duration_ms=417838
