@@ -6,7 +6,7 @@ This maintainer-verification record owns the version-scoped Pi renderer taxonomy
 ## Required presentation boundary
 
 A qualifying Calm implementation must auto-load from the trusted project and read the effective Firstmate home's persisted choice on every Pi session start.
-While active, it must leave only genuine captain prompts, normal assistant replies, interactive dialogs, and explicit errors that need a response in the visible conversation area.
+While active, it must leave only genuine captain prompts, normal assistant replies, the captain's own `!bash` command rows with their output, interactive dialogs, and explicit errors that need a response in the visible conversation area.
 It must remove thinking, complete tool rows and shells, tool images, Pi working activity, canonically classified Firstmate operational inputs, and the remaining non-conversation rows Pi renders, without changing their delivery or model context.
 It must redraw loaded transcript rows, preserve tool expansion state, add no replacement status UI, restore stock rendering when disabled, and leave exports and shares complete.
 Presentation must remain inactive in RPC, JSON, print, and untrusted contexts.
@@ -15,13 +15,13 @@ Presentation must remain inactive in RPC, JSON, print, and untrusted contexts.
 
 `.pi/extensions/fm-calm.ts` is the single extension owner for Calm lifecycle, persistence integration, stock-export rendering, and `/calm`.
 `.pi/extensions/lib/fm-calm-visibility.ts` owns the allowlist-style transcript policy.
-Only `genuine-user-prompt` and `genuine-agent-response` are policy-visible while Calm is active.
+`genuine-user-prompt`, `genuine-agent-response`, and `user-bash` are the policy-visible classes while Calm is active; `user-bash` is visible because a `!bash` row is the captain's direct action rather than agent machinery.
 `.pi/extensions/lib/fm-calm-assistant-layout.ts` removes thinking blocks from the shallow presentation copy before Pi calculates assistant layout.
 `.pi/extensions/lib/fm-calm-tool-layout.ts` returns zero rows from Pi's exported `ToolExecutionComponent` while Calm is active, which removes calls, results, framing, and image children together, and keeps only the width-clamped error text of a row whose assistant turn stopped on `aborted` or `error`.
 Routine per-tool failures carry the same `isError` flag but are not turn-level failures, so they stay hidden with the rest of the row.
 `.pi/extensions/lib/fm-calm-tool-layout.ts` also owns the tool-error turn boundary that classifies each assistant turn and scopes identical-error ownership to that turn, holding the turn state on the shared patch registry so an extension reload cannot split it from the surviving prototype wrappers.
 `.pi/extensions/lib/fm-calm-operational-user-layout.ts` renders canonically classified text-only Firstmate operational user rows at zero height.
-`.pi/extensions/lib/fm-calm-nonconversation-layout.ts` renders the remaining non-conversation rows at zero height through one probed seam each: `BashExecutionComponent`, `SkillInvocationMessageComponent`, `CompactionSummaryMessageComponent`, `BranchSummaryMessageComponent`, and `CustomMessageComponent` prototype renders, plus `InteractiveMode.addCustomEntryToChat` and `InteractiveMode.addCacheMissNotice` for the rows Pi builds without an exported class.
+`.pi/extensions/lib/fm-calm-nonconversation-layout.ts` renders the remaining non-conversation rows at zero height through one probed seam each: `SkillInvocationMessageComponent`, `CompactionSummaryMessageComponent`, `BranchSummaryMessageComponent`, and `CustomMessageComponent` prototype renders, plus `InteractiveMode.addCustomEntryToChat` and `InteractiveMode.addCacheMissNotice` for the rows Pi builds without an exported class.
 It also replaces the standalone spacer `InteractiveMode.addMessageToChat` adds beside a compaction summary, a branch summary, or a skill invocation, so a hidden row leaves no blank line; a render adapter that failed to install keeps its own spacer.
 `bin/fm-operational-input.sh` remains the single owner of operational-input construction and parsing.
 The seven built-in definitions and `fm_watch_arm_pi` retain per-renderer zero-height behavior as an independent fallback if the complete tool-row adapter is unavailable.
@@ -59,7 +59,8 @@ Serialized session entries are never modified by a presentation toggle.
 
 ## Compatibility review
 
-Pi 0.82.1 additionally exposes the `BashExecutionComponent`, `SkillInvocationMessageComponent`, `CompactionSummaryMessageComponent`, `BranchSummaryMessageComponent`, and `CustomMessageComponent` exports and the `InteractiveMode.addMessageToChat`, `addCustomEntryToChat`, and `addCacheMissNotice` seams the non-conversation adapters patch, along with pi-tui's `Spacer` class the spacer adapter needs to recognize a standalone spacer.
+Pi 0.82.1 additionally exposes the `SkillInvocationMessageComponent`, `CompactionSummaryMessageComponent`, `BranchSummaryMessageComponent`, and `CustomMessageComponent` exports and the `InteractiveMode.addMessageToChat`, `addCustomEntryToChat`, and `addCacheMissNotice` seams the non-conversation adapters patch, along with pi-tui's `Spacer` class the spacer adapter needs to recognize a standalone spacer.
+Pi's `BashExecutionComponent` export is deliberately left unpatched, so no Calm adapter probes or installs on it.
 Pi 0.81.1 introduced the evidence baseline, Pi 0.82.0 preserved the original assistant and operational-user seams, and Pi 0.82.1 preserves those seams plus the exported `ToolExecutionComponent.render`, `ToolExecutionComponent.updateResult`, and `AssistantMessageComponent.updateContent` seams used for complete tool-row suppression and its actionable-error surface, and pi-tui's `visibleWidth`, `truncateToWidth`, and `wrapTextWithAnsi` column helpers used to keep every emitted error line inside the terminal width Pi enforces.
 Version strings are evidence rather than compatibility gates.
 A future version with a missing method degrades only that adapter.
