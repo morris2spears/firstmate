@@ -676,23 +676,35 @@ escalate_add() {  # <state> <distilled-item>
 #
 # The transport outcome is classified into exactly two non-accepted proof classes,
 # never inferred from a bare non-zero status:
-#   proven-local   nothing reached the network - no ledger write, no spool, no
-#                  watchdog (125), no runnable client (127). The attempt is
-#                  retired through the ledger: its claim comes back AND the batch's
-#                  attempt ordinal advances, so the same lines retry under a fresh
-#                  delivery id while this attempt's evidence stays auditable.
+#   proven-local   nothing reached the network - no runnable client
+#                  (fmtg_client_runnable, checked before the watchdog ever runs),
+#                  or the watchdog's own pre-launch guard (125), which
+#                  telegram_away_send_file makes unforgeable by remapping any
+#                  124/125 the client itself might return to a generic ambiguous
+#                  status, so 125 here can only be the watchdog's sentinel. The
+#                  attempt is retired through the ledger: its claim comes back AND
+#                  the batch's attempt ordinal advances, so the same lines retry
+#                  under a fresh delivery id while this attempt's evidence stays
+#                  auditable.
 #   ambiguous      the request may have reached Telegram - a watchdog timeout, or a
-#                  client that ran and exited non-zero, which the real client cannot
-#                  distinguish from a lost response to a send Telegram accepted.
-#                  The claim is KEPT, the ordinal does not move, so those lines are
-#                  never offered to the phone again and the batch falls back
-#                  visibly in session instead.
+#                  client that ran and exited non-zero (including a disappeared
+#                  client racing the runnable check, or 124/125 from the client
+#                  itself), which cannot be distinguished from a lost response to a
+#                  send Telegram accepted. The claim is KEPT, the ordinal does not
+#                  move, so those lines are never offered to the phone again and
+#                  the batch falls back visibly in session instead.
 #
 # The send itself runs under the same bounded watchdog every other external
 # notifier in this file uses (FM_WEDGE_ALARM_TIMEOUT_SECS), so a hung phone client
 # can never stall housekeeping or the ~1s shutdown path.
 telegram_away_send_file() {  # <spool-file>
+  local rc
   fmtg_send_stdin < "$1"
+  rc=$?
+  case "$rc" in
+    124|125) return 1 ;;
+    *) return "$rc" ;;
+  esac
 }
 
 # How long a retired proven-local attempt waits before the same lines may be

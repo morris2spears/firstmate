@@ -125,15 +125,12 @@ print_blockers() {  # <file>
 }
 
 clear_delivery_artifacts() {
-  rm -f \
-    "$STATE/.subsuper-escalations" \
+  # Retire the complete owned unit through the ledger owner. Only ever called
+  # after the catch-up evidence above has folded the digests in, so an accepted
+  # one-shot escalation is never dropped here. The text-free <id>.status
+  # delivery evidence is deliberately kept.
+  away_ledger_retire_batch "$STATE" "$STATE/.subsuper-escalations" \
     "$STATE/.subsuper-inject-wedged"
-  # Retire the batch ledger and this away session's working records through their
-  # owner. Only ever called after the catch-up evidence above has folded the
-  # digests in, so an accepted one-shot escalation is never dropped here. The
-  # text-free <id>.status delivery evidence is deliberately kept.
-  away_ledger_retire "$STATE/.subsuper-escalations"
-  away_ledger_retire_working_records "$STATE"
 }
 
 return_guard() {

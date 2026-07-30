@@ -919,6 +919,44 @@ test_away_uncertain_send_stops_the_batch_from_reaching_the_phone() {
   pass "an uncertain send keeps its reservation and stops the batch reaching the phone"
 }
 
+# A client that actually ran and exited 125 (or 124) must never be treated as
+# proven-local: those exit codes belong exclusively to wedge_alarm_run_bounded's
+# own pre-launch guard and timeout. A client-produced 125 must stay ambiguous -
+# reservation kept, attempt ordinal unchanged - so the same lines are never
+# offered to the phone again under a fresh delivery id (which would duplicate
+# the captain alert the client may already have sent).
+test_away_client_exit_125_is_never_proven_local() {
+  local home state tg injected
+  home=$(make_home away-client-exit-125)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: client exited 125 after issuing the request'
+
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" FAKE_TG_EXIT=125 escalate_flush "$state"
+  ) && fail "a client exit 125 must leave escalate_flush unconfirmed"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "the client must have been invoked exactly once"
+  ledger_field "$state" 2 1 "a client exit 125 must keep its reservation"
+  ledger_field "$state" 3 0 "a client exit 125 must not confirm anything"
+  ledger_field "$state" 5 0 "a client exit 125 must not advance the attempt ordinal"
+  assert_grep 'Telegram delivery uncertain' "$injected" \
+    "a client exit 125 must never be reported as a proven-local failure"
+
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "a poisoned batch must still complete the in-session flush"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "an ambiguous exit 125 must never be retried, which would risk a duplicate phone alert"
+  pass "a client exit 125 stays ambiguous and is never retried as proven-local"
+}
+
 # Every send must come through the ledger: no default arguments, no id minted
 # outside the owner, no bypass of the exactly-once accounting.
 test_away_delivery_refuses_untracked_sends() {
@@ -1228,6 +1266,7 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim
 test_away_off_mid_batch_never_repeats_delivered_events
 test_away_lifecycle_retires_tg_working_records
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
+test_away_client_exit_125_is_never_proven_local
 test_away_delivery_refuses_untracked_sends
 test_away_delivery_refuses_malformed_counts
 test_away_proven_local_failure_retries_the_same_lines

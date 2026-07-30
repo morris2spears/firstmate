@@ -230,6 +230,42 @@ unit_failed_start_rolls_back_state() {
   rm -rf "$st"
 }
 
+unit_failed_start_preserves_digests_mid_session() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-failed-start-digest.XXXXXX")
+  mkdir -p "$st/state/tg-away-digest"
+  printf 'was already away\n' > "$st/state/.afk"
+  printf 'pending\n' > "$st/state/.subsuper-escalations"
+  printf '1700000000-abc 1 1 1 0 0 x\n' > "$st/state/.subsuper-escalations.since"
+  printf 'blocked: needs the captain\n' > "$st/state/tg-away-digest/1700000000-abc-a0-0-x.items"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=unused \
+    FM_SUPERVISOR_BACKEND=unsupported "$LAUNCH" start >/dev/null 2>&1; then
+    fail "failed start (mid-session): unsupported backend unexpectedly succeeded"
+  elif [ -f "$st/state/tg-away-digest/1700000000-abc-a0-0-x.items" ] \
+    && [ "$(cat "$st/state/tg-away-digest/1700000000-abc-a0-0-x.items")" = 'blocked: needs the captain' ]; then
+    pass "failed start (mid-session): rollback preserves accepted digests through the owner API"
+  else
+    fail "failed start (mid-session): rollback lost an accepted digest"
+  fi
+  rm -rf "$st"
+}
+
+unit_failed_start_rolls_back_stale_digests() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-failed-start-stale-digest.XXXXXX")
+  mkdir -p "$st/state/tg-away-digest"
+  printf 'leftover from a prior session\n' > "$st/state/tg-away-digest/stale-a0-0-x.items"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=unused \
+    FM_SUPERVISOR_BACKEND=unsupported "$LAUNCH" start >/dev/null 2>&1; then
+    fail "failed start (fresh entry): unsupported backend unexpectedly succeeded"
+  elif [ -f "$st/state/tg-away-digest/stale-a0-0-x.items" ]; then
+    pass "failed start (fresh entry): rollback restores the pre-attempt digest snapshot exactly"
+  else
+    fail "failed start (fresh entry): rollback lost the pre-attempt digest snapshot"
+  fi
+  rm -rf "$st"
+}
+
 unit_concurrent_start_serialized() {
   command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found (concurrent start)"; return 0; }
   local st cap_session cap_pane first second rec count
@@ -914,6 +950,8 @@ unit_fresh_vs_refresh
 unit_stop_ordering
 unit_stop_rejects_reused_pid
 unit_failed_start_rolls_back_state
+unit_failed_start_preserves_digests_mid_session
+unit_failed_start_rolls_back_stale_digests
 unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_signal_exits_with_lock_cleanup

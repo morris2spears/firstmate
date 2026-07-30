@@ -73,13 +73,11 @@ fm_afk_start_usage() {
 # escalation buffer itself is re-derived by the daemon's heartbeat scan.
 fm_afk_clear_stale_artifacts() {  # <state-dir> [had-afk]
   local state=$1 had_afk=${2:-0}
-  rm -f "$state/.subsuper-escalations" \
-        "$state/.subsuper-inject-wedged" 2>/dev/null
-  # The ledger owner retires its own record and this away session's working
-  # records (private digests, outbound spool, ledger temps); the text-free
-  # <id>.status delivery evidence is deliberately left in place.
-  away_ledger_retire "$state/.subsuper-escalations"
-  away_ledger_retire_working_records "$state" "$had_afk"
+  # The ledger owner retires the complete owned unit (buffer, wedge marker,
+  # sidecar, working records) itself; the text-free <id>.status delivery
+  # evidence is deliberately left in place.
+  away_ledger_retire_batch "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$had_afk"
 }
 
 daemon_lock_owner() {

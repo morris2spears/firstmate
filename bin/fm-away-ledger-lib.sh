@@ -46,12 +46,13 @@
 # daemon, away start, and away return all agree on one state machine.
 #
 # All of it lives in the sidecar because every away lifecycle path already
-# retires, backs up, and restores that sidecar together with its buffer. The one
-# path that touches the sidecar file directly is away launch's crash rollback,
-# which snapshots and restores the whole away artifact set (buffer, sidecar,
-# flag, wedge marker) as opaque bytes rather than reading or advancing counts -
-# so it cannot desynchronise the state machine, and clearing state on a fresh
-# away entry still goes through away_ledger_retire.
+# retires, backs up, and restores that sidecar together with its buffer through
+# this owner's away_ledger_snapshot/away_ledger_restore/away_ledger_retire_batch,
+# never by enumerating the artifact set itself. away launch's crash rollback
+# copies the whole unit (buffer, sidecar, wedge marker, digest directory) as
+# opaque bytes rather than reading or advancing counts, so it cannot
+# desynchronise the state machine, and away-mode's own flag file is the one
+# artifact outside this unit - it belongs to the launcher, not the ledger.
 
 FM_AWAY_LEDGER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-x-lib.sh
@@ -322,4 +323,70 @@ away_ledger_retire_working_records() {  # <state> [preserve-digests]
   rm -f "$(away_ledger_delivery_dir "$state")"/.spool.* \
         "$state"/.subsuper-escalations.since.* 2>/dev/null
   return 0
+}
+
+# The complete owned artifact unit for one away batch transaction: the
+# escalation buffer, its ledger sidecar, the wedge marker, and the private
+# digest directory - every artifact a crash or a failed re-entry must resume
+# exactly once from. The text-free <id>.status delivery evidence is NEVER part
+# of this unit: it outlives every snapshot/restore/retire of the batch above it,
+# so accepted/failed/unavailable outcomes stay auditable regardless of how many
+# batches come and go over it.
+#
+# Callers snapshot/restore/retire through these three functions only; they
+# never enumerate or independently delete an owned artifact themselves, so a
+# rollback always restores the complete prior unit or leaves a durable
+# recoverable transaction - never a partial mix of retired and restored pieces.
+
+# Copy the complete owned unit into <backup> (a directory the caller owns and
+# is responsible for removing once it is no longer needed).
+away_ledger_snapshot() {  # <state> <buf> <wedge> <backup>
+  local state=$1 buf=$2 wedge=$3 backup=$4 artifact base digest_dir result=0
+  mkdir -p "$backup" || return 1
+  for artifact in "$buf" "${buf}.since" "$wedge"; do
+    base=${artifact##*/}
+    if [ -e "$artifact" ]; then
+      cp -p "$artifact" "$backup/$base" || result=1
+    fi
+  done
+  digest_dir=$(away_ledger_digest_dir "$state")
+  if [ -d "$digest_dir" ]; then
+    cp -pR "$digest_dir" "$backup/tg-away-digest" || result=1
+  fi
+  return "$result"
+}
+
+# Replace the complete owned unit with what <backup> holds (dropping whatever
+# is currently on disk first), so a caller never ends up with some artifacts
+# restored and others left from the failed attempt.
+away_ledger_restore() {  # <state> <buf> <wedge> <backup>
+  local state=$1 buf=$2 wedge=$3 backup=$4 artifact base digest_dir result=0
+  rm -f "$buf" "${buf}.since" "$wedge" || result=1
+  digest_dir=$(away_ledger_digest_dir "$state")
+  rm -rf "$digest_dir" || result=1
+  for artifact in "$buf" "${buf}.since" "$wedge"; do
+    base=${artifact##*/}
+    if [ -e "$backup/$base" ]; then
+      cp -p "$backup/$base" "$artifact" || result=1
+    fi
+  done
+  if [ -d "$backup/tg-away-digest" ]; then
+    cp -pR "$backup/tg-away-digest" "$digest_dir" || result=1
+  fi
+  return "$result"
+}
+
+# Retire the complete owned unit for a genuinely fresh away entry or a
+# fully-delivered in-session batch: the escalation buffer, the wedge marker,
+# the ledger sidecar, and this session's working records.
+#
+# <preserve-digests>, when 1, keeps the digest directory intact (see
+# away_ledger_retire_working_records) - callers pass 1 on a continuation of an
+# already-active away session rather than a genuinely fresh entry.
+away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
+  local state=$1 buf=$2 wedge=$3 preserve=${4:-0} result=0
+  rm -f "$buf" "$wedge" 2>/dev/null || result=1
+  away_ledger_retire "$buf" || result=1
+  away_ledger_retire_working_records "$state" "$preserve" || result=1
+  return "$result"
 }
