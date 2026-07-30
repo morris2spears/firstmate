@@ -878,6 +878,53 @@ test_away_lifecycle_retires_tg_working_records() {
   pass "the away lifecycle retires the Telegram working records and keeps the evidence"
 }
 
+# A launch rollback backup only survives past its own transaction when
+# away_ledger_restore itself failed partway. away_ledger_reclaim_backups must
+# fold any digest text such a backup holds into the live digest directory
+# rather than let it age out silently, then remove the orphaned backup.
+test_away_reclaim_backups_folds_orphaned_digest_text() {
+  local home state backup live
+  home=$(make_home away-reclaim-backups)
+  state="$home/state"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  mkdir -p "$backup/tg-away-digest"
+  printf 'blocked: stranded by an interrupted restore\n' \
+    > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+
+  away_ledger_reclaim_backups "$state" "$state/.afk-launch-backup.*" \
+    || fail "reclaim must succeed when the live digest directory is writable"
+
+  live="$state/tg-away-digest/1700000000-abc-a0-0-x.items"
+  [ -f "$live" ] \
+    || fail "reclaim must fold the orphaned backup's digest text into the live digest directory"
+  [ "$(cat "$live" 2>/dev/null)" = 'blocked: stranded by an interrupted restore' ] \
+    || fail "reclaim must preserve the orphaned digest's exact text"
+  assert_absent "$backup" "reclaim must remove the orphaned backup once its digest text is folded in"
+  pass "reclaim folds an orphaned rollback backup's digest text and removes the backup"
+}
+
+# A live delivery id's digest file must never be clobbered by a reclaim: if the
+# same delivery id somehow exists in both the live directory and an orphaned
+# backup, the live copy - already possibly folded or read - wins.
+test_away_reclaim_backups_never_overwrites_a_live_digest() {
+  local home state backup
+  home=$(make_home away-reclaim-no-clobber)
+  state="$home/state"
+  mkdir -p "$state/tg-away-digest"
+  printf 'live copy\n' > "$state/tg-away-digest/1700000000-abc-a0-0-x.items"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  mkdir -p "$backup/tg-away-digest"
+  printf 'stale backup copy\n' > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+
+  away_ledger_reclaim_backups "$state" "$state/.afk-launch-backup.*" \
+    || fail "reclaim must succeed"
+
+  [ "$(cat "$state/tg-away-digest/1700000000-abc-a0-0-x.items" 2>/dev/null)" = 'live copy' ] \
+    || fail "reclaim must never overwrite an existing live digest file"
+  assert_absent "$backup" "reclaim must still remove the orphaned backup"
+  pass "reclaim never overwrites a live digest file with an orphaned backup's copy"
+}
+
 # An uncertain outcome poisons the batch for the phone: confirmation can only ever
 # extend a contiguous proven prefix, so a later line is never sent (which would
 # risk a duplicate of the uncertain one) and never presented as delivered.
@@ -1265,6 +1312,8 @@ test_away_unusable_bookkeeping_never_sends_to_the_phone
 test_away_reserved_lines_resolve_from_evidence_not_from_the_claim
 test_away_off_mid_batch_never_repeats_delivered_events
 test_away_lifecycle_retires_tg_working_records
+test_away_reclaim_backups_folds_orphaned_digest_text
+test_away_reclaim_backups_never_overwrites_a_live_digest
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_client_exit_125_is_never_proven_local
 test_away_delivery_refuses_untracked_sends

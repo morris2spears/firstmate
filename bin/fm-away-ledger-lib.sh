@@ -333,10 +333,15 @@ away_ledger_retire_working_records() {  # <state> [preserve-digests]
 # so accepted/failed/unavailable outcomes stay auditable regardless of how many
 # batches come and go over it.
 #
-# Callers snapshot/restore/retire through these three functions only; they
-# never enumerate or independently delete an owned artifact themselves, so a
-# rollback always restores the complete prior unit or leaves a durable
-# recoverable transaction - never a partial mix of retired and restored pieces.
+# The away-mode lifecycle callers (launch, start, return) snapshot/restore/
+# retire through these functions only; they never enumerate or independently
+# delete an owned artifact themselves, so a rollback always restores the
+# complete prior unit or leaves a durable recoverable transaction - never a
+# partial mix of retired and restored pieces. The daemon's in-session success
+# path does not call away_ledger_retire_batch: it only truncates the buffer and
+# retires the sidecar/wedge marker, deliberately leaving the digest directory
+# alone, because the away session is still live and its digests may still be
+# needed by a later crash-recovery read or the eventual return fold.
 
 # Copy the complete owned unit into <backup> (a directory the caller owns and
 # is responsible for removing once it is no longer needed).
@@ -376,9 +381,10 @@ away_ledger_restore() {  # <state> <buf> <wedge> <backup>
   return "$result"
 }
 
-# Retire the complete owned unit for a genuinely fresh away entry or a
-# fully-delivered in-session batch: the escalation buffer, the wedge marker,
-# the ledger sidecar, and this session's working records.
+# Retire the complete owned unit for a lifecycle boundary (a fresh away entry,
+# a mid-session restart, or a completed return catch-up): the escalation
+# buffer, the wedge marker, the ledger sidecar, and this session's working
+# records.
 #
 # <preserve-digests>, when 1, keeps the digest directory intact (see
 # away_ledger_retire_working_records) - callers pass 1 on a continuation of an
@@ -388,5 +394,36 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
   rm -f "$buf" "$wedge" 2>/dev/null || result=1
   away_ledger_retire "$buf" || result=1
   away_ledger_retire_working_records "$state" "$preserve" || result=1
+  return "$result"
+}
+
+# Reclaim every leftover rollback-backup directory matching <backup-glob>: a
+# backup only survives past its own transaction when away_ledger_restore
+# reported a failure and the caller (fm-afk-launch.sh) deliberately kept it
+# rather than risk a partial restore. Any digest text such a backup holds is
+# merged into the live digest directory - never overwriting an existing
+# delivery's file, since delivery ids are unique per attempt - so it still
+# reaches captain chat or the return fold instead of aging out silently in an
+# orphaned copy, and the backup itself is then removed. <exclude>, when given,
+# skips one path even if it matches the glob - the caller's own in-flight
+# backup, which is not yet an orphan and must not be consumed before its own
+# transaction resolves. Called at the next lifecycle entry (away launch) and
+# at return, so no copy of actionable escalation text can outlive recovery.
+away_ledger_reclaim_backups() {  # <state> <backup-glob> [exclude]
+  local state=$1 pattern=$2 exclude=${3:-} backup digest_dir f base result=0
+  digest_dir=$(away_ledger_digest_dir "$state")
+  for backup in $pattern; do
+    [ -d "$backup" ] || continue
+    [ -z "$exclude" ] || [ "$backup" != "$exclude" ] || continue
+    if [ -d "$backup/tg-away-digest" ]; then
+      mkdir -p "$digest_dir" || { result=1; continue; }
+      for f in "$backup/tg-away-digest"/*.items; do
+        [ -f "$f" ] || continue
+        base=${f##*/}
+        [ -e "$digest_dir/$base" ] || cp -p "$f" "$digest_dir/$base" || result=1
+      done
+    fi
+    rm -rf "$backup" || result=1
+  done
   return "$result"
 }

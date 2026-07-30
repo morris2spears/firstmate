@@ -266,6 +266,28 @@ unit_failed_start_rolls_back_stale_digests() {
   rm -rf "$st"
 }
 
+unit_next_entry_reclaims_orphaned_rollback_backup() {
+  local st backup
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-reclaim-backup.XXXXXX")
+  mkdir -p "$st/state"
+  backup=$(mktemp -d "$st/state/.afk-launch-backup.XXXXXX")
+  mkdir -p "$backup/tg-away-digest"
+  printf 'blocked: stranded by an interrupted restore\n' \
+    > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_ENTRY="$SLEEPER" \
+    bash -c '. "$1"; fm_afk_launch_start_native' _ "$LAUNCH" >/dev/null 2>&1; then
+    if [ -f "$st/state/tg-away-digest/1700000000-abc-a0-0-x.items" ] && [ ! -e "$backup" ]; then
+      pass "next entry: reclaims an orphaned rollback backup's digest text"
+    else
+      fail "next entry: left an orphaned backup or lost its digest text"
+    fi
+  else
+    fail "next entry: native start failed unexpectedly"
+  fi
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  rm -rf "$st"
+}
+
 unit_concurrent_start_serialized() {
   command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found (concurrent start)"; return 0; }
   local st cap_session cap_pane first second rec count
@@ -952,6 +974,7 @@ unit_stop_rejects_reused_pid
 unit_failed_start_rolls_back_state
 unit_failed_start_preserves_digests_mid_session
 unit_failed_start_rolls_back_stale_digests
+unit_next_entry_reclaims_orphaned_rollback_backup
 unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_signal_exits_with_lock_cleanup

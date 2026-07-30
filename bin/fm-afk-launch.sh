@@ -470,6 +470,8 @@ fm_afk_launch_start() {
 
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
+    away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" \
+      || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
     if ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to refresh away-mode flag"
       return 1
@@ -497,6 +499,8 @@ fm_afk_launch_start() {
       result=1
     fi
   fi
+  away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" "$backup" \
+    || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
   if [ "$result" -eq 0 ]; then
     if ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to write away-mode flag"
@@ -531,6 +535,8 @@ fm_afk_launch_start_native() {
   fi
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
+    away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" \
+      || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
     fm_afk_launch_flag_write || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0
@@ -549,9 +555,12 @@ fm_afk_launch_start_native() {
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" "$had_afk"; then
       fm_afk_launch_log "failed to clear stale away-mode artifacts"
       result=1
-    elif ! fm_afk_launch_flag_write; then
-      result=1
     fi
+  fi
+  away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" "$backup" \
+    || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
+  if [ "$result" -eq 0 ] && ! fm_afk_launch_flag_write; then
+    result=1
   fi
   if [ "$result" -eq 0 ]; then
     fm_afk_launch_record_write none - native || result=1
