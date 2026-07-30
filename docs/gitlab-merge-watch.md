@@ -195,6 +195,10 @@ No armed watch is lost by upgrading.
 `bin/fm-pr-merge.sh` still addresses GitHub only, by owner and repository.
 It refuses a GitLab merge request URL rather than sending it to the wrong forge, so merging a merge request stays a deliberate manual step until merge parity lands separately.
 
+Decline detection is GitHub-only for the same tooling reason.
+A pull request the captain closes without merging, after commenting on it, wakes firstmate with the comment to act on; a GitLab merge request keeps watching only for its merge.
+Reading a comment author needs identity output that plain `glab`'s field format does not expose, so a GitLab equivalent waits for the same JSON-processor decision as `pr_head=` below.
+
 A GitLab task records no `pr_head=`.
 `gh` exposes the head commit as a selectable field, while plain `glab` exposes it only inside its JSON output, which would need a JSON processor firstmate does not require.
 Both consumers already treat it as optional: `bin/fm-teardown.sh` reads the head from the forge at teardown rather than from metadata and falls back to its provider-agnostic content check, and `bin/fm-review-diff.sh` resolves the head from the remote when none is recorded.

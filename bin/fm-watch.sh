@@ -31,7 +31,11 @@
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
 #                          resume. Unless afk is active.
-#   check: <script>: <out> authenticated check output, always actionable
+#   check: <script>: <out> authenticated check output, always actionable. A PR
+#                          poll's "declined <number> <comment-id>" is emitted
+#                          once per distinct captain comment: the durable
+#                          <id>.pr-decline-seen record suppresses the repeats
+#                          the stateless poll keeps producing.
 #   check: rejected unauthenticated state checks: <paths>
 #                          unsafe state checks were refused without execution
 #   check: rejected unauthenticated PR poll retirement receipts: <paths>
@@ -756,9 +760,33 @@ while :; do
           continue
         fi
       fi
+      # A declined pull request stays declined, so the poll reports the same
+      # newest captain comment on every cycle until he says something new. The
+      # durable seen record, not the poll, decides whether this is a fresh
+      # instruction. The record is written only after the wake is durably
+      # queued: an interruption in between costs one repeated relay, while the
+      # reverse order could drop the captain's instruction entirely.
+      decline_url=
+      decline_comment=
+      decline_number=
+      if [ "$is_pr_poll" -eq 1 ] && [ -n "$out" ] && fm_pr_decline_output_parse "$out"; then
+        decline_url=$FM_PR_POLL_SNAPSHOT_URL
+        decline_comment=$FM_PR_DECLINE_COMMENT
+        decline_number=$FM_PR_DECLINE_NUMBER
+        if fm_pr_decline_already_delivered "$STATE" "$id" "$decline_url" "$decline_comment"; then
+          out=
+          decline_url=
+          decline_comment=
+          decline_number=
+        fi
+      fi
       if [ -n "$out" ]; then
         reason="check: $c: $out"
         fm_wake_append check "$c" "$reason" || exit 1
+        if [ -n "$decline_comment" ] \
+          && ! fm_pr_decline_seen_record "$STATE" "$id" "$decline_url" "$decline_comment"; then
+          triage_log "declined PR #$decline_number comment for $id could not be recorded as delivered; it will relay again"
+        fi
         if [ "$is_pr_poll" -eq 1 ] && [ "$out" = merged ]; then
           if fm_pr_poll_retirement_publish "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" "$out"; then
             fm_pr_poll_retirement_recover_one "$STATE" "$id" "$SCRIPT_DIR/fm-pr-poll.sh" \

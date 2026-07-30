@@ -156,6 +156,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/pr-decline-feedback/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/project-management/SKILL.md",
       "audience": "agent-runtime"
     },
