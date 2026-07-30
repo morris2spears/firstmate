@@ -118,6 +118,7 @@ case "$provider" in
     # the window gh reports. The close binding above makes that failure silent
     # rather than wrong, which is again the safe direction; a paginated or
     # reversed query is the follow-up if a pull request ever gets that long.
+    # shellcheck disable=SC2016 # single quotes are deliberate: jq expands its own variables.
     comments=$(gh pr view "$url" --json closedAt,comments -q '(.closedAt|fromdateiso8601) as $c | .comments[] | select((.createdAt|fromdateiso8601) >= ($c - 21600)) | [.author.login, .id] | @tsv' 2>/dev/null) || exit 0
     [ -n "$comments" ] || exit 0
     latest=
