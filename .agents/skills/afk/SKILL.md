@@ -171,11 +171,12 @@ Classify each wake this way:
 - Unknown reason, or any uncertainty -> escalate fail-safe.
 
 Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 = immediate) and flushed as one batch.
-When Telegram mode is configured, that same batch first goes through the existing phone-inbox `tg` client as one concise notice with an explicit reminder that the notice grants no approval.
-An accepted send leaves only a non-secret internal delivery receipt in Firstmate chat, so firstmate reconciles the durable work records and does not repeat the alert to the captain there.
-A failed or unavailable send preserves the full in-session escalation as the safe fallback and explicitly says the captain was not contacted on Telegram.
-Accepted, failed, and unavailable outcomes persist under `state/tg-away-delivery/` by opaque delivery id without message text, chat id, token, or raw sender diagnostics.
-The daemon records an attempt before network I/O and never retries an uncertain attempt, preventing a crash between Telegram acceptance and local recording from duplicating the alert.
+When Telegram mode is configured, that same batch first goes through the existing phone-inbox `tg` client as a concise notice with an explicit reminder that the notice grants no approval.
+`bin/fm-away-ledger-lib.sh` is the single owner of the batch ledger (`state/.subsuper-escalations.since`: batch identity plus `reserved`, `confirmed`, and `accounted` counts); the phone only ever gets lines past `reserved`, so a batch that grows while the receipt is wedged sends one notice per new increment and never repeats a delivered line.
+An accepted and fully recorded send leaves only a non-secret internal delivery receipt in Firstmate chat, naming the batch's private away digests `state/tg-away-digest/<batch-id>-*.items`; read those to reconcile and act, and do not repeat the alert to the captain there.
+Every other outcome preserves the not-yet-recorded items in the in-session escalation as the safe fallback and labels the outcome honestly: `uncertain` means the send may or may not have reached the captain and will not be retried to the phone, `failed`/`unavailable` means he was not contacted there, an accepted send with an incomplete digest carries its items in session once, and an unreadable ledger means nothing was sent to the phone.
+Accepted, failed, and unavailable outcomes persist under `state/tg-away-delivery/` by opaque delivery id without message text, chat id, token, or raw sender diagnostics; the away digests are separate private 0600 working records that DO hold the distilled lines, are folded into the return catch-up evidence before retirement, and retire with the away session.
+The ledger reserves lines before network I/O and advances `confirmed` only from durable accepted evidence, so a restart resolves an interrupted send from that evidence instead of guessing: an unresolved attempt is retired as uncertain and never retried, and a reservation with no evidence is released so those lines can still reach the phone.
 Without Telegram mode configured, away mode keeps its existing in-session fallback behavior.
 The single-line internal format makes submission unambiguous across harnesses, and the operational prefix lets firstmate distinguish it from a real captain message.
 

@@ -19,6 +19,8 @@ install_runner() {  # <case-dir>
   cp "$ROOT/bin/fm-afk-return.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-away-ledger-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-x-lib.sh" "$dir/bin/"
   cat > "$dir/bin/fm-afk-launch.sh" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = stop ] || exit 2
@@ -209,7 +211,30 @@ test_check_retries_recorded_terminal_teardown() {
   pass "check retries recorded terminal teardown and keeps catch-up gated until success"
 }
 
+test_return_folds_accepted_away_digest_before_retiring_it() {
+  local dir out
+  dir="$TMP_ROOT/away-digest-fold"
+  install_runner "$dir"
+  : > "$dir/home/state/.afk"
+  mkdir -p "$dir/home/state/tg-away-digest"
+  chmod 0700 "$dir/home/state/tg-away-digest"
+  printf 'stale persisted 300s (possible wedge): fm-task-3\n' \
+    > "$dir/home/state/tg-away-digest/b1-0-abc.items"
+  chmod 0600 "$dir/home/state/tg-away-digest/b1-0-abc.items"
+
+  out=$(run_return "$dir" begin) \
+    || fail "an accepted away digest must not block the return catch-up: $out"
+  case "$out" in
+    *'catch-up away-telegram: stale persisted 300s (possible wedge): fm-task-3'*) ;;
+    *) fail "return catch-up did not fold the accepted away digest: $out" ;;
+  esac
+  [ ! -e "$dir/home/state/tg-away-digest" ] \
+    || fail "the away digest must retire once it has been folded into the catch-up"
+  pass "return catch-up folds every accepted away digest in before retiring it"
+}
+
 test_return_gate_orders_catchup_before_bearings
+test_return_folds_accepted_away_digest_before_retiring_it
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
 test_away_reentry_refuses_pending_return_gate

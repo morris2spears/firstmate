@@ -42,6 +42,11 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 
+# The away batch ledger owner: this script retires a previous session's ledger
+# and working records through it instead of deleting those files itself.
+# shellcheck source=bin/fm-away-ledger-lib.sh
+. "$FM_AFK_START_DIR/fm-away-ledger-lib.sh"
+
 fm_afk_start_usage() {
   sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -62,20 +67,12 @@ fm_afk_start_usage() {
 fm_afk_clear_stale_artifacts() {  # <state-dir>
   local state=$1
   rm -f "$state/.subsuper-escalations" \
-        "$state/.subsuper-escalations.since" \
         "$state/.subsuper-inject-wedged" 2>/dev/null
-  fm_afk_clear_tg_away_working_records "$state"
-}
-
-# The private away digest and the outbound spool are working records of ONE away
-# session's Telegram deliveries, so they retire with the buffer they describe. The
-# text-free <id>.status delivery evidence is deliberately left in place.
-fm_afk_clear_tg_away_working_records() {  # <state-dir>
-  local state=$1
-  rm -rf "$state/tg-away-digest" 2>/dev/null
-  rm -f "$state"/tg-away-delivery/.spool.* \
-        "$state"/.subsuper-escalations.since.* 2>/dev/null
-  return 0
+  # The ledger owner retires its own record and this away session's working
+  # records (private digests, outbound spool, ledger temps); the text-free
+  # <id>.status delivery evidence is deliberately left in place.
+  away_ledger_retire "$state/.subsuper-escalations"
+  away_ledger_retire_working_records "$state"
 }
 
 daemon_lock_owner() {

@@ -27,6 +27,10 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 GATE="$STATE/.afk-return-catchup"
+# The away batch ledger owner: the return path folds and retires the away records
+# through it rather than deleting them itself.
+# shellcheck source=bin/fm-away-ledger-lib.sh
+. "$SCRIPT_DIR/fm-away-ledger-lib.sh"
 LOCK="$STATE/.afk-return-catchup.lock"
 
 usage() {
@@ -123,14 +127,13 @@ print_blockers() {  # <file>
 clear_delivery_artifacts() {
   rm -f \
     "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-escalations.since" \
     "$STATE/.subsuper-inject-wedged"
-  # The away-mode Telegram working records describe the buffer being retired
-  # here: the private items digest, the outbound spool, and any sidecar temp.
-  # The text-free <id>.status delivery evidence is deliberately kept.
-  rm -rf "$STATE/tg-away-digest" 2>/dev/null || true
-  rm -f "$STATE"/tg-away-delivery/.spool.* \
-        "$STATE"/.subsuper-escalations.since.* 2>/dev/null || true
+  # Retire the batch ledger and this away session's working records through their
+  # owner. Only ever called after the catch-up evidence above has folded the
+  # digests in, so an accepted one-shot escalation is never dropped here. The
+  # text-free <id>.status delivery evidence is deliberately kept.
+  away_ledger_retire "$STATE/.subsuper-escalations"
+  away_ledger_retire_working_records "$STATE"
 }
 
 return_guard() {
@@ -147,7 +150,7 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations lifecycle_ok=1
+  local evidence blockers drained wedge escalations away_items lifecycle_ok=1
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -173,6 +176,13 @@ return_reconcile() {
   if [ -s "$STATE/.subsuper-escalations" ]; then
     escalations=$(cat "$STATE/.subsuper-escalations" 2>/dev/null || true)
     append_evidence escalation "$escalations" "$evidence"
+  fi
+  # An accepted away batch has already been receipted and its buffer truncated, so
+  # the ledger owner's private digests are the only local copy of those events.
+  # Fold them in BEFORE anything retires them.
+  away_items=$(away_ledger_fold_digests "$STATE" 2>/dev/null || true)
+  if [ -n "$away_items" ]; then
+    append_evidence away-telegram "$away_items" "$evidence"
   fi
 
   scan_open_blockers > "$blockers"

@@ -607,7 +607,7 @@ test_away_delivery_acceptance_does_not_duplicate_alert_in_chat() {
 }
 
 test_away_batch_never_resends_accepted_events() {
-  local home state tg injected sends digest_id digest
+  local home state tg injected sends pointer digests digest delivery_id
   home=$(make_home away-grown-batch)
   state="$home/state"
   tg=$(make_fake_tg "$home")
@@ -628,6 +628,7 @@ test_away_batch_never_resends_accepted_events() {
   # A second event appends while the receipt is still wedged. The phone must
   # receive ONLY the new event, never a repeat of the accepted one.
   printf 'needs-decision: approve privileged cutover\n' >> "$state/.subsuper-escalations"
+  cp "$state/.subsuper-escalations" "$home/expected-items.txt"
   (
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
@@ -643,23 +644,25 @@ test_away_batch_never_resends_accepted_events() {
     "an accepted away alert must not be duplicated into captain chat"
   [ ! -s "$state/.subsuper-escalations" ] || fail "the confirmed receipt must clear the away buffer"
 
-  # The receipt must name a private digest that actually exists and holds exactly
-  # the accepted items, so a one-shot escalation stays actionable after the
-  # buffer is truncated.
-  digest_id=$(sed -n 's/^Telegram accepted away-mode alert \([^ ]*\) .*/\1/p' "$injected")
-  [ -n "$digest_id" ] || fail "the accepted receipt must name its delivery id"
-  digest="$state/tg-away-digest/$digest_id.items"
-  [ -f "$digest" ] && [ ! -L "$digest" ] \
-    || fail "the accepted receipt must name a digest file that exists ($digest)"
-  case "$(ls -l "$digest")" in
-    -rw-------*) ;;
-    *) fail "the away digest must be private (0600)" ;;
-  esac
-  [ "$(cat "$digest")" = 'needs-decision: approve privileged cutover' ] \
-    || fail "the digest must hold exactly the items of its own delivery"
-  grep -Rq 'fm-task-3' "$state/tg-away-digest" \
-    || fail "the earlier accepted event must remain recoverable from a digest"
-  assert_no_grep 'privileged cutover' "$state/tg-away-delivery/$digest_id.status" \
+  # The receipt must point at digests that actually exist and, together, hold
+  # EVERY accepted item of the grown batch - not just the last delivery's - so a
+  # one-shot escalation stays actionable after the buffer is truncated.
+  pointer=$(sed -n 's|.*private away digests state/tg-away-digest/\([^ ;]*\)\.items.*|\1|p' "$injected")
+  [ -n "$pointer" ] || fail "the accepted receipt must point at the batch digests"
+  digests=$(eval ls "$state/tg-away-digest/$pointer.items" 2>/dev/null || true)
+  [ -n "$digests" ] || fail "the receipt's digest pointer must match real files ($pointer)"
+  for digest in $digests; do
+    [ -f "$digest" ] && [ ! -L "$digest" ] || fail "a pointed-at digest must be a regular file"
+    case "$(ls -l "$digest")" in
+      -rw-------*) ;;
+      *) fail "the away digest must be private (0600)" ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  [ "$(cat $digests | sort)" = "$(sort "$home/expected-items.txt")" ] \
+    || fail "the pointed-at digests must hold exactly the accepted items of the batch"
+  delivery_id=$(sed -n 's/^Telegram accepted away-mode alert \([^ ,]*\).*/\1/p' "$injected")
+  assert_no_grep 'privileged cutover' "$state/tg-away-delivery/$delivery_id.status" \
     "delivery evidence must stay text-free"
 
   # A later failure must not repeat the events Telegram already delivered.
@@ -703,9 +706,92 @@ test_away_unusable_bookkeeping_never_sends_to_the_phone() {
     "unreadable away bookkeeping must never risk a duplicate phone alert"
   assert_grep 'blocked: needs a decision' "$injected" \
     "the visible in-session fallback must carry every buffered event"
-  assert_grep 'bookkeeping is unreadable' "$injected" \
+  assert_grep 'ledger is unreadable' "$injected" \
     "the fallback must say why the phone was not contacted"
   pass "unusable away bookkeeping fails closed to the visible in-session fallback"
+}
+
+# The ledger reserves lines BEFORE the network call, so a reservation alone never
+# proves the captain was contacted. A restart must resolve it from the durable
+# delivery evidence: an unresolved attempt stays honestly uncertain and is never
+# re-sent, while a reservation with no evidence at all is released so those lines
+# can still reach the phone.
+test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
+  local home state tg injected did
+  home=$(make_home away-reserved-recovery)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+
+  # (a) reserved with an unresolved `attempting` record: uncertain, never re-sent.
+  printf 'blocked: mid-send crash\n' > "$state/.subsuper-escalations"
+  did='1700000030-abcdef0123456789-0-0123456789abcdef'
+  mkdir -p "$state/tg-away-delivery"
+  chmod 0700 "$state/tg-away-delivery"
+  printf 'attempting 1700000030\n' > "$state/tg-away-delivery/$did.status"
+  chmod 0600 "$state/tg-away-delivery/$did.status"
+  printf '1700000030-abcdef0123456789 1 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "an uncertain reservation must still complete the in-session flush"
+  assert_absent "$home/tg-sent.log" \
+    "a reserved-but-unconfirmed line must never be re-sent to the phone"
+  assert_grep 'Telegram delivery uncertain' "$injected" \
+    "an unconfirmed reservation must never be reported as accepted"
+  assert_grep 'blocked: mid-send crash' "$injected" \
+    "the uncertain event must still reach the visible in-session fallback"
+
+  # (b) reserved with no evidence at all: the claim is released and the line is
+  # offered to the phone.
+  printf 'blocked: crashed before the send\n' > "$state/.subsuper-escalations"
+  printf '1700000040-fedcba9876543210 1 0 0 none\n' > "$state/.subsuper-escalations.since"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "a released reservation must complete the away flush"
+  assert_grep 'crashed before the send' "$home/tg-sent.log" \
+    "a reservation with no delivery evidence must be released back to the phone"
+  assert_grep 'Telegram accepted away-mode alert' "$injected" \
+    "the re-offered event must report its real accepted outcome"
+  pass "reserved away lines resolve from durable evidence, never from the claim alone"
+}
+
+# Turning Telegram mode off mid-batch must not replay into captain chat what the
+# captain already received on his phone.
+test_away_off_mid_batch_never_repeats_delivered_events() {
+  local home state tg injected
+  home=$(make_home away-off-mid-batch)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: already on the phone'
+  (
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+  assert_grep 'already on the phone' "$home/tg-sent.log" "the first event must reach the phone"
+
+  # Telegram mode is switched off, then a second event appends.
+  rm "$home/config/telegram-mode"
+  escalate_add "$state" 'blocked: after the opt-out'
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "an opted-out away flush must still deliver in session"
+  assert_grep 'after the opt-out' "$injected" \
+    "the undelivered event must reach captain chat once Telegram mode is off"
+  assert_no_grep 'already on the phone' "$injected" \
+    "an event the captain already received on his phone must not be replayed in chat"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "an opted-out flush must not contact the phone again"
+  pass "an opt-out mid-batch never repeats phone-delivered events in captain chat"
 }
 
 test_away_lifecycle_retires_tg_working_records() {
@@ -786,6 +872,8 @@ test_away_delivery_failure_classes_and_safe_chat_fallback
 test_away_delivery_acceptance_does_not_duplicate_alert_in_chat
 test_away_batch_never_resends_accepted_events
 test_away_unusable_bookkeeping_never_sends_to_the_phone
+test_away_reserved_lines_resolve_from_evidence_not_from_the_claim
+test_away_off_mid_batch_never_repeats_delivered_events
 test_away_lifecycle_retires_tg_working_records
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence

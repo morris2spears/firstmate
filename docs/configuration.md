@@ -398,12 +398,15 @@ Follow-ups are deliberately not gated on the opt-in flag: removing the flag stop
 Every live send notifies the captain's phone, so nothing in this mode sends as a test.
 
 While `state/.afk` is present, the away daemon also routes each captain-relevant escalation batch through the same phone-inbox `tg` client before its in-session delivery.
-It sends exactly one concise Telegram notice per batch and includes an explicit reminder that delivery grants no approval for a merge, privileged change, destructive action, or security-sensitive action.
-An accepted send causes the daemon to inject only a non-secret receipt into Firstmate, preventing the same alert contents from being repeated in captain chat while preserving Firstmate's obligation to reconcile and act on the durable work records.
-A failed or unavailable send keeps the complete in-session escalation as the existing fallback and labels the Telegram outcome accurately.
+Each notice carries an explicit reminder that delivery grants no approval for a merge, privileged change, destructive action, or security-sensitive action.
+`bin/fm-away-ledger-lib.sh` owns one ledger per batch in `state/.subsuper-escalations.since` - the batch identity plus its `reserved`, `confirmed`, and `accounted` line counts - and the away daemon, away start, and away return all query and transition that one owner instead of keeping counters of their own.
+A notice covers only the lines past `reserved`, so a batch that grows while its in-session receipt is wedged sends one notice per NEW increment and never repeats a line the captain already has.
+An accepted and fully recorded send causes the daemon to inject only a non-secret receipt into Firstmate, pointing at the batch's private away digests instead of repeating the alert contents in captain chat, while preserving Firstmate's obligation to reconcile and act on the durable work records.
+Every other outcome carries the not-yet-recorded items into the in-session escalation as the existing fallback and labels the Telegram outcome honestly: `uncertain` (the send may or may not have arrived, so it is never retried to the phone), `failed` or `unavailable` (the captain was not contacted there), an accepted send whose digest is incomplete (the items follow once in session), or an unreadable ledger (nothing was sent to the phone at all).
 Delivery evidence lives in the private `state/tg-away-delivery/<opaque-id>.status` records as `attempting`, `accepted`, `failed`, or `unavailable` plus an epoch and a non-secret reason class.
-The records never contain alert text, raw sender output, a token, or a chat id.
-An `attempting` record is written before network I/O; if a daemon restart finds an unresolved attempt, it marks that attempt failed/uncertain and never retries it, avoiding duplicate phone alerts when Telegram may already have accepted the send.
+Those evidence records never contain alert text, raw sender output, a token, or a chat id.
+The separate private `state/tg-away-digest/<opaque-id>.items` working records DO hold the distilled escalation lines - the same text the in-session escalation would have carried - so an accepted one-shot escalation such as a stale wedge stays actionable after the buffer is truncated; they carry no token, chat id, or sender output, are 0600, are folded into the return catch-up evidence before they are retired, and retire with the away session.
+The ledger reserves lines before network I/O and only durable `accepted` evidence advances `confirmed`, so a restart resolves an interrupted send from the evidence rather than guessing: an unresolved `attempting` record is retired as uncertain and never retried, while a reservation with no evidence at all is released so those lines can still reach the phone.
 A successful `tg` exit means the Telegram API returned an accepted response end to end; it does not prove the captain read the notice.
 This away-only use does not change inbound notes, linked-task follow-ups, opt-out behavior, watcher ownership, return catch-up, or buffering outside away mode.
 

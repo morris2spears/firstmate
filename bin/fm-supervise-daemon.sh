@@ -166,6 +166,12 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-x-lib.sh
 . "$FM_DAEMON_DIR/fm-x-lib.sh"
 
+# The single owner of the away batch ledger (identity, phone reservation,
+# confirmed acceptance, digest retention, retirement). The daemon, away start, and
+# away return all transition this one owner instead of keeping local counters.
+# shellcheck source=bin/fm-away-ledger-lib.sh
+. "$FM_DAEMON_DIR/fm-away-ledger-lib.sh"
+
 # Telegram mode's existing authenticated outbound transport owner.
 # The daemon uses only its stdin sender helper and never reads credentials.
 # shellcheck source=bin/fm-tg-lib.sh
@@ -443,8 +449,8 @@ classify_unknown() {  # <reason>
 # Seen:     state/.subsuper-seen-status-<task>  last status line the scan
 #           escalated, so the catch-all does not re-fire the same terminal.
 # Away:     state/tg-away-delivery/<id>.status     text-free delivery evidence.
-#           state/.subsuper-escalations.since      batch identity plus the phone
-#           and chat counts that keep each event to one phone alert.
+#           state/.subsuper-escalations.since      the batch ledger (identity plus
+#           reserved/confirmed/accounted counts) owned by fm-away-ledger-lib.sh.
 #           state/tg-away-digest/<id>.items        private 0600 copy of the
 #           accepted items, the working record the receipt points Firstmate at.
 
@@ -634,131 +640,59 @@ stale_window_is_busy() {  # <window> <state>
     | fm_busy_lines_match "$harness"
 }
 
-# --- away-mode batch bookkeeping ---------------------------------------------
-# state/.subsuper-escalations.since is the ONE sidecar for the live batch and
-# holds a single line:
-#   <arrival-epoch>-<nonce> <phone-count> <chat-count> <last-delivery-id>
-# The arrival epoch keeps the batch-age semantics _oldest_line_age needs; the
-# nonce makes the identity minted-once, so no later batch can ever inherit this
-# batch's bookkeeping. <phone-count> is how many leading buffer lines must NEVER
-# reach the phone again - it is claimed BEFORE the network call, so a crash
-# mid-send can never produce a duplicate captain alert - and <chat-count> is how
-# many the captain has provably been told about through Telegram, so anything
-# whose delivery stayed uncertain still surfaces through the in-session fallback.
-# All of it lives in the sidecar precisely because every away lifecycle path
-# already retires, backs up, and restores the sidecar together with its buffer.
-# An unparseable sidecar is reported as `unknown`, which fails CLOSED: no phone
-# send at all, everything into the visible in-session escalation.
+# --- away-mode escalation batch (ledger-governed) ----------------------------
+# bin/fm-away-ledger-lib.sh is the single owner of the batch ledger: the per-line
+# phone reservation, the evidence-proven confirmed count, the accounted
+# (digest-recorded) count, the private digest, and the retirement of both. Nothing
+# below keeps its own counters - every decision here is a query or a transition on
+# that owner, and an `unknown` ledger fails CLOSED: nothing reaches the phone and
+# the whole buffer goes to the visible in-session escalation.
 escalate_add() {  # <state> <distilled-item>
   local state=$1 item=$2 buf
   buf="$state/.subsuper-escalations"
   if [ ! -s "$buf" ]; then
-    escalate_batch_state_set "$buf" "$(escalate_mint_batch_id)" 0 0 none \
-      || rm -f "${buf}.since"
+    away_ledger_open "$buf" || away_ledger_retire "$buf"
   fi
   printf '%s\n' "$item" >> "$buf"
-}
-
-escalate_mint_batch_id() {
-  local now
-  now=$(_now)
-  printf '%s-%s\n' "$now" "$(_hash_text_short "$$-${RANDOM:-0}-${RANDOM:-0}-$now")"
-}
-
-escalate_batch_state_set() {  # <buf> <batch-id> <phone> <chat> <delivery-id>
-  local buf=$1 id=$2 phone=$3 chat=$4 did=$5 sidecar tmp
-  sidecar="${buf}.since"
-  tmp=$(umask 077; mktemp "${sidecar}.XXXXXX" 2>/dev/null) || return 1
-  if ! printf '%s %s %s %s\n' "$id" "$phone" "$chat" "$did" > "$tmp" 2>/dev/null \
-    || ! mv -f "$tmp" "$sidecar" 2>/dev/null; then
-    rm -f -- "$tmp"
-    return 1
-  fi
-}
-
-# Print "<batch-id> <phone-count> <chat-count> <last-delivery-id>" for the live
-# batch, or the single word `unknown` when the sidecar is absent or unusable.
-# A bare epoch (the pre-bookkeeping form) is upgraded in place to a minted
-# identity with zero counts, which is exactly "nothing delivered yet".
-escalate_batch_state() {  # <buf>
-  local buf=$1 raw id phone chat did epoch nonce f5
-  raw=$(head -n 1 "${buf}.since" 2>/dev/null || true)
-  IFS=' ' read -r id phone chat did f5 <<< "$raw"
-  if [ -z "${id:-}" ] || [ -n "${f5:-}" ]; then printf 'unknown\n'; return 0; fi
-  if [ -z "${phone:-}" ] && [ -z "${chat:-}" ] && [ -z "${did:-}" ]; then
-    phone=0; chat=0; did=none
-  elif [ -z "${phone:-}" ] || [ -z "${chat:-}" ] || [ -z "${did:-}" ]; then
-    printf 'unknown\n'; return 0
-  fi
-  epoch=${id%%-*}
-  nonce=${id#*-}
-  case "$epoch" in ''|*[!0-9]*) printf 'unknown\n'; return 0 ;; esac
-  case "$phone$chat" in ''|*[!0-9]*) printf 'unknown\n'; return 0 ;; esac
-  case "$did" in ''|*[!0-9a-zA-Z-]*) printf 'unknown\n'; return 0 ;; esac
-  if [ -z "$nonce" ] || [ "$nonce" = "$id" ]; then
-    id="$epoch-$(_hash_text_short "$$-${RANDOM:-0}-$epoch")"
-    escalate_batch_state_set "$buf" "$id" "$phone" "$chat" "$did" \
-      || { printf 'unknown\n'; return 0; }
-  fi
-  printf '%s %s %s %s\n' "$id" "$phone" "$chat" "$did"
-}
-
-# Keep the distilled items of an ACCEPTED away batch where the away supervisor
-# can still act on them. Several escalation classes are one-shot: a stale wedge
-# clears its marker and marks the status seen the moment it escalates, so once the
-# buffer is truncated nothing local records which window was wedged. The delivery
-# evidence deliberately stays text-free, so this private 0600 digest - the same
-# distilled lines that were already sitting in state/.subsuper-escalations, no
-# credentials, chat ids, or sender output - is the durable working record the
-# receipt points Firstmate at, instead of repeating the alert in captain chat.
-telegram_away_digest_write() {  # <state> <delivery-id> <accepted-offset>
-  local state=$1 delivery_id=$2 offset=$3 buf
-  buf="$state/.subsuper-escalations"
-  [ -s "$buf" ] || return 0
-  tail -n "+$((offset + 1))" "$buf" 2>/dev/null \
-    | fmx_private_artifact_publish_stdin "$state/tg-away-digest" "$delivery_id.items" 600 \
-      2>/dev/null || return 1
 }
 
 # Send one batched away alert through Telegram mode's existing phone-inbox tg
 # client. The durable record stores only a delivery id, result class, and epoch.
 # It never stores alert text, credentials, chat ids, or raw sender diagnostics.
 #
-# <offset> is how many leading lines of the batch Telegram already accepted, so
-# the delivery id names an exact (batch, first-undelivered-line) pair and a batch
-# that grew while the in-session receipt was wedged sends only its NEW lines.
+# <offset> is the ledger's reserved count, so the delivery id names an exact
+# (batch, first-unreserved-line) pair and a batch that grew while the in-session
+# receipt was wedged sends only its NEW lines.
 #
-# Exactly-once ordering, all of it before the network call: the batch's
-# phone-count is claimed for every line about to be sent, then an attempting
-# evidence record is written. Either write failing aborts the send outright, so an
-# unrecordable delivery can never become a duplicate phone alert. After the send
-# the digest and the chat-count are committed together; if either fails the caller
-# is told `accepted_unrecorded` and puts the items in the in-session message
-# instead of pointing Firstmate at a record that was not written. A send that
-# provably never left the box (no spool, no watchdog, no client) releases the
-# phone-count again; a send that may have reached Telegram keeps it claimed.
+# Ordering, all of it before the network call: the ledger reserves every line
+# about to be sent, then an attempting evidence record is written. Either write
+# failing aborts the send outright, so an unrecordable delivery can never become a
+# duplicate phone alert. Only an accepted evidence record transitions the ledger's
+# confirmed count, and the digest is recorded from the accounted position. A send
+# that provably never left the box (no spool, no watchdog, no client, a rejecting
+# client) releases the reservation; a timed-out send keeps it and reports
+# `uncertain`, because Telegram may already hold the message.
 #
 # The send itself runs under the same bounded watchdog every other external
 # notifier in this file uses (FM_WEDGE_ALARM_TIMEOUT_SECS), so a hung phone client
-# can never stall housekeeping or the ~1s shutdown path; a timed-out or unbounded
-# send classifies as failed and falls back to the in-session escalation.
+# can never stall housekeeping or the ~1s shutdown path.
 telegram_away_send_file() {  # <spool-file>
   fmtg_send_stdin < "$1"
 }
 
-telegram_away_deliver() {  # <state> <batch-body> [offset] [total] [chat-count] [batch-id]
-  local state=$1 body=$2 offset=${3:-0} total=${4:-0} chat=${5:-0} batch_id=${6:-}
-  local buf bstate delivery_id dir base record status now rc alert spool track=0
+telegram_away_deliver() {  # <state> <batch-body> [offset] [total] [accounted] [batch-id]
+  local state=$1 body=$2 offset=${3:-0} total=${4:-0} accounted=${5:-0} batch_id=${6:-}
+  local buf rec delivery_id dir base record status now rc alert spool track=0
   if [ "${FM_TG_AWAY_EXEC:-live}" = discard ] || ! afk_active "$state" || ! fmtg_enabled "$FM_HOME"; then
     printf 'off|none\n'
     return 0
   fi
   buf="$state/.subsuper-escalations"
   if [ -z "$batch_id" ]; then
-    bstate=$(escalate_batch_state "$buf")
-    case "$bstate" in
+    rec=$(away_ledger_read "$buf")
+    case "$rec" in
       unknown) batch_id=$(_hash_text_short "$state") ;;
-      *) batch_id=${bstate%% *} ;;
+      *) batch_id=${rec%% *} ;;
     esac
   fi
   [ "$total" -gt "$offset" ] && track=1
@@ -770,11 +704,7 @@ telegram_away_deliver() {  # <state> <batch-body> [offset] [total] [chat-count] 
     status=${record%% *}
     case "$status" in
       accepted)
-        if telegram_away_commit_accepted "$state" "$batch_id" "$delivery_id" "$offset" "$total" "$track"; then
-          printf 'accepted|%s\n' "$delivery_id"
-        else
-          printf 'accepted_unrecorded|%s\n' "$delivery_id"
-        fi
+        telegram_away_settle_accepted "$state" "$buf" "$delivery_id" "$total" "$accounted" "$track"
         return 0
         ;;
       failed|unavailable)
@@ -785,7 +715,7 @@ telegram_away_deliver() {  # <state> <batch-body> [offset] [total] [chat-count] 
         now=$(_now)
         printf 'failed %s uncertain_previous_attempt\n' "$now" \
           | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-        printf 'failed|%s\n' "$delivery_id"
+        printf 'uncertain|%s\n' "$delivery_id"
         return 0
         ;;
     esac
@@ -794,10 +724,9 @@ telegram_away_deliver() {  # <state> <batch-body> [offset] [total] [chat-count] 
     return 0
   fi
 
-  if [ "$track" -eq 1 ] \
-    && ! escalate_batch_state_set "$buf" "$batch_id" "$total" "$chat" "$delivery_id"; then
+  if [ "$track" -eq 1 ] && ! away_ledger_reserve "$buf" "$total" "$delivery_id"; then
     now=$(_now)
-    printf 'unavailable %s bookkeeping_unwritable\n' "$now" \
+    printf 'unavailable %s ledger_unwritable\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
     printf 'unavailable|%s\n' "$delivery_id"
     return 0
@@ -806,22 +735,19 @@ telegram_away_deliver() {  # <state> <batch-body> [offset] [total] [chat-count] 
   now=$(_now)
   if ! printf 'attempting %s\n' "$now" \
     | fmx_private_artifact_publish_stdin_once "$dir" "$base" 600 2>/dev/null; then
-    telegram_away_release_phone_claim "$state" "$batch_id" "$offset" "$chat" "$delivery_id" "$track"
+    [ "$track" -eq 1 ] && away_ledger_release "$buf" "$offset" "$delivery_id"
     printf 'unavailable|%s\n' "$delivery_id"
     return 0
   fi
 
   alert=$(printf 'Firstmate needs you: %s Notice only. This message does not approve a merge, privileged change, destructive action, or security-sensitive action.' "$body")
   # The watchdog backgrounds its command, and a backgrounded command's stdin is
-  # /dev/null, so the text travels via a spool file the sender redirects from
-  # itself - never through a command argument. The spool lives inside the private
-  # 0700 delivery directory, so a crash mid-send cannot leave alert text outside
-  # the firstmate home where no away-mode cleanup path would ever find it.
-  if ! fmx_private_artifact_dir_prepare "$dir" >/dev/null 2>&1 \
-    || ! spool=$(umask 077; mktemp "$dir/.spool.XXXXXX" 2>/dev/null) \
+  # /dev/null, so the text travels via the ledger owner's private spool file,
+  # which the sender redirects from itself - never through a command argument.
+  if ! spool=$(away_ledger_spool_create "$state") \
     || ! printf '%s' "$alert" > "$spool" 2>/dev/null; then
     rm -f -- "${spool:-}" 2>/dev/null || true
-    telegram_away_release_phone_claim "$state" "$batch_id" "$offset" "$chat" "$delivery_id" "$track"
+    [ "$track" -eq 1 ] && away_ledger_release "$buf" "$offset" "$delivery_id"
     now=$(_now)
     printf 'failed %s sender_spool_unavailable\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
@@ -839,126 +765,184 @@ telegram_away_deliver() {  # <state> <batch-body> [offset] [total] [chat-count] 
   if [ "$rc" -eq 0 ]; then
     printf 'accepted %s\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    if telegram_away_commit_accepted "$state" "$batch_id" "$delivery_id" "$offset" "$total" "$track"; then
-      printf 'accepted|%s\n' "$delivery_id"
-    else
-      printf 'accepted_unrecorded|%s\n' "$delivery_id"
-    fi
+    telegram_away_settle_accepted "$state" "$buf" "$delivery_id" "$total" "$accounted" "$track"
   elif [ "$rc" -eq 124 ]; then
     printf 'failed %s sender_timeout\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    printf 'failed|%s\n' "$delivery_id"
+    printf 'uncertain|%s\n' "$delivery_id"
   elif [ "$rc" -eq 125 ]; then
-    telegram_away_release_phone_claim "$state" "$batch_id" "$offset" "$chat" "$delivery_id" "$track"
+    [ "$track" -eq 1 ] && away_ledger_release "$buf" "$offset" "$delivery_id"
     printf 'failed %s sender_watchdog_unavailable\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
     printf 'failed|%s\n' "$delivery_id"
   elif [ "$rc" -eq 127 ]; then
-    telegram_away_release_phone_claim "$state" "$batch_id" "$offset" "$chat" "$delivery_id" "$track"
+    [ "$track" -eq 1 ] && away_ledger_release "$buf" "$offset" "$delivery_id"
     printf 'unavailable %s sender_missing\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
     printf 'unavailable|%s\n' "$delivery_id"
   else
+    [ "$track" -eq 1 ] && away_ledger_release "$buf" "$offset" "$delivery_id"
     printf 'failed %s sender_rejected\n' "$now" \
       | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
     printf 'failed|%s\n' "$delivery_id"
   fi
+  return 0
 }
 
-# Commit the two records an accepted delivery promises: the private items digest
-# the receipt points at, and the chat-count that stops the fallback repeating what
-# the captain already has. Non-zero means the caller must carry the items in the
-# in-session message instead.
-telegram_away_commit_accepted() {  # <state> <batch-id> <delivery-id> <offset> <total> <track>
-  local state=$1 batch_id=$2 delivery_id=$3 offset=$4 total=$5 track=$6
-  telegram_away_digest_write "$state" "$delivery_id" "$offset" || return 1
-  [ "$track" -eq 1 ] || return 0
-  escalate_batch_state_set "$state/.subsuper-escalations" "$batch_id" "$total" "$total" "$delivery_id"
+# Turn an accepted evidence record into ledger state: confirm the delivered lines,
+# then record the digest from the accounted position. `accepted` means Firstmate
+# can reconcile from the digests alone; `accepted_undigested` means the caller must
+# carry the still-unrecorded items in the in-session message instead.
+telegram_away_settle_accepted() {  # <state> <buf> <delivery-id> <total> <accounted> <track>
+  local state=$1 buf=$2 delivery_id=$3 total=$4 accounted=$5 track=$6
+  if [ "$track" -eq 1 ] && ! away_ledger_confirm "$buf" "$total" "$delivery_id"; then
+    printf 'accepted_undigested|%s\n' "$delivery_id"
+    return 0
+  fi
+  if away_ledger_digest_record "$state" "$buf" "$delivery_id" "$accounted"; then
+    printf 'accepted|%s\n' "$delivery_id"
+  else
+    printf 'accepted_undigested|%s\n' "$delivery_id"
+  fi
+  return 0
 }
 
-# Release the pre-send phone claim after a send that provably never left the box,
-# so those lines stay eligible for the phone. Best effort: a failure here only
-# keeps the claim, which is the safe direction.
-telegram_away_release_phone_claim() {  # <state> <batch-id> <offset> <chat> <delivery-id> <track>
-  local state=$1 batch_id=$2 offset=$3 chat=$4 delivery_id=$5 track=$6
-  [ "$track" -eq 1 ] || return 0
-  escalate_batch_state_set "$state/.subsuper-escalations" "$batch_id" "$offset" "$chat" "$delivery_id" \
-    || return 0
+# Reconcile a reservation that outran the confirmed count against the durable
+# delivery evidence, so a restart never has to GUESS whether the phone got it:
+#   no evidence at all -> the crash preceded the send, release the reservation and
+#                         let the lines be offered to the phone again
+#   attempting          -> outcome unknowable, retire the attempt and stay uncertain
+#   accepted            -> confirm the reservation
+#   failed/unavailable  -> a kept reservation here means a maybe-delivered send
+#                         (timeout), so stay uncertain rather than claim either way
+telegram_away_recover() {  # <state> <buf> <reserved> <confirmed> <delivery-id>
+  local state=$1 buf=$2 reserved=$3 confirmed=$4 did=$5 dir base record status now
+  [ "$reserved" -gt "$confirmed" ] || { printf 'settled\n'; return 0; }
+  dir="$state/tg-away-delivery"
+  base="$did.status"
+  if [ "$did" = none ]; then
+    away_ledger_release "$buf" "$confirmed" "$did" || true
+    printf 'released\n'
+    return 0
+  fi
+  if ! fmx_private_artifact_file_valid "$dir" "$base" 600; then
+    if [ -e "$dir/$base" ] || [ -L "$dir/$base" ]; then printf 'uncertain\n'; return 0; fi
+    away_ledger_release "$buf" "$confirmed" "$did" || true
+    printf 'released\n'
+    return 0
+  fi
+  record=$(cat "$dir/$base" 2>/dev/null || true)
+  status=${record%% *}
+  case "$status" in
+    accepted)
+      away_ledger_confirm "$buf" "$reserved" "$did" || { printf 'uncertain\n'; return 0; }
+      printf 'confirmed\n'
+      ;;
+    attempting)
+      now=$(_now)
+      printf 'failed %s uncertain_previous_attempt\n' "$now" \
+        | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+      printf 'uncertain\n'
+      ;;
+    *)
+      printf 'uncertain\n'
+      ;;
+  esac
+  return 0
 }
 
-# Flush the escalation buffer as one batched digest. Telegram receives the
-# concise captain notice first. On a fully recorded accepted delivery, Firstmate
-# receives only a private receipt and reconciles the durable work records,
-# avoiding a duplicate captain-facing chat notice. Failed, unavailable, unknown,
-# or unrecorded delivery preserves the existing in-session escalation as the safe
-# fallback and says Telegram did not receive it. The buffer clears only after the
+# Flush the escalation buffer as one batched digest, driven entirely by the ledger:
+#   lines past `reserved`  -> the only lines the phone may ever be offered
+#   lines past `accounted` -> the only lines captain chat still needs to see
+# A fully accepted and recorded delivery injects just a private receipt naming the
+# batch's digests, so the alert contents are never repeated in captain chat. Every
+# other outcome - uncertain, failed, unavailable, unknown ledger, or Telegram mode
+# off - carries the not-yet-recorded items into the visible in-session escalation
+# and labels the Telegram outcome honestly. The buffer clears only after the
 # in-session submit is confirmed.
-#
-# A batch keeps growing while the in-session receipt is wedged, so the flush works
-# from the batch's two counts (see the bookkeeping block above): the phone gets
-# only lines past <phone-count>, so an accepted item is never sent to the phone
-# twice, and chat gets only lines past <chat-count>, so the fallback never repeats
-# what the captain already has and never silently swallows a line whose delivery
-# stayed uncertain. An unusable sidecar sends nothing to the phone and escalates
-# the whole buffer in session.
 escalate_flush() {  # <state>
-  local state=$1 buf n body msg tg_result tg_status tg_id
-  local bstate batch_id phone chat chat_after chat_body chat_pending phone_body prior_note
+  local state=$1 buf n body msg rec recovery tg_result tg_status tg_id
+  local batch_id reserved confirmed accounted did pending_body chat_body chat_pending
+  local prior_note pointer
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
   n=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
   body=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  bstate=$(escalate_batch_state "$buf")
-  batch_id=none; phone=0; chat=0; tg_status=''; tg_id=none
-  if [ "$bstate" = unknown ]; then
-    tg_status=unknown
-  else
-    IFS=' ' read -r batch_id phone chat tg_id <<< "$bstate"
-    # A batch only ever grows, so a count past its line total means the
-    # bookkeeping does not describe this buffer. Fail closed.
-    if [ "$phone" -gt "$n" ] || [ "$chat" -gt "$phone" ]; then
-      tg_status=unknown
+  batch_id=none; reserved=0; confirmed=0; accounted=0; did=none
+  tg_status=''; tg_id=none
+  rec=$(away_ledger_read "$buf")
+  if [ "$rec" != unknown ]; then
+    IFS=' ' read -r batch_id reserved confirmed accounted did <<< "$rec"
+    # A batch only ever grows, so a reservation past its line total means the
+    # ledger does not describe this buffer.
+    [ "$reserved" -le "$n" ] || rec=unknown
+  fi
+  if [ "$rec" != unknown ]; then
+    recovery=$(telegram_away_recover "$state" "$buf" "$reserved" "$confirmed" "$did")
+    if [ "$recovery" != settled ]; then
+      rec=$(away_ledger_read "$buf")
+      [ "$rec" = unknown ] \
+        || IFS=' ' read -r batch_id reserved confirmed accounted did <<< "$rec"
     fi
   fi
-  if [ "$tg_status" = unknown ]; then
-    phone=0; chat=0; tg_id=none
-  elif [ "$n" -le "$phone" ]; then
-    tg_status=accepted_unrecorded
-    [ "$chat" -lt "$n" ] || tg_status=accepted
-  else
-    phone_body=$(tail -n "+$((phone + 1))" "$buf" 2>/dev/null \
+  if [ "$rec" = unknown ]; then
+    tg_status=unknown; batch_id=none; reserved=0; confirmed=0; accounted=0; did=none
+  elif [ "$n" -gt "$reserved" ]; then
+    pending_body=$(tail -n "+$((reserved + 1))" "$buf" 2>/dev/null \
       | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
-    tg_result=$(telegram_away_deliver "$state" "$phone_body" "$phone" "$n" "$chat" "$batch_id")
+    tg_result=$(telegram_away_deliver "$state" "$pending_body" "$reserved" "$n" "$accounted" "$batch_id")
     tg_status=${tg_result%%|*}
     tg_id=${tg_result#*|}
+    rec=$(away_ledger_read "$buf")
+    [ "$rec" = unknown ] \
+      || IFS=' ' read -r batch_id reserved confirmed accounted did <<< "$rec"
+  elif [ "$confirmed" -ge "$n" ]; then
+    tg_id=$did
+    tg_status=accepted
+    [ "$accounted" -ge "$n" ] || tg_status=accepted_undigested
+  else
+    tg_id=$did
+    tg_status=uncertain
   fi
-  chat_after=$chat
-  [ "$tg_status" = accepted ] && chat_after=$n
-  chat_pending=$(( n - chat_after ))
+  chat_pending=$(( n - accounted ))
   [ "$chat_pending" -gt 0 ] || chat_pending=0
-  chat_body=$(tail -n "+$((chat_after + 1))" "$buf" 2>/dev/null \
+  chat_body=$(tail -n "+$((accounted + 1))" "$buf" 2>/dev/null \
     | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
+  pointer=$(away_ledger_digest_pointer "$batch_id")
   prior_note=''
-  [ "$chat_after" -gt 0 ] && [ "$tg_status" != accepted ] \
-    && prior_note=$(printf ' Telegram already delivered %s earlier event(s) of this batch (see the private away digests under state/tg-away-digest); do not repeat those in captain chat.' "$chat_after")
+  if [ "$accounted" -gt 0 ] && [ "$tg_status" != accepted ]; then
+    prior_note=$(printf ' Telegram already delivered and recorded %s earlier event(s) of this batch in %s; do not repeat those in captain chat.' "$accounted" "$pointer")
+  fi
   case "$tg_status" in
     accepted)
-      msg=$(printf 'Telegram accepted away-mode alert %s (%s event(s)). Reconcile the durable fleet records now using the private away digest state/tg-away-digest/%s.items; do not repeat this alert in captain chat. (pre-read; re-arm not needed - watcher daemon-managed)' "$tg_id" "$n" "$tg_id")
+      msg=$(printf 'Telegram accepted away-mode alert %s (%s event(s)). Reconcile the durable fleet records now using the private away digests %s; do not repeat this alert in captain chat. (pre-read; re-arm not needed - watcher daemon-managed)' "$tg_id" "$n" "$pointer")
       ;;
-    accepted_unrecorded)
-      msg=$(printf 'Telegram accepted away-mode alert %s but its private away digest is unavailable, so the %s undelivered-to-chat event(s) follow here once: %s. Do not resend these to Telegram; the captain already has them.%s (pre-read; re-arm not needed - watcher daemon-managed)' "$tg_id" "$chat_pending" "$chat_body" "$prior_note")
+    accepted_undigested)
+      msg=$(printf 'Telegram accepted away-mode alert %s, but %s event(s) of it are not recorded in a private away digest, so they follow here once: %s. Do not resend these to Telegram; the captain already has them.%s (pre-read; re-arm not needed - watcher daemon-managed)' "$tg_id" "$chat_pending" "$chat_body" "$prior_note")
+      ;;
+    uncertain)
+      msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery uncertain; the captain may or may not have received these and they will NOT be re-sent to the phone.%s Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "$prior_note")
       ;;
     failed|unavailable)
       msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery %s; the captain was not contacted there.%s Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "$tg_status" "$prior_note")
       ;;
     unknown)
-      msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery unavailable; the away batch bookkeeping is unreadable so nothing was sent to the phone. Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
+      msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery unavailable; the away batch ledger is unreadable so nothing was sent to the phone. Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
       ;;
     *)
-      msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
+      if [ "$accounted" -gt 0 ]; then
+        msg=$(printf 'Supervisor escalate (%s event(s)): %s (%s Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "${prior_note# }")
+      else
+        msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
+      fi
       ;;
   esac
-  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
+  if inject_msg "$msg" "$state"; then
+    : > "$buf"
+    away_ledger_retire "$buf"
+    rm -f "$state/.subsuper-inject-wedged"
+    return 0
+  fi
   return 1
 }
 
@@ -1239,18 +1223,12 @@ inject_wedge_alarm() {  # <state> <age-seconds>
   fi
 }
 
-_oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first arrived (sidecar epoch)
-  local f=$1 since raw epoch
+_oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first arrived (ledger epoch)
+  local f=$1 since epoch
   [ -s "$f" ] || { echo 999999; return; }
   since="${f}.since"
-  if [ -r "$since" ]; then
-    raw=$(head -n 1 "$since" 2>/dev/null || true)
-    epoch=${raw%% *}
-    epoch=${epoch%%-*}
-    case "$epoch" in
-      ''|*[!0-9]*) echo 999999 ;;
-      *) echo $(( $(_now) - epoch )) ;;
-    esac
+  if [ -r "$since" ] && epoch=$(away_ledger_epoch "$f"); then
+    echo $(( $(_now) - epoch ))
   else
     echo 999999
   fi
