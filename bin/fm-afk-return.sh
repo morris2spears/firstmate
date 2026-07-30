@@ -147,7 +147,7 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations away_items lifecycle_ok=1
+  local evidence blockers drained wedge escalations away_items retained lifecycle_ok=1 reclaim_rc=0
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -166,6 +166,21 @@ return_reconcile() {
   }
   append_evidence wake "$drained" "$evidence"
 
+  # Reclaim any complete buffer/sidecar/wedge group (and any digest text,
+  # unconditionally) stranded in a leftover launch-rollback backup BEFORE the
+  # live-unit evidence below is gathered, so an adopted group (only possible
+  # when the live unit was clear) is captured by those reads in this same pass
+  # instead of being adopted and then destroyed by clear_delivery_artifacts
+  # with no evidence ever recorded. rc 2 means only a live conflict deferred a
+  # backup's group - the normal wait state, not a fault - so only rc 1 (a real
+  # copy/prepare/removal failure) is worth surfacing.
+  away_ledger_reclaim_backups "$STATE" "$STATE/.subsuper-escalations" \
+    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || reclaim_rc=$?
+  if [ "$reclaim_rc" -eq 1 ]; then
+    append_evidence lifecycle 'a leftover away-mode rollback backup could not be fully reclaimed; retry catch-up before ordinary work' "$evidence"
+    lifecycle_ok=0
+  fi
+
   if [ -s "$STATE/.subsuper-inject-wedged" ]; then
     wedge=$(head -1 "$STATE/.subsuper-inject-wedged" 2>/dev/null || true)
     append_evidence wedge "$wedge" "$evidence"
@@ -174,11 +189,16 @@ return_reconcile() {
     escalations=$(cat "$STATE/.subsuper-escalations" 2>/dev/null || true)
     append_evidence escalation "$escalations" "$evidence"
   fi
-  # Reclaim any digest text stranded in a leftover launch-rollback backup (an
-  # interrupted away_ledger_restore keeps its backup rather than risk a partial
-  # mix) so it folds in below instead of aging out in an orphaned copy.
-  away_ledger_reclaim_backups "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || true
+  # Whatever away_ledger_reclaim_backups could not adopt above (a live buffer/
+  # sidecar/wedge conflicted with a backup's group) is folded here from each
+  # backup's own preserved sidecar count, then removed - so a backup blocked
+  # from adoption by a live conflict is never silently discarded and never
+  # left to resurface as a duplicate once the live conflict eventually clears.
+  retained=$(away_ledger_fold_retained_backups "$STATE" "$STATE/.subsuper-escalations" \
+    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || true)
+  if [ -n "$retained" ]; then
+    append_evidence away-retained "$retained" "$evidence"
+  fi
   # An accepted away batch has already been receipted and its buffer truncated, so
   # the ledger owner's private digests are the only local copy of those events.
   # Fold them in BEFORE anything retires them.

@@ -427,21 +427,30 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 #
 # The backup is removed only once every artifact it holds has been reconciled
 # onto the live unit (digest merge) or adopted as a whole (buffer/sidecar/
-# wedge) or was already redundant with what is live; any failure anywhere -
-# including "the live unit already conflicts" - leaves the complete backup in
-# place rather than discarding a copy that was never actually merged. Called
-# before a new transaction begins (an already-running daemon's refresh) or
-# after a launch transaction fully resolves (success or rollback), and at
-# return, so no copy of actionable escalation text can outlive recovery, and
-# never while a transaction is open, so a rollback can never erase what
-# reclaim merged in.
+# wedge) or was already redundant with what is live; a real copy/prepare/
+# removal failure anywhere leaves the complete backup in place rather than
+# discarding a copy that was never actually merged. Called before a new
+# transaction begins (an already-running daemon's refresh) or after a launch
+# transaction fully resolves (success or rollback), and at return, so no copy
+# of actionable escalation text can outlive recovery, and never while a
+# transaction is open, so a rollback can never erase what reclaim merged in.
+#
+# Return status distinguishes an ordinary wait state from a real fault:
+#   0  every backup was fully reconciled (or none matched the glob)
+#   2  deferred only - a live buffer/sidecar/wedge conflicts with at least one
+#      backup's group, so that backup was correctly left untouched; this is
+#      the normal state during an active away session and is not a failure
+#   1  a real copy, directory-prepare, or removal failure occurred; callers
+#      should surface this one, unlike the merely-deferred status above
 away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
   local state=$1 buf=$2 wedge=$3 pattern=$4
-  local backup digest_dir artifact base f ok group_clear_to_adopt result=0
+  local backup digest_dir artifact base f ok real_fail group_clear_to_adopt group_ok
+  local result=0 deferred=0
   digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
     ok=1
+    real_fail=0
     if [ -d "$backup/tg-away-digest" ]; then
       if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
         for f in "$backup/tg-away-digest"/*.items; do
@@ -450,11 +459,11 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
           if [ -e "$digest_dir/$base" ]; then
             :
           elif ! cp -p "$f" "$digest_dir/$base"; then
-            ok=0
+            ok=0; real_fail=1
           fi
         done
       else
-        ok=0
+        ok=0; real_fail=1
       fi
     fi
     if [ -e "$backup/${buf##*/}" ] || [ -e "$backup/${buf##*/}.since" ] \
@@ -462,20 +471,78 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
       group_clear_to_adopt=0
       [ -e "$buf" ] || [ -e "${buf}.since" ] || [ -e "$wedge" ] || group_clear_to_adopt=1
       if [ "$group_clear_to_adopt" -eq 1 ]; then
+        group_ok=1
         for artifact in "$buf" "${buf}.since" "$wedge"; do
           base=${artifact##*/}
           [ -e "$backup/$base" ] || continue
-          cp -p "$backup/$base" "$artifact" || ok=0
+          cp -p "$backup/$base" "$artifact" || { group_ok=0; ok=0; real_fail=1; }
         done
+        # Consume the group from the backup as soon as it is fully adopted,
+        # independent of any unrelated digest-merge outcome above, so a
+        # digest failure alone can never leave an already-adopted group
+        # sitting in the backup to be folded a second time by
+        # away_ledger_fold_retained_backups.
+        if [ "$group_ok" -eq 1 ]; then
+          rm -f "$backup/${buf##*/}" "$backup/${buf##*/}.since" "$backup/${wedge##*/}" \
+            || { ok=0; real_fail=1; }
+        fi
       else
         ok=0
+        deferred=1
       fi
     fi
     if [ "$ok" -eq 1 ]; then
-      rm -rf "$backup" || result=1
-    else
+      rm -rf "$backup" || { result=1; real_fail=1; }
+    elif [ "$real_fail" -eq 1 ]; then
       result=1
     fi
+  done
+  [ "$result" -eq 0 ] || return 1
+  [ "$deferred" -eq 0 ] || return 2
+  return 0
+}
+
+# Fold the actionable content of every backup that away_ledger_reclaim_backups
+# left behind (deferred: its buffer/sidecar/wedge group conflicted with a live
+# one) directly into the caller's evidence, then remove it - so a backup
+# blocked from adoption by a live conflict is never silently discarded, and
+# never left to resurface as a duplicate delivery once the live conflict
+# eventually clears. Digest text needs no separate handling here: it is always
+# merged by away_ledger_reclaim_backups regardless of any buffer conflict, so
+# by the time this runs a remaining backup's digest text is already reconciled
+# and only its raw buffer/wedge content can still be stranded.
+#
+# Reads each backup's own escalation count through its own preserved sidecar
+# (away_ledger_read against the backup's own buffer path), so only the lines
+# past that backup's own accounted count - never anything already digested -
+# are printed, one whitespace-joined line per backup, tagged so the caller can
+# label it distinctly from the live buffer's own evidence.
+away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
+  local state=$1 buf=$2 wedge=$3 pattern=$4
+  local backup bbuf accounted rec n body wedge_body result=0
+  for backup in $pattern; do
+    [ -d "$backup" ] || continue
+    bbuf="$backup/${buf##*/}"
+    accounted=0
+    if [ -f "$bbuf" ] && [ -f "${bbuf}.since" ]; then
+      rec=$(away_ledger_read "$bbuf")
+      if [ "$rec" != unknown ]; then
+        IFS=' ' read -r _ _ _ accounted _ _ _ <<< "$rec"
+      fi
+    fi
+    if [ -f "$bbuf" ]; then
+      n=$(( $(wc -l < "$bbuf" 2>/dev/null || echo 0) ))
+      if [ "$n" -gt "$accounted" ]; then
+        body=$(tail -n "+$((accounted + 1))" "$bbuf" 2>/dev/null \
+          | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
+        printf '%s\n' "$body"
+      fi
+    fi
+    if [ -s "$backup/${wedge##*/}" ]; then
+      wedge_body=$(head -1 "$backup/${wedge##*/}" 2>/dev/null)
+      printf 'wedge: %s\n' "$wedge_body"
+    fi
+    rm -rf "$backup" || result=1
   done
   return "$result"
 }

@@ -1036,6 +1036,141 @@ test_away_reclaim_backups_keeps_backup_on_partial_merge_failure() {
   pass "reclaim keeps the complete backup when only part of it could be merged"
 }
 
+# The return status must distinguish an ordinary wait state (a live buffer
+# conflicts with a backup's group - expected during an active away session)
+# from a real fault, so a caller can log the latter without alarming on the
+# former on every routine launch/refresh during a live session.
+test_away_reclaim_backups_returns_deferred_not_failure_on_live_conflict() {
+  local home state backup rc
+  home=$(make_home away-reclaim-rc-deferred)
+  state="$home/state"
+  printf 'live buffer\n' > "$state/.subsuper-escalations"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'stale backup buffer\n' > "$backup/.subsuper-escalations"
+
+  rc=0
+  away_ledger_reclaim_backups "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*" || rc=$?
+  [ "$rc" -eq 2 ] \
+    || fail "a live-conflict-only outcome must return the deferred status 2 (got: $rc)"
+  pass "reclaim returns the deferred status, not a failure, on a mere live conflict"
+}
+
+test_away_reclaim_backups_returns_zero_when_nothing_to_reclaim() {
+  local home state rc
+  home=$(make_home away-reclaim-rc-clean)
+  state="$home/state"
+  rc=0
+  away_ledger_reclaim_backups "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*" || rc=$?
+  [ "$rc" -eq 0 ] \
+    || fail "reclaim must return 0 when no backup matches the glob (got: $rc)"
+  pass "reclaim returns 0 when there is nothing to reclaim"
+}
+
+test_away_reclaim_backups_returns_failure_on_real_copy_error() {
+  local home state backup rc
+  home=$(make_home away-reclaim-rc-failure)
+  state="$home/state"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  mkdir -p "$backup/tg-away-digest"
+  printf 'blocked: item\n' > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+
+  rc=0
+  (
+    cp() { return 1; }
+    away_ledger_reclaim_backups "$state" "$state/.subsuper-escalations" \
+      "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*"
+  ) || rc=$?
+  [ "$rc" -eq 1 ] \
+    || fail "a real copy failure must return status 1, distinct from the deferred status (got: $rc)"
+  pass "reclaim returns the failure status, not deferred, on a real copy error"
+}
+
+# away_ledger_fold_retained_backups must surface exactly the lines a retained
+# backup's own sidecar says are still undigested - never anything already
+# accounted for, which would duplicate content already delivered to Telegram -
+# and must remove the backup once folded, so it cannot resurface again.
+test_away_fold_retained_backups_folds_only_undigested_lines() {
+  local home state backup buf out
+  home=$(make_home away-fold-retained)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'live buffer\n' > "$buf"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'already digested\nstill undigested\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 2 2 1 0 0 none\n' > "$backup/.subsuper-escalations.since"
+
+  out=$(away_ledger_fold_retained_backups "$state" "$buf" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*") \
+    || fail "fold_retained_backups must succeed"
+
+  assert_grep 'still undigested' <(printf '%s\n' "$out") \
+    "the undigested line must be folded into the returned evidence"
+  assert_no_grep 'already digested' <(printf '%s\n' "$out") \
+    "an already-digested line must never be folded again"
+  assert_absent "$backup" "the backup must be removed once its content is folded"
+  pass "fold_retained_backups folds only the lines past the backup's own accounted count"
+}
+
+test_away_fold_retained_backups_folds_wedge_evidence() {
+  local home state backup out
+  home=$(make_home away-fold-retained-wedge)
+  state="$home/state"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'stranded wedge alarm\n' > "$backup/.subsuper-inject-wedged"
+
+  out=$(away_ledger_fold_retained_backups "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*") \
+    || fail "fold_retained_backups must succeed"
+
+  assert_grep 'stranded wedge alarm' <(printf '%s\n' "$out") \
+    "a retained backup's wedge marker must be folded into the returned evidence"
+  assert_absent "$backup" "the backup must be removed once its wedge is folded"
+  pass "fold_retained_backups folds a retained backup's wedge marker"
+}
+
+# A digest-merge failure inside a backup must never leave an already-adopted
+# buffer/sidecar/wedge group sitting in that backup for a later
+# away_ledger_fold_retained_backups pass to fold a second time - the group is
+# consumed from the backup the moment it is adopted, independent of whatever
+# happens to that backup's unrelated digest items.
+test_away_reclaim_backups_group_adoption_survives_a_sibling_digest_failure() {
+  local home state backup buf out
+  home=$(make_home away-reclaim-group-vs-digest-failure)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: adopted line\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+  mkdir -p "$backup/tg-away-digest"
+  printf 'blocked: undeliverable digest\n' > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+
+  (
+    cp() {
+      case "$2" in
+        *tg-away-digest*) return 1 ;;
+        *) command cp "$@" ;;
+      esac
+    }
+    away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
+      "$state/.afk-launch-backup.*"
+  ) && fail "reclaim must report failure when the digest merge fails"
+
+  [ "$(cat "$buf" 2>/dev/null)" = 'blocked: adopted line' ] \
+    || fail "the group must still be adopted despite the sibling digest failure"
+  [ -d "$backup" ] \
+    || fail "the backup must survive so its unmerged digest can be retried"
+  [ ! -e "$backup/.subsuper-escalations" ] \
+    || fail "an adopted group must be consumed from the backup immediately"
+
+  out=$(away_ledger_fold_retained_backups "$state" "$buf" \
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*")
+  assert_no_grep 'adopted line' <(printf '%s\n' "$out") \
+    "a group already adopted must never be folded again by fold_retained_backups"
+  pass "an adopted group is consumed immediately and never re-folded after a sibling digest failure"
+}
+
 # A live delivery id's digest file must never be clobbered by a reclaim: if the
 # same delivery id somehow exists in both the live directory and an orphaned
 # backup, the live copy - already possibly folded or read - wins.
@@ -1452,6 +1587,12 @@ test_away_reclaim_backups_fills_missing_buffer_and_sidecar
 test_away_reclaim_backups_never_mixes_a_live_buffer_with_a_foreign_group
 test_away_reclaim_backups_never_pairs_orphan_sidecar_with_sidecarless_live_buffer
 test_away_reclaim_backups_keeps_backup_on_partial_merge_failure
+test_away_reclaim_backups_returns_deferred_not_failure_on_live_conflict
+test_away_reclaim_backups_returns_zero_when_nothing_to_reclaim
+test_away_reclaim_backups_returns_failure_on_real_copy_error
+test_away_fold_retained_backups_folds_only_undigested_lines
+test_away_fold_retained_backups_folds_wedge_evidence
+test_away_reclaim_backups_group_adoption_survives_a_sibling_digest_failure
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_client_exit_125_is_never_proven_local
 test_away_delivery_refuses_untracked_sends

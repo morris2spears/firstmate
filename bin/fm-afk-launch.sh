@@ -89,6 +89,16 @@ set +e
 
 fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 
+# A deferred status (rc 2: a live buffer/sidecar/wedge conflicts with a
+# retained backup's group) is the normal state during an active away session
+# and is not logged; only a real copy/prepare/removal failure (rc 1) is.
+fm_afk_launch_reclaim_backups() {
+  local rc=0
+  away_ledger_reclaim_backups "$@" || rc=$?
+  [ "$rc" -ne 1 ] || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
+  return 0
+}
+
 fm_afk_launch_lock_owned() {
   local pid expected actual
   [ -d "$FM_AFK_LAUNCH_LOCK" ] || return 1
@@ -470,9 +480,8 @@ fm_afk_launch_start() {
 
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
-    away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" \
-      || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
+    fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*"
     if ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to refresh away-mode flag"
       return 1
@@ -522,9 +531,8 @@ fm_afk_launch_start() {
   else
     rm -rf "$backup" || result=1
   fi
-  away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" \
-    || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
+  fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*"
   return "$result"
 }
 
@@ -537,9 +545,8 @@ fm_afk_launch_start_native() {
   fi
   if daemon_lock_held_by_live_daemon; then
     fm_afk_launch_record_validate_if_present || return 1
-    away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" \
-      || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
+    fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+      "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*"
     fm_afk_launch_flag_write || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0
@@ -571,9 +578,8 @@ fm_afk_launch_start_native() {
   else
     rm -rf "$backup" || result=1
   fi
-  away_ledger_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*" \
-    || fm_afk_launch_log "could not fully reclaim a leftover rollback backup"
+  fm_afk_launch_reclaim_backups "$FM_AFK_LAUNCH_STATE" "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
+    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.*"
   return "$result"
 }
 
