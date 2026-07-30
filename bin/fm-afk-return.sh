@@ -179,7 +179,7 @@ return_reconcile() {
   # transient fault, fully resolves it, so the lifecycle blocker is decided
   # once after that pass has had its turn rather than on this result alone.
   away_ledger_reclaim_backups "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || true
+    "$STATE/.subsuper-inject-wedged" 2>/dev/null || true
 
   if [ -s "$STATE/.subsuper-inject-wedged" ]; then
     wedge=$(head -1 "$STATE/.subsuper-inject-wedged" 2>/dev/null || true)
@@ -197,7 +197,7 @@ return_reconcile() {
   # never leaves already-folded evidence behind to duplicate on the next
   # catch-up.
   retained=$(away_ledger_fold_retained_backups "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null) || fold_retained_rc=$?
+    "$STATE/.subsuper-inject-wedged" 2>/dev/null) || fold_retained_rc=$?
   if [ -n "$retained" ]; then
     append_evidence away-retained "$retained" "$evidence"
   fi

@@ -399,10 +399,13 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
   return "$result"
 }
 
-# Reclaim every leftover rollback-backup directory matching <backup-glob>: a
-# backup only survives past its own transaction when away_ledger_restore
-# reported a failure and the caller (fm-afk-launch.sh) deliberately kept it
-# rather than risk a partial restore. Two kinds of artifact inside it are
+# Reclaim every leftover rollback-backup directory under <state> (this owner's
+# own glob, built from the quoted state directory so a space or glob byte in
+# it can never word-split before the trailing `*` globs - callers pass only
+# the directory, never a prejoined pattern): a backup only survives past its
+# own transaction when away_ledger_restore reported a failure and the caller
+# (fm-afk-launch.sh) deliberately kept it rather than risk a partial restore.
+# Two kinds of artifact inside it are
 # treated differently:
 #
 #   digest text        merged into the live digest directory by delivery id,
@@ -463,13 +466,13 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 #      an active away session and is not a failure
 #   1  a real copy, directory-prepare, or removal failure occurred; callers
 #      should surface this one, unlike the merely-deferred status above
-away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-only]
-  local state=$1 buf=$2 wedge=$3 pattern=$4 digests_only=${5:-0}
+away_ledger_reclaim_backups() {  # <state> <buf> <wedge> [digests-only]
+  local state=$1 buf=$2 wedge=$3 digests_only=${4:-0}
   local backup digest_dir artifact base f ok real_fail group_clear_to_adopt group_ok
   local dir tmp result=0 deferred=0
   local -a committed
   digest_dir=$(away_ledger_digest_dir "$state")
-  for backup in $pattern; do
+  for backup in "$state"/.afk-launch-backup.*; do
     [ -d "$backup" ] || continue
     case "$backup" in
       *.consumed)
@@ -477,6 +480,10 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-
         continue
         ;;
     esac
+    if [ -e "$backup/.fold-published" ]; then
+      rm -rf "$backup" || result=1
+      continue
+    fi
     ok=1
     real_fail=0
     if [ -d "$backup/tg-away-digest" ]; then
@@ -573,12 +580,17 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-
 # `.consumed` marker is still the removal's own commit point, so `rm -rf`
 # unlinking in unspecified order can never both destroy content and suppress
 # already-published evidence: a later call recognizes the marker by name and
-# retries only the removal, never re-reading or re-printing its content.
-away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
-  local state=$1 buf=$2 wedge=$3 pattern=$4
+# retries only the removal, never re-reading or re-printing its content. If
+# even the rename fails, a `.fold-published` sentinel is written inside the
+# backup before falling back to removing it in place, so away_ledger_reclaim_
+# backups (which checks for that sentinel too) can never adopt a backup whose
+# content already reached the catch-up evidence under a different, non-
+# deduplicated kind.
+away_ledger_fold_retained_backups() {  # <state> <buf> <wedge>
+  local state=$1 buf=$2 wedge=$3
   local backup bbuf accounted rec n body wedge_body digest_dir f base ok consumed result=0
   digest_dir=$(away_ledger_digest_dir "$state")
-  for backup in $pattern; do
+  for backup in "$state"/.afk-launch-backup.*; do
     [ -d "$backup" ] || continue
     case "$backup" in
       *.consumed)
@@ -586,6 +598,10 @@ away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
         continue
         ;;
     esac
+    if [ -e "$backup/.fold-published" ]; then
+      rm -rf "$backup" || result=1
+      continue
+    fi
     ok=1
     if [ -d "$backup/tg-away-digest" ]; then
       if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
@@ -632,7 +648,8 @@ away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
     if mv "$backup" "$consumed" 2>/dev/null; then
       rm -rf "$consumed" || result=1
     else
-      result=1
+      : > "$backup/.fold-published" 2>/dev/null
+      rm -rf "$backup" || result=1
     fi
   done
   return "$result"
