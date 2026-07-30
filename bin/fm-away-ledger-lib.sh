@@ -295,7 +295,7 @@ away_ledger_fold_digests() {  # <state>
 # Private 0700-directory spool for one outbound alert, so the text never lands
 # outside the firstmate home even if the daemon is killed mid-send.
 away_ledger_spool_create() {  # <state>
-  local dir
+  local state=$1 dir
   dir=$(away_ledger_delivery_dir "$state")
   fmx_private_artifact_dir_prepare "$dir" >/dev/null 2>&1 || return 1
   (umask 077; mktemp "$dir/.spool.XXXXXX" 2>/dev/null) || return 1
@@ -310,9 +310,15 @@ away_ledger_retire() {  # <buf>
 # Retire the away session's working records: the private digests, any leaked
 # spool, and any ledger temp. The text-free <id>.status delivery evidence is
 # deliberately kept, so accepted/failed/unavailable outcomes stay auditable.
-away_ledger_retire_working_records() {  # <state>
-  local state=$1
-  rm -rf "$(away_ledger_digest_dir "$state")" 2>/dev/null
+#
+# <preserve-digests>, when 1, keeps the digest directory intact. Callers pass 1
+# when this call is reached on a continuation of an already-active away session
+# (state/.afk was already present) rather than a genuinely fresh entry, so a
+# crashed-daemon restart or a failed re-entry can never destroy digested items
+# that Firstmate has not consumed or folded yet.
+away_ledger_retire_working_records() {  # <state> [preserve-digests]
+  local state=$1 preserve=${2:-0}
+  [ "$preserve" -eq 1 ] || rm -rf "$(away_ledger_digest_dir "$state")" 2>/dev/null
   rm -f "$(away_ledger_delivery_dir "$state")"/.spool.* \
         "$state"/.subsuper-escalations.since.* 2>/dev/null
   return 0

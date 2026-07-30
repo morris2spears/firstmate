@@ -497,7 +497,7 @@ fm_afk_launch_start() {
   if ! fm_afk_launch_reconcile; then
     result=1
   else
-    if fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
+    if fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" "$had_afk"; then
       result=0
     else
       fm_afk_launch_log "failed to clear stale away-mode artifacts"
@@ -554,7 +554,7 @@ fm_afk_launch_start_native() {
   done
   fm_afk_launch_reconcile || result=1
   if [ "$result" -eq 0 ]; then
-    if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
+    if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" "$had_afk"; then
       fm_afk_launch_log "failed to clear stale away-mode artifacts"
       result=1
     elif ! fm_afk_launch_flag_write; then

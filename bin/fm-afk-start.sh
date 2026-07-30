@@ -64,15 +64,22 @@ fm_afk_start_usage() {
 # lifecycle" and bin/fm-supervise-daemon.sh's escalate_add/inject_wedge_alarm).
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
-fm_afk_clear_stale_artifacts() {  # <state-dir>
-  local state=$1
+#
+# <had-afk>, when 1, means state/.afk was already present before this call -
+# a crashed-daemon restart or a failed re-entry mid-away-session, not a
+# genuinely fresh entry - so the digest directory is preserved rather than
+# retired: those items may be accepted-and-receipted but not yet consumed or
+# folded by Firstmate, and this path never re-derives them the way the
+# escalation buffer itself is re-derived by the daemon's heartbeat scan.
+fm_afk_clear_stale_artifacts() {  # <state-dir> [had-afk]
+  local state=$1 had_afk=${2:-0}
   rm -f "$state/.subsuper-escalations" \
         "$state/.subsuper-inject-wedged" 2>/dev/null
   # The ledger owner retires its own record and this away session's working
   # records (private digests, outbound spool, ledger temps); the text-free
   # <id>.status delivery evidence is deliberately left in place.
   away_ledger_retire "$state/.subsuper-escalations"
-  away_ledger_retire_working_records "$state"
+  away_ledger_retire_working_records "$state" "$had_afk"
 }
 
 daemon_lock_owner() {
@@ -127,6 +134,8 @@ fm_afk_start_main() {
   esac
 
   mkdir -p "$FM_AFK_STATE"
+  local had_afk=0
+  [ -f "$FM_AFK_STATE/.afk" ] && had_afk=1
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
     [ -f "$FM_AFK_STATE/.afk" ] || { echo "afk: launcher-prepared state is missing" >&2; return 1; }
   else
@@ -147,7 +156,7 @@ fm_afk_start_main() {
   # Fresh start: clear the previous away session's stale delivery artifacts
   # before the new daemon can surface them (fix for the leaked-artifact defect).
   if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
-    fm_afk_clear_stale_artifacts "$FM_AFK_STATE"
+    fm_afk_clear_stale_artifacts "$FM_AFK_STATE" "$had_afk"
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"

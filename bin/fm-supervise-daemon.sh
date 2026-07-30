@@ -739,7 +739,7 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
   fi
   delivery_id=$(away_ledger_delivery_id "$batch_id" "$led_attempt" "$offset" "$body") \
     || { printf 'unavailable|none\n'; return 0; }
-  dir="$state/tg-away-delivery"
+  dir=$(away_ledger_delivery_dir "$state")
   base="$delivery_id.status"
   if fmx_private_artifact_file_valid "$dir" "$base" 600; then
     record=$(cat "$dir/$base" 2>/dev/null || true)
@@ -784,6 +784,14 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
     return 0
   fi
 
+  if ! fmtg_client_runnable; then
+    away_ledger_release "$buf" "$offset" "$delivery_id" "$(telegram_away_retry_secs)"
+    printf 'unavailable %s sender_missing\n' "$now" \
+      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+    printf 'unavailable|%s\n' "$delivery_id"
+    return 0
+  fi
+
   alert=$(printf 'Firstmate needs you: %s Notice only. This message does not approve a merge, privileged change, destructive action, or security-sensitive action.' "$body")
   # The watchdog backgrounds its command, and a backgrounded command's stdin is
   # /dev/null, so the text travels via the ledger owner's private spool file,
@@ -817,12 +825,6 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
       printf 'failed %s sender_watchdog_unavailable\n' "$now" \
         | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
       printf 'failed|%s\n' "$delivery_id"
-      ;;
-    127)  # proven local: there is no runnable client to send with
-      away_ledger_release "$buf" "$offset" "$delivery_id" "$(telegram_away_retry_secs)"
-      printf 'unavailable %s sender_missing\n' "$now" \
-        | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-      printf 'unavailable|%s\n' "$delivery_id"
       ;;
     124)  # ambiguous: the request was in flight when the watchdog fired
       printf 'failed %s sender_timeout\n' "$now" \
@@ -871,7 +873,7 @@ telegram_away_settle_accepted() {  # <state> <buf> <delivery-id> <offset> <total
 telegram_away_recover() {  # <state> <buf> <reserved> <confirmed> <delivery-id>
   local state=$1 buf=$2 reserved=$3 confirmed=$4 did=$5 dir base record status now
   [ "$reserved" -gt "$confirmed" ] || { printf 'settled\n'; return 0; }
-  dir="$state/tg-away-delivery"
+  dir=$(away_ledger_delivery_dir "$state")
   base="$did.status"
   if [ "$did" = none ]; then
     away_ledger_release "$buf" "$confirmed" "$did" || true

@@ -62,6 +62,15 @@ fmtg_tg_bin() {
   printf '%s\n' "${FMTG_TG_BIN:-$HOME/dev/phone-inbox/tg}"
 }
 
+# Whether the client is runnable at all, checked as its own out-of-band signal
+# so a caller can treat "no client to run" as unforgeable and distinct from any
+# exit status the client itself might later return once it actually ran.
+fmtg_client_runnable() {
+  local tg_bin
+  tg_bin=$(fmtg_tg_bin)
+  [ -f "$tg_bin" ] && [ -x "$tg_bin" ]
+}
+
 fmtg_send_stdin() {
   local tg_bin
   tg_bin=$(fmtg_tg_bin)
