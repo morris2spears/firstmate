@@ -285,9 +285,9 @@ unit_next_entry_replays_a_pending_version_switch() {
   printf 'v.1700000000-pending\n' > "$st/state/tg-away-versions/active"
   if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_ENTRY="$SLEEPER" \
     bash -c '. "$1"; fm_afk_launch_start_native' _ "$LAUNCH" >/dev/null 2>&1; then
-    if [ "$(cat "$st/state/tg-away-versions/active.applied" 2>/dev/null)" = v.1700000000-pending ] \
-      && grep -rq 'stranded by an interrupted switch' "$st/state/tg-away-versions" 2>/dev/null \
-      && grep -rq 'stranded digest text' "$st/state/tg-away-versions" 2>/dev/null; then
+    if grep -rq 'stranded by an interrupted switch' "$st/state/tg-away-versions" 2>/dev/null \
+      && grep -rq 'stranded digest text' "$st/state/tg-away-versions" 2>/dev/null \
+      && [ ! -e "$st/state/tg-away-versions/active" ]; then
       pass "next entry: replays a pending version switch and keeps its content for catch-up"
     else
       fail "next entry: left the switch pending or lost the stranded version's content"

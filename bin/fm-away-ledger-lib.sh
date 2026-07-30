@@ -91,9 +91,22 @@ away_ledger_delivery_dir() {  # <state>
   printf '%s\n' "$1/tg-away-delivery"
 }
 
-away_ledger_mint_id() {
-  local now
+# A minted-once identity. The entropy comes from a mktemp token rather than
+# $RANDOM: this owner mints ids from inside command substitutions, and in bash 3.2
+# $RANDOM restarts from the parent's state in every one of those, so two mints in
+# the same second within one process produce the SAME value - which would give two
+# batches one identity and two versions one directory name. mktemp's uniqueness
+# does not depend on that sequence. <scope-dir>, when given, is where the token is
+# created (it is removed immediately); the old scheme remains the fallback.
+away_ledger_mint_id() {  # [scope-dir]
+  local now token dir
   now=$(away_ledger_now)
+  dir=${1:-${TMPDIR:-/tmp}}
+  if token=$(umask 077; mktemp "$dir/.mint.XXXXXX" 2>/dev/null); then
+    printf '%s-%s\n' "$now" "$(away_ledger_hash "$$-${token##*/}-${RANDOM:-0}-$now")"
+    rm -f -- "$token" 2>/dev/null
+    return 0
+  fi
   printf '%s-%s\n' "$now" "$(away_ledger_hash "$$-${RANDOM:-0}-${RANDOM:-0}-$now")"
 }
 
@@ -129,6 +142,24 @@ away_ledger_wedge_of() {  # <state>
   printf '%s\n' "$1/.subsuper-inject-wedged"
 }
 
+# The in-session (captain chat) delivery state of the current batch, part of the
+# owned unit like every other artifact: "<batch-id> <lines> attempting|confirmed".
+# It exists so a bookkeeping failure AFTER a confirmed submit can never become a
+# second delivery of the same batch into captain chat.
+away_ledger_chat_of() {  # <state>
+  printf '%s\n' "$1/.subsuper-chat-delivery"
+}
+
+# The unit's artifact slots, in one place, so a slot can never be copied by the
+# staging build and then forgotten by the projection (or the reverse).
+_away_ledger_unit_paths() {  # <state> <buf> <wedge>
+  printf '%s\n%s\n%s\n%s\n' "$2" "${2}.since" "$3" "$(away_ledger_chat_of "$1")"
+}
+
+_away_ledger_unit_slots() {
+  printf 'escalations\nescalations.since\nwedge\nchat\n'
+}
+
 # Every LIVE record change is a version transition: a complete successor version
 # carrying the new record is built, validated, and published, and only then does
 # the active pointer switch and the live projection get rewritten.
@@ -142,7 +173,7 @@ away_ledger_write() {  # <buf> <batch-id> <reserved> <confirmed> <accounted> <at
 
 # Start the ledger for a brand new batch: a fresh identity and nothing delivered.
 away_ledger_open() {  # <buf>
-  away_ledger_write "$1" "$(away_ledger_mint_id)" 0 0 0 0 0 none
+  away_ledger_write "$1" "$(away_ledger_mint_id "$(away_ledger_state_of "$1")")" 0 0 0 0 0 none
 }
 
 # Append one distilled escalation line to the batch. The daemon's own append is a
@@ -203,8 +234,41 @@ _away_ledger_mut_append() {  # <line> <staging>
 
 _away_ledger_mut_truncate() {  # <staging>
   : > "$1/escalations" 2>/dev/null || return 1
-  rm -f -- "$1/escalations.since" "$1/wedge" 2>/dev/null || return 1
+  rm -f -- "$1/escalations.since" "$1/wedge" "$1/chat" 2>/dev/null || return 1
   return 0
+}
+
+_away_ledger_mut_chat() {  # <batch-id> <lines> attempting|confirmed <staging>
+  printf '%s %s %s\n' "$1" "$2" "$3" > "$4/chat" 2>/dev/null
+}
+
+# Record where this batch stands with captain chat, as a version transition, so
+# the fact survives a crash exactly like every other part of the unit.
+away_ledger_chat_mark() {  # <state> <batch-id> <lines> attempting|confirmed
+  local state=$1 id=$2 lines=$3 phase=$4
+  away_ledger_is_count "$lines" || return 1
+  case "$phase" in
+    attempting|confirmed) ;;
+    *) return 1 ;;
+  esac
+  case "$id" in
+    ''|*[!0-9a-zA-Z-]*) return 1 ;;
+  esac
+  away_ledger_transact "$state" "$state/.subsuper-escalations" \
+    "$(away_ledger_wedge_of "$state")" _away_ledger_mut_chat "$id" "$lines" "$phase"
+}
+
+# Whether captain chat PROVABLY already received exactly this batch and line
+# count. Only a confirmed submit answers yes, so an interrupted attempt still
+# retries rather than silently dropping an escalation - and a confirmed one is
+# never re-injected even if the truncation that should have followed it failed.
+away_ledger_chat_confirmed() {  # <state> <batch-id> <lines>
+  local id lines phase extra
+  IFS=' ' read -r id lines phase extra \
+    < <(head -n 1 "$(away_ledger_chat_of "$1")" 2>/dev/null || true)
+  [ -z "${extra:-}" ] || return 1
+  [ "${phase:-}" = confirmed ] || return 1
+  [ "${id:-}" = "$2" ] && [ "${lines:-}" = "$3" ]
 }
 
 _away_ledger_mut_wedge() {  # <text-file> <staging>
@@ -472,7 +536,10 @@ away_ledger_retire_working_records() {  # <state> [preserve-digests]
   rm -f "$(away_ledger_delivery_dir "$state")"/.spool.* \
         "$state"/.subsuper-escalations.since.* \
         "$state"/.subsuper-escalations.apply.* \
-        "$state"/.subsuper-inject-wedged.apply.* 2>/dev/null
+        "$state"/.subsuper-inject-wedged.apply.* \
+        "$state"/.subsuper-inject-wedged.stage.* \
+        "$state"/.subsuper-chat-delivery.apply.* \
+        "$state"/.mint.* 2>/dev/null
   rm -rf "$(away_ledger_versions_dir "$state")"/.staging.* \
          "$state"/.tg-away-digest.apply.* 2>/dev/null
   return 0
@@ -621,15 +688,34 @@ away_ledger_daemon_live() {  # <state>
 # with a materialise. An incomplete lock is given a bounded grace first, so a
 # racing acquirer's own half-written lock is never ripped out from under it.
 away_ledger_lock_acquire() {  # <versions-dir>
-  local dir=$1 lock="$1/.owner.lock" attempt=0 incomplete=0 pid stale
+  local dir=$1 lock="$1/.owner.lock" attempt=0 incomplete=0 pid stale me
+  me=${BASHPID:-$$}
   (umask 077; mkdir -p "$dir" 2>/dev/null) || return 1
+  # Reentrant for the SAME process only, with a bounded depth. The daemon's
+  # TERM/INT cleanup runs its final flush inside this same shell, so without this
+  # a signal arriving mid-transaction would make every shutdown transition spin
+  # against a lock this process already holds - a stalled shutdown and a lost
+  # final flush. Exclusion against other processes is unchanged, and the recorded
+  # identity is re-verified against the lock on disk, so a lock lost or stolen in
+  # between is never treated as still held.
+  if [ "${AWAY_LEDGER_LOCK_DEPTH:-0}" -gt 0 ] \
+    && [ "${AWAY_LEDGER_LOCK_DIR:-}" = "$dir" ] \
+    && [ "${AWAY_LEDGER_LOCK_OWNER:-}" = "$me" ] \
+    && [ "$(head -n 1 "$lock/pid" 2>/dev/null || true)" = "$me" ]; then
+    [ "$AWAY_LEDGER_LOCK_DEPTH" -lt 8 ] || return 1
+    AWAY_LEDGER_LOCK_DEPTH=$((AWAY_LEDGER_LOCK_DEPTH + 1))
+    return 0
+  fi
   while [ "$attempt" -lt 200 ]; do
     attempt=$((attempt + 1))
     if mkdir "$lock" 2>/dev/null; then
-      if ! printf '%s\n' "$$" > "$lock/pid" 2>/dev/null; then
+      if ! printf '%s\n' "$me" > "$lock/pid" 2>/dev/null; then
         rm -rf -- "$lock" 2>/dev/null
         return 1
       fi
+      AWAY_LEDGER_LOCK_DIR=$dir
+      AWAY_LEDGER_LOCK_OWNER=$me
+      AWAY_LEDGER_LOCK_DEPTH=1
       return 0
     fi
     pid=$(head -n 1 "$lock/pid" 2>/dev/null || true)
@@ -673,7 +759,7 @@ _away_ledger_lock_steal() {  # <lock-dir> <observed-pid>
     esac
     return 0
   fi
-  printf '%s\n' "$$" > "$steal/pid" 2>/dev/null || true
+  printf '%s\n' "${BASHPID:-$$}" > "$steal/pid" 2>/dev/null || true
   current=$(head -n 1 "$lock/pid" 2>/dev/null || true)
   if [ "$current" = "$observed" ]; then
     case "$current" in
@@ -685,9 +771,19 @@ _away_ledger_lock_steal() {  # <lock-dir> <observed-pid>
   return 0
 }
 
+# Release one nesting level; the lock itself is only dropped by the outermost
+# release, so a nested transition can never unlock the transaction containing it.
 away_ledger_lock_release() {  # <versions-dir>
-  local lock="$1/.owner.lock"
-  [ "$(head -n 1 "$lock/pid" 2>/dev/null || true)" = "$$" ] || return 0
+  local dir=$1 lock="$1/.owner.lock" me
+  me=${BASHPID:-$$}
+  if [ "${AWAY_LEDGER_LOCK_DEPTH:-0}" -gt 0 ] && [ "${AWAY_LEDGER_LOCK_DIR:-}" = "$dir" ] \
+    && [ "${AWAY_LEDGER_LOCK_OWNER:-}" = "$me" ]; then
+    AWAY_LEDGER_LOCK_DEPTH=$((AWAY_LEDGER_LOCK_DEPTH - 1))
+    [ "$AWAY_LEDGER_LOCK_DEPTH" -eq 0 ] || return 0
+    AWAY_LEDGER_LOCK_DIR=''
+    AWAY_LEDGER_LOCK_OWNER=''
+  fi
+  [ "$(head -n 1 "$lock/pid" 2>/dev/null || true)" = "$me" ] || return 0
   rm -rf -- "$lock" 2>/dev/null
   return 0
 }
@@ -734,8 +830,10 @@ away_ledger_version_publish() {  # <state> <buf> <wedge>
 }
 
 _away_ledger_version_publish_locked() {  # <state> <buf> <wedge>
-  local state=$1 buf=$2 wedge=$3 staging
-  staging=$(_away_ledger_stage_build "$state" "$buf" "$wedge") || return 1
+  local state=$1 buf=$2 wedge=$3 built staging
+  built=$(_away_ledger_stage_build "$state" "$buf" "$wedge") || return 1
+  staging=${built#*	}
+  [ -n "$staging" ] && [ -d "$staging" ] || return 1
   _away_ledger_stage_commit "$state" "$staging"
 }
 
@@ -744,13 +842,35 @@ _away_ledger_version_publish_locked() {  # <state> <buf> <wedge>
 # version always starts from a complete, self-consistent copy of one unit rather
 # than from artifacts gathered at different moments.
 _away_ledger_stage_build() {  # <state> <buf> <wedge>
-  local state=$1 buf=$2 wedge=$3 dir staging digest_dir slot artifact i
+  local state=$1 buf=$2 wedge=$3 dir staging digest_dir slot artifact base
   local -a artifacts slots
   dir=$(away_ledger_versions_dir "$state")
   staging=$(umask 077; mktemp -d "$dir/.staging.XXXXXX" 2>/dev/null) || return 1
-  artifacts=("$buf" "${buf}.since" "$wedge")
-  slots=(escalations escalations.since wedge)
-  i=0
+  # Preferred base: the immutable active predecessor directory itself, so the
+  # successor is provably that version plus one transition - which is also what
+  # makes retiring the predecessor sound. Only used when the live unit is
+  # provably still that version's projection; a unit that diverged (an
+  # interrupted projection, or a writer outside this owner) is staged from live
+  # instead, so divergence is captured into the successor rather than discarded.
+  base=$(away_ledger_pointer_read "$dir/active" 2>/dev/null || true)
+  if [ -n "$base" ] \
+    && [ "$base" = "$(away_ledger_pointer_read "$dir/active.applied" 2>/dev/null || true)" ] \
+    && away_ledger_version_is_complete "$dir/$base" \
+    && _away_ledger_unit_matches_version "$state" "$buf" "$wedge" "$dir/$base"; then
+    if ! cp -pR "$dir/$base/." "$staging/" 2>/dev/null \
+      || ! rm -f -- "$staging/manifest" "$staging/.complete" 2>/dev/null; then
+      rm -rf -- "$staging" 2>/dev/null
+      return 1
+    fi
+    printf '%s\t%s\n' "$base" "$staging"
+    return 0
+  fi
+  artifacts=()
+  while IFS= read -r artifact; do artifacts+=("$artifact"); done \
+    < <(_away_ledger_unit_paths "$state" "$buf" "$wedge")
+  slots=()
+  while IFS= read -r slot; do slots+=("$slot"); done < <(_away_ledger_unit_slots)
+  local i=0
   while [ "$i" -lt "${#slots[@]}" ]; do
     artifact=${artifacts[$i]}
     slot=${slots[$i]}
@@ -768,7 +888,41 @@ _away_ledger_stage_build() {  # <state> <buf> <wedge>
       return 1
     fi
   fi
-  printf '%s\n' "$staging"
+  printf '\t%s\n' "$staging"
+  return 0
+}
+
+# Whether the live unit is still exactly <version-dir>'s projection: every single
+# file present-and-identical or absent on both sides, and the same digest item
+# names. Anything else means something diverged after the projection.
+_away_ledger_unit_matches_version() {  # <state> <buf> <wedge> <version-dir>
+  local state=$1 buf=$2 wedge=$3 vdir=$4 slot artifact digest_dir i
+  local -a artifacts slots
+  artifacts=()
+  while IFS= read -r artifact; do artifacts+=("$artifact"); done \
+    < <(_away_ledger_unit_paths "$state" "$buf" "$wedge")
+  slots=()
+  while IFS= read -r slot; do slots+=("$slot"); done < <(_away_ledger_unit_slots)
+  i=0
+  while [ "$i" -lt "${#slots[@]}" ]; do
+    artifact=${artifacts[$i]}
+    slot=${slots[$i]}
+    i=$((i + 1))
+    if [ -e "$vdir/$slot" ]; then
+      [ -f "$artifact" ] || return 1
+      cmp -s "$vdir/$slot" "$artifact" || return 1
+    else
+      [ ! -e "$artifact" ] || return 1
+    fi
+  done
+  digest_dir=$(away_ledger_digest_dir "$state")
+  if [ -d "$vdir/tg-away-digest" ]; then
+    [ -d "$digest_dir" ] || return 1
+    [ "$(cd "$vdir/tg-away-digest" && ls -1 2>/dev/null | sort)" \
+      = "$(cd "$digest_dir" && ls -1 2>/dev/null | sort)" ] || return 1
+  else
+    [ ! -d "$digest_dir" ] || return 1
+  fi
   return 0
 }
 
@@ -808,7 +962,7 @@ _away_ledger_stage_commit() {  # <state> <staging>
     rm -rf -- "$staging" 2>/dev/null
     return 1
   fi
-  for slot in escalations escalations.since wedge tg-away-digest; do
+  for slot in escalations escalations.since wedge chat tg-away-digest; do
     [ -e "$staging/$slot" ] || continue
     if ! printf '%s\n' "$slot" >> "$staging/manifest" 2>/dev/null; then
       rm -rf -- "$staging" 2>/dev/null
@@ -826,8 +980,10 @@ _away_ledger_stage_commit() {  # <state> <staging>
     rm -rf -- "$staging" 2>/dev/null
     return 1
   fi
-  name="v.$(away_ledger_mint_id)"
-  if ! mv "$staging" "$dir/$name" 2>/dev/null; then
+  name="v.$(away_ledger_mint_id "$dir")"
+  # Never rename ONTO an existing entry: mv would move the staging directory
+  # inside it, leaving the predecessor published as though it were the successor.
+  if [ -e "$dir/$name" ] || ! mv "$staging" "$dir/$name" 2>/dev/null; then
     rm -rf -- "$staging" 2>/dev/null
     return 1
   fi
@@ -861,11 +1017,13 @@ away_ledger_transact() {  # <state> <buf> <wedge> <mutator> [args...]
 }
 
 _away_ledger_transact_locked() {  # <state> <buf> <wedge> <mutator> [args...]
-  local state=$1 buf=$2 wedge=$3 dir staging name previous
+  local state=$1 buf=$2 wedge=$3 dir staging name previous built
   shift 3
   dir=$(away_ledger_versions_dir "$state")
-  previous=$(away_ledger_pointer_read "$dir/active" 2>/dev/null || true)
-  staging=$(_away_ledger_stage_build "$state" "$buf" "$wedge") || return 1
+  built=$(_away_ledger_stage_build "$state" "$buf" "$wedge") || return 1
+  previous=${built%%	*}
+  staging=${built#*	}
+  [ -n "$staging" ] && [ -d "$staging" ] || return 1
   if ! "$@" "$staging"; then
     rm -rf -- "$staging" 2>/dev/null
     return 1
@@ -874,6 +1032,10 @@ _away_ledger_transact_locked() {  # <state> <buf> <wedge> <mutator> [args...]
   away_ledger_pointer_write "$dir" active "$name" || return 1
   away_ledger_version_materialise "$state" "$buf" "$wedge" "$dir/$name" || return 1
   away_ledger_pointer_write "$dir" active.applied "$name" || return 1
+  # Only the version this successor was actually BUILT from is retired, so the
+  # superset claim is proven rather than assumed: a successor staged from a
+  # diverged live unit leaves its predecessor retained for the return fold, which
+  # already collapses identical lines.
   if [ -n "$previous" ] && [ "$previous" != "$name" ] \
     && [ -d "$dir/$previous" ]; then
     rm -rf -- "$dir/$previous" 2>/dev/null || true
@@ -914,7 +1076,7 @@ away_ledger_version_gc() {  # <state>
   [ -d "$dir" ] || return 0
   away_ledger_lock_acquire "$dir" || return 1
   rm -rf -- "$dir"/.staging.* 2>/dev/null
-  rm -f -- "$dir"/.pointer.* 2>/dev/null
+  rm -f -- "$dir"/.pointer.* "$dir"/.mint.* 2>/dev/null
   for v in "$dir"/v.*; do
     [ -e "$v" ] || continue
     away_ledger_version_is_complete "$v" && continue
@@ -995,10 +1157,13 @@ _away_ledger_version_apply_locked() {  # <state> <buf> <wedge>
 away_ledger_version_materialise() {  # <state> <buf> <wedge> <version-dir>
   local state=$1 buf=$2 wedge=$3 vdir=$4 digest_dir slot artifact tmp i
   local -a artifacts slots
-  artifacts=("$buf" "${buf}.since" "$wedge")
-  slots=(escalations escalations.since wedge)
+  artifacts=()
+  while IFS= read -r artifact; do artifacts+=("$artifact"); done \
+    < <(_away_ledger_unit_paths "$state" "$buf" "$wedge")
+  slots=()
+  while IFS= read -r slot; do slots+=("$slot"); done < <(_away_ledger_unit_slots)
   digest_dir=$(away_ledger_digest_dir "$state")
-  rm -f -- "$buf" "${buf}.since" "$wedge" 2>/dev/null || return 1
+  rm -f -- "${artifacts[@]}" 2>/dev/null || return 1
   rm -rf -- "$digest_dir" 2>/dev/null || return 1
   i=0
   while [ "$i" -lt "${#slots[@]}" ]; do
@@ -1051,7 +1216,8 @@ away_ledger_versions_retire_all() {  # <state>
   dir=$(away_ledger_versions_dir "$1")
   [ -d "$dir" ] || return 0
   away_ledger_lock_acquire "$dir" || return 1
-  rm -f -- "$dir/active" "$dir/active.applied" "$dir"/.pointer.* 2>/dev/null || result=1
+  rm -f -- "$dir/active" "$dir/active.applied" "$dir"/.pointer.* "$dir"/.mint.* 2>/dev/null \
+    || result=1
   rm -rf -- "$dir"/v.* "$dir"/.staging.* 2>/dev/null || result=1
   # Removal is only acknowledged when the store is provably empty of versions and
   # pointers: a caller that keeps a gate open on this status must not be told the
@@ -1183,9 +1349,22 @@ EOF
 # away_ledger_retire_working_records) - callers pass 1 on a continuation of an
 # already-active away session rather than a genuinely fresh entry.
 away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
-  local state=$1 buf=$2 wedge=$3 preserve=${4:-0} result=0
-  rm -f "$buf" "$wedge" 2>/dev/null || result=1
+  local state=$1 buf=$2 wedge=$3 preserve=${4:-0} dir result=0
+  rm -f "$buf" "$wedge" "$(away_ledger_chat_of "$state")" 2>/dev/null || result=1
   away_ledger_retire "$buf" || result=1
   away_ledger_retire_working_records "$state" "$preserve" || result=1
+  # The retired unit is no longer any version's projection, so the chain head is
+  # cleared too: the next transition stages a fresh unit instead of resurrecting a
+  # retired batch from a stale active pointer. The version DIRECTORIES stay - they
+  # are the evidence the return catch-up folds and only acknowledgement retires.
+  dir=$(away_ledger_versions_dir "$state")
+  if [ -d "$dir" ]; then
+    if away_ledger_lock_acquire "$dir"; then
+      rm -f -- "$dir/active" "$dir/active.applied" 2>/dev/null || result=1
+      away_ledger_lock_release "$dir"
+    else
+      result=1
+    fi
+  fi
   return "$result"
 }

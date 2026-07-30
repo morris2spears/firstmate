@@ -1151,7 +1151,7 @@ test_away_every_transition_goes_through_the_version_transaction() {
   assert_not_contains "$body" '> "$marker"' \
     "the daemon must not write the live wedge marker directly"
 
-  body=$(grep -nE '>>?[[:space:]]*"\$state/\.subsuper-(escalations|inject-wedged)' "$daemon" || true)
+  body=$(grep -nE '>>?[[:space:]]*"\$state/\.subsuper-(escalations|inject-wedged|chat-delivery)' "$daemon" || true)
   [ -z "$body" ] || fail "no live away artifact may be written outside the transaction: $body"
   pass "every ledger transition commits a successor version and no live write remains"
 }
@@ -1331,6 +1331,181 @@ test_away_store_lock_steal_never_removes_a_new_owner() {
   away_ledger_lock_release "$dir"
   assert_absent "$lock" "releasing the store lock must remove it"
   pass "a stale store-lock reclaim can never hand the store to two owners"
+}
+
+# A refused append must leave every suppressor untouched. The seen marker is what
+# the heartbeat catch-all checks, so recording it for an escalation that reached no
+# buffer, no version and no digest would suppress the only re-derivation path and
+# lose a captain-relevant event outright.
+test_away_refused_append_keeps_the_wake_re_derivable() {
+  local home state seen
+  home=$(make_home away-refused-append)
+  state="$home/state"
+  : > "$state/.afk"
+  printf 'blocked [key=needs-captain]: the captain must decide\n' > "$state/t1.status"
+  seen="$state/.subsuper-seen-status-t1"
+
+  (
+    away_ledger_append() { return 1; }
+    log() { :; }
+    handle_wake "signal: $state/t1.status" "$state"
+  ) >/dev/null 2>&1
+  assert_absent "$seen" \
+    "a refused append must not record the seen suppressor the catch-all scan checks"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a refused append must leave nothing buffered"
+
+  ( log() { :; }; handle_wake "signal: $state/t1.status" "$state" ) >/dev/null 2>&1
+  assert_grep 'the captain must decide' "$state/.subsuper-escalations" \
+    "the retried wake must buffer the escalation the refused append dropped"
+  assert_present "$seen" "a committed append must record the seen suppressor"
+  pass "a refused append leaves the wake re-derivable instead of suppressing it"
+}
+
+# Once the in-session submit is confirmed, a failure in the bookkeeping that
+# should have followed must never become a second delivery of the same batch into
+# captain chat.
+test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate() {
+  local home state buf injected count
+  home=$(make_home away-confirmed-inject)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: one event the captain already saw' \
+    || fail "the append must succeed"
+
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    away_ledger_truncate() { return 1; }
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+  count=$(grep -c 'one event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] || fail "the first flush must inject exactly once (got $count)"
+  assert_grep confirmed "$state/.subsuper-chat-delivery" \
+    "a confirmed submit must be recorded in the unit before the truncation"
+
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the retry must settle the batch once the truncation can land"
+  count=$(grep -c 'one event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "a confirmed batch must never be re-injected into captain chat (got $count)"
+  [ ! -s "$buf" ] || fail "the retry must complete the outstanding truncation"
+  assert_absent "$state/.subsuper-chat-delivery" \
+    "a retired batch must not leave its in-session delivery state behind"
+  pass "a confirmed in-session delivery is never repeated after a failed truncation"
+}
+
+# The daemon's TERM/INT cleanup runs its final flush inside the same shell, so a
+# transition must be able to nest inside a transaction this process already holds -
+# and a nested release must never drop the outer transaction's lock.
+test_away_store_lock_is_reentrant_for_its_own_holder() {
+  local home state dir buf
+  home=$(make_home away-lock-reentrant)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  dir="$state/tg-away-versions"
+  (umask 077; mkdir -p "$dir")
+
+  away_ledger_lock_acquire "$dir" || fail "acquiring the store lock must succeed"
+  away_ledger_append "$buf" 'blocked: nested under the holder-owned lock' \
+    || fail "a nested transition must not spin against a lock this process holds"
+  assert_present "$dir/.owner.lock" \
+    "a nested release must not drop the outer transaction's lock"
+  assert_grep 'nested under the holder-owned lock' "$buf" \
+    "the nested transition must still have committed and projected"
+  away_ledger_lock_release "$dir"
+  assert_absent "$dir/.owner.lock" "the outermost release must drop the lock"
+  pass "the store lock is reentrant for its own holder and only the outer release frees it"
+}
+
+# The predecessor is only retired when the successor was provably BUILT from it.
+# A live unit that diverged - an interrupted projection, or a writer outside this
+# owner - is staged from live instead, and its predecessor stays retained for the
+# return fold rather than being deleted on an unverified superset assumption.
+test_away_diverged_live_unit_retains_its_predecessor() {
+  local home state buf first second out
+  home=$(make_home away-diverged-unit)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+
+  escalate_add "$state" 'blocked: first event' || fail "the first append must succeed"
+  first=$(cat "$state/tg-away-versions/active")
+  escalate_add "$state" 'blocked: second event' || fail "the second append must succeed"
+  second=$(cat "$state/tg-away-versions/active")
+  assert_absent "$state/tg-away-versions/$first" \
+    "a successor built from its predecessor must retire it"
+
+  rm -f "$buf.since"
+  escalate_add "$state" 'blocked: third event' || fail "the third append must succeed"
+  [ "$(cat "$state/tg-away-versions/active")" != "$second" ] \
+    || fail "the diverged transition must have published its own successor"
+  assert_present "$state/tg-away-versions/$second/escalations" \
+    "a successor staged from a diverged live unit must retain its predecessor"
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding the retained predecessor must succeed"
+  assert_contains "$out" 'blocked: first event' \
+    "the retained predecessor must still reach the catch-up"
+  pass "a predecessor is retired only when the successor was built from it"
+}
+
+# The wedge and chat staging temps are part of the unit's temp set, so a crash
+# between mktemp and its removal must not outlive a lifecycle boundary.
+test_away_lifecycle_sweeps_leaked_unit_staging_temps() {
+  local home state
+  home=$(make_home away-temp-sweep)
+  state="$home/state"
+  : > "$state/.subsuper-inject-wedged.stage.zzzzzz"
+  : > "$state/.subsuper-chat-delivery.apply.zzzzzz"
+
+  away_ledger_retire_working_records "$state" || fail "the sweep must succeed"
+  assert_absent "$state/.subsuper-inject-wedged.stage.zzzzzz" \
+    "a leaked wedge staging temp must retire with the away session"
+  assert_absent "$state/.subsuper-chat-delivery.apply.zzzzzz" \
+    "a leaked in-session delivery temp must retire with the away session"
+  pass "leaked unit staging temps retire with the away session"
+}
+
+# Every identity this owner mints must be unique, and the mint runs from inside
+# command substitutions where bash 3.2 restarts $RANDOM from the caller's state.
+# Two mints in the same second colliding would give two batches one identity and
+# two versions one directory name - and a rename onto an existing version name
+# publishes the PREDECESSOR as though it were the successor, silently dropping the
+# transition that was just committed.
+test_away_minted_identities_do_not_collide_within_one_second() {
+  local home state buf version first second
+  home=$(make_home away-mint-unique)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+
+  escalate_add "$state" 'blocked: first within the same second' \
+    || fail "the first append must succeed"
+  escalate_add "$state" 'blocked: second within the same second' \
+    || fail "the second append must succeed"
+  [ "$(wc -l < "$buf" | tr -d ' ')" -eq 2 ] \
+    || fail "two appends in the same second must both survive: [$(cat "$buf")]"
+  version=$(cat "$state/tg-away-versions/active")
+  [ "$(wc -l < "$state/tg-away-versions/$version/escalations" | tr -d ' ')" -eq 2 ] \
+    || fail "the active version must hold both appends"
+  [ -z "$(find "$state/tg-away-versions" -name '.staging.*' 2>/dev/null)" ] \
+    || fail "a version must never contain a nested staging directory"
+
+  away_ledger_truncate "$buf" || fail "the truncation must succeed"
+  away_ledger_open "$buf" || fail "opening a fresh batch must succeed"
+  first=$(cut -d ' ' -f1 < "$buf.since")
+  away_ledger_truncate "$buf" || fail "the second truncation must succeed"
+  away_ledger_open "$buf" || fail "opening a second fresh batch must succeed"
+  second=$(cut -d ' ' -f1 < "$buf.since")
+  [ "$first" != "$second" ] \
+    || fail "two batch identities minted in the same second must differ ($first)"
+  pass "minted identities never collide within one second"
 }
 
 # Enforcement, not behaviour: the version store has exactly one writer, and the
@@ -1877,6 +2052,12 @@ test_away_wedge_and_truncate_transitions_publish_versions
 test_away_unparseable_record_is_quarantined_not_fatal
 test_away_gc_clears_a_dangling_active_pointer
 test_away_store_lock_steal_never_removes_a_new_owner
+test_away_refused_append_keeps_the_wake_re_derivable
+test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate
+test_away_store_lock_is_reentrant_for_its_own_holder
+test_away_diverged_live_unit_retains_its_predecessor
+test_away_lifecycle_sweeps_leaked_unit_staging_temps
+test_away_minted_identities_do_not_collide_within_one_second
 test_away_only_the_owner_writes_the_version_store
 test_away_peek_never_writes_and_read_migrates_only_live
 test_away_version_publish_migrates_into_the_successor_only

@@ -451,6 +451,9 @@ classify_unknown() {  # <reason>
 #           owned by fm-away-ledger-lib.sh.
 #           state/tg-away-digest/<id>.items        private 0600 copy of the
 #           accepted items, the working record the receipt points Firstmate at.
+#           state/.subsuper-chat-delivery          the batch's in-session (captain
+#           chat) delivery state, so a bookkeeping failure after a confirmed
+#           submit can never become a second delivery of the same batch.
 #           state/tg-away-versions/v.<id>/         one complete immutable copy
 #           of that whole unit per ledger transition, published under the store's
 #           owner lock; every live artifact above is the projection of whichever
@@ -956,6 +959,13 @@ escalate_flush() {  # <state>
     # ledger does not describe this buffer.
     [ "$reserved" -le "$n" ] || rec=unknown
   fi
+  # Captain chat already provably received exactly this batch and line count, and
+  # only the bookkeeping that should have followed is outstanding. Retry that and
+  # nothing else: re-injecting would duplicate an escalation the captain has.
+  if away_ledger_chat_confirmed "$state" "$batch_id" "$n"; then
+    away_ledger_truncate "$buf" || return 1
+    return 0
+  fi
   if [ "$rec" != unknown ]; then
     recovery=$(telegram_away_recover "$state" "$buf" "$reserved" "$confirmed" "$did")
     if [ "$recovery" != settled ]; then
@@ -1019,7 +1029,16 @@ escalate_flush() {  # <state>
       fi
       ;;
   esac
+  # The in-session delivery state is recorded in the version before and after the
+  # submit. A truncation that fails AFTER a confirmed submit therefore cannot
+  # become a second delivery of the same batch into captain chat: the next flush
+  # sees the confirmed record above and retries only the bookkeeping.
+  away_ledger_chat_mark "$state" "$batch_id" "$n" attempting \
+    || log "WARN: could not record the in-session delivery attempt for this away batch"
   if inject_msg "$msg" "$state"; then
+    if ! away_ledger_chat_mark "$state" "$batch_id" "$n" confirmed; then
+      log "ERROR: in-session delivery confirmed but not recorded; a retry may repeat this batch in captain chat"
+    fi
     away_ledger_truncate "$buf" || return 1
     return 0
   fi
@@ -1440,8 +1459,12 @@ housekeeping() {  # <state>
       [ -n "$f" ] || continue
       seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
       [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] && continue
-      escalate_add "$state" "$(basename "$f"): $last (catch-all scan)"
-      mark_status_seen "$state" "$task" "$last"
+      # The seen marker is the suppressor the next scan checks, so it is only
+      # recorded once the escalation is provably buffered in a committed version.
+      # A refused append therefore stays re-derivable instead of vanishing.
+      if escalate_add "$state" "$(basename "$f"): $last (catch-all scan)"; then
+        mark_status_seen "$state" "$task" "$last"
+      fi
     done < <(scan_captain_relevant_statuses "$state")
   fi
 }
@@ -1594,12 +1617,17 @@ handle_wake() {  # <reason> <state>
   case "$action" in
     escalate)
       log "escalate: $reason -> $distilled"
-      escalate_add "$state" "$distilled"
-      # A terminal-stale escalate must not leave a persistence marker behind, or
-      # housekeeping re-escalates the same pane as a false wedge later.
-      [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
-      mark_escalated_seen "$kind" "$arg" "$state"
-      [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
+      if escalate_add "$state" "$distilled"; then
+        # A terminal-stale escalate must not leave a persistence marker behind, or
+        # housekeeping re-escalates the same pane as a false wedge later. Both
+        # suppressors are only touched once the append is provably committed, so a
+        # refused append leaves this wake re-derivable by the next scan.
+        [ "$kind" = "stale" ] && stale_marker_remove "$arg" "$state"
+        mark_escalated_seen "$kind" "$arg" "$state"
+        [ "${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}" -le 0 ] && { escalate_flush "$state" || true; }
+      else
+        log "ERROR: escalation NOT buffered; stale and seen suppressors left intact so the next scan re-derives it: $distilled"
+      fi
       ;;
     pause)
       # Declared external-wait pause: record a pause marker (long re-surface
