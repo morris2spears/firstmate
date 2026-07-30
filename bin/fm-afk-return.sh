@@ -147,7 +147,8 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations away_items retained lifecycle_ok=1 reclaim_rc=0
+  local evidence blockers drained wedge escalations away_items retained lifecycle_ok=1
+  local reclaim_rc=0 fold_retained_rc=0
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -189,15 +190,21 @@ return_reconcile() {
     escalations=$(cat "$STATE/.subsuper-escalations" 2>/dev/null || true)
     append_evidence escalation "$escalations" "$evidence"
   fi
-  # Whatever away_ledger_reclaim_backups could not adopt above (a live buffer/
-  # sidecar/wedge conflicted with a backup's group) is folded here from each
-  # backup's own preserved sidecar count, then removed - so a backup blocked
-  # from adoption by a live conflict is never silently discarded and never
-  # left to resurface as a duplicate once the live conflict eventually clears.
+  # Whatever away_ledger_reclaim_backups could not fully reconcile above (a
+  # live buffer/sidecar/wedge conflicted with a backup's group, or a digest
+  # item failed to merge) is folded here - including any digest text - from
+  # each backup's own preserved sidecar count, then removed; publication and
+  # removal are atomic per backup, so a genuine failure here (surfaced below)
+  # never leaves already-folded evidence behind to duplicate on the next
+  # catch-up.
   retained=$(away_ledger_fold_retained_backups "$STATE" "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null || true)
+    "$STATE/.subsuper-inject-wedged" "$STATE/.afk-launch-backup.*" 2>/dev/null) || fold_retained_rc=$?
   if [ -n "$retained" ]; then
     append_evidence away-retained "$retained" "$evidence"
+  fi
+  if [ "$fold_retained_rc" -ne 0 ]; then
+    append_evidence lifecycle 'a leftover away-mode rollback backup could not be fully folded; retry catch-up before ordinary work' "$evidence"
+    lifecycle_ok=0
   fi
   # An accepted away batch has already been receipted and its buffer truncated, so
   # the ledger owner's private digests are the only local copy of those events.

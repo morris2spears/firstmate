@@ -1130,13 +1130,53 @@ test_away_fold_retained_backups_folds_wedge_evidence() {
   pass "fold_retained_backups folds a retained backup's wedge marker"
 }
 
+# Publication and removal are atomic: if a backup's digest item cannot be
+# merged, fold_retained_backups must neither print that backup's buffer/wedge
+# evidence nor remove it, so a later retry - once the fault clears - is the
+# only place that content is ever emitted, never duplicated across two calls.
+test_away_fold_retained_backups_never_publishes_on_digest_merge_failure() {
+  local home state backup buf out rc
+  home=$(make_home away-fold-retained-digest-failure)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: still undigested\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+  printf 'stranded wedge alarm\n' > "$backup/.subsuper-inject-wedged"
+  mkdir -p "$backup/tg-away-digest"
+  printf 'blocked: undeliverable digest\n' > "$backup/tg-away-digest/1700000000-abc-a0-0-x.items"
+
+  rc=0
+  out=$(
+    cp() {
+      case "$2" in
+        (*tg-away-digest*) return 1 ;;
+        (*) command cp "$@" ;;
+      esac
+    }
+    away_ledger_fold_retained_backups "$state" "$buf" \
+      "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*"
+  ) || rc=$?
+  [ "$rc" -ne 0 ] \
+    || fail "fold_retained_backups must report failure when a digest item cannot be merged"
+  [ -z "$out" ] \
+    || fail "no evidence may be emitted for a backup that was not fully reconciled and removed"
+  [ -d "$backup" ] \
+    || fail "the backup must survive a digest-merge failure for a later retry"
+  [ -f "$backup/.subsuper-escalations" ] \
+    || fail "the backup's buffer must remain intact alongside its unmerged digest"
+  assert_absent "$state/tg-away-digest/1700000000-abc-a0-0-x.items" \
+    "a failed merge must never leave a partial copy in the live digest directory"
+  pass "fold_retained_backups never publishes or removes a backup on a digest-merge failure"
+}
+
 # A digest-merge failure inside a backup must never leave an already-adopted
 # buffer/sidecar/wedge group sitting in that backup for a later
 # away_ledger_fold_retained_backups pass to fold a second time - the group is
 # consumed from the backup the moment it is adopted, independent of whatever
 # happens to that backup's unrelated digest items.
 test_away_reclaim_backups_group_adoption_survives_a_sibling_digest_failure() {
-  local home state backup buf out
+  local home state backup buf out live_digest rc
   home=$(make_home away-reclaim-group-vs-digest-failure)
   state="$home/state"
   buf="$state/.subsuper-escalations"
@@ -1163,12 +1203,29 @@ test_away_reclaim_backups_group_adoption_survives_a_sibling_digest_failure() {
     || fail "the backup must survive so its unmerged digest can be retried"
   [ ! -e "$backup/.subsuper-escalations" ] \
     || fail "an adopted group must be consumed from the backup immediately"
+  [ -f "$backup/tg-away-digest/1700000000-abc-a0-0-x.items" ] \
+    || fail "reclaim must never destroy a digest item it failed to merge"
 
+  live_digest="$state/tg-away-digest/1700000000-abc-a0-0-x.items"
+  assert_absent "$live_digest" \
+    "the failed digest merge must not have reached the live digest directory"
+
+  rc=0
   out=$(away_ledger_fold_retained_backups "$state" "$buf" \
-    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*")
+    "$state/.subsuper-inject-wedged" "$state/.afk-launch-backup.*") || rc=$?
+  [ "$rc" -eq 0 ] \
+    || fail "fold_retained_backups must succeed once the digest client is no longer failing"
   assert_no_grep 'adopted line' <(printf '%s\n' "$out") \
     "a group already adopted must never be folded again by fold_retained_backups"
-  pass "an adopted group is consumed immediately and never re-folded after a sibling digest failure"
+  [ -f "$live_digest" ] \
+    || fail "fold_retained_backups must fold the previously unmerged digest item"
+  [ "$(cat "$live_digest" 2>/dev/null)" = 'blocked: undeliverable digest' ] \
+    || fail "the folded digest item's content must survive intact"
+  [ "$(find "$state/tg-away-digest" -name '1700000000-abc-a0-0-x.items' | wc -l | tr -d ' ')" = 1 ] \
+    || fail "the digest item must exist exactly once after folding"
+  assert_absent "$backup" \
+    "the backup must be removed once its digest item is folded and merged"
+  pass "an adopted group is consumed immediately, and a sibling digest failure is folded exactly once once resolved"
 }
 
 # A live delivery id's digest file must never be clobbered by a reclaim: if the
@@ -1592,6 +1649,7 @@ test_away_reclaim_backups_returns_zero_when_nothing_to_reclaim
 test_away_reclaim_backups_returns_failure_on_real_copy_error
 test_away_fold_retained_backups_folds_only_undigested_lines
 test_away_fold_retained_backups_folds_wedge_evidence
+test_away_fold_retained_backups_never_publishes_on_digest_merge_failure
 test_away_reclaim_backups_group_adoption_survives_a_sibling_digest_failure
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_client_exit_125_is_never_proven_local

@@ -503,25 +503,54 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
 }
 
 # Fold the actionable content of every backup that away_ledger_reclaim_backups
-# left behind (deferred: its buffer/sidecar/wedge group conflicted with a live
-# one) directly into the caller's evidence, then remove it - so a backup
-# blocked from adoption by a live conflict is never silently discarded, and
-# never left to resurface as a duplicate delivery once the live conflict
-# eventually clears. Digest text needs no separate handling here: it is always
-# merged by away_ledger_reclaim_backups regardless of any buffer conflict, so
-# by the time this runs a remaining backup's digest text is already reconciled
-# and only its raw buffer/wedge content can still be stranded.
+# left behind directly into the caller's evidence, then remove it - so a
+# backup blocked from adoption by a live conflict (deferred) or still holding
+# an unmerged digest item (a real reclaim failure) is never silently
+# discarded, and never left to resurface as a duplicate delivery once the
+# conflict clears or the merge succeeds. A backup's digest text is folded here
+# too rather than assumed already reconciled: away_ledger_reclaim_backups
+# leaves a backup fully intact - digest items included - whenever even one of
+# its digest items failed to merge, so this is the only path some digest text
+# may ever go through.
 #
 # Reads each backup's own escalation count through its own preserved sidecar
 # (away_ledger_read against the backup's own buffer path), so only the lines
 # past that backup's own accounted count - never anything already digested -
 # are printed, one whitespace-joined line per backup, tagged so the caller can
 # label it distinctly from the live buffer's own evidence.
+#
+# Publication and removal are atomic per backup: nothing is printed for a
+# backup unless that backup's digest merge AND its removal both succeed in
+# this same call, so an incomplete reconciliation can never duplicate
+# evidence on a later retry - it simply leaves that backup untouched, exactly
+# as far along as it was, for the next call to finish or retry from.
 away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
   local state=$1 buf=$2 wedge=$3 pattern=$4
-  local backup bbuf accounted rec n body wedge_body result=0
+  local backup bbuf accounted rec n body wedge_body digest_dir f base ok result=0
+  digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
+    ok=1
+    if [ -d "$backup/tg-away-digest" ]; then
+      if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
+        for f in "$backup/tg-away-digest"/*.items; do
+          [ -f "$f" ] || continue
+          base=${f##*/}
+          if [ -e "$digest_dir/$base" ]; then
+            :
+          elif ! cp -p "$f" "$digest_dir/$base"; then
+            ok=0
+          fi
+        done
+      else
+        ok=0
+      fi
+    fi
+    if [ "$ok" -ne 1 ]; then
+      result=1
+      continue
+    fi
+
     bbuf="$backup/${buf##*/}"
     accounted=0
     if [ -f "$bbuf" ] && [ -f "${bbuf}.since" ]; then
@@ -530,19 +559,23 @@ away_ledger_fold_retained_backups() {  # <state> <buf> <wedge> <backup-glob>
         IFS=' ' read -r _ _ _ accounted _ _ _ <<< "$rec"
       fi
     fi
+    body=''
     if [ -f "$bbuf" ]; then
       n=$(( $(wc -l < "$bbuf" 2>/dev/null || echo 0) ))
       if [ "$n" -gt "$accounted" ]; then
         body=$(tail -n "+$((accounted + 1))" "$bbuf" 2>/dev/null \
           | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
-        printf '%s\n' "$body"
       fi
     fi
-    if [ -s "$backup/${wedge##*/}" ]; then
-      wedge_body=$(head -1 "$backup/${wedge##*/}" 2>/dev/null)
-      printf 'wedge: %s\n' "$wedge_body"
+    wedge_body=''
+    [ -s "$backup/${wedge##*/}" ] && wedge_body=$(head -1 "$backup/${wedge##*/}" 2>/dev/null)
+
+    if rm -rf "$backup"; then
+      [ -z "$body" ] || printf '%s\n' "$body"
+      [ -z "$wedge_body" ] || printf 'wedge: %s\n' "$wedge_body"
+    else
+      result=1
     fi
-    rm -rf "$backup" || result=1
   done
   return "$result"
 }
