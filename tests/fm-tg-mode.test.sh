@@ -1522,6 +1522,48 @@ test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix() {
   pass "an unreadable ledger keeps the confirmed in-session prefix out of captain chat"
 }
 
+# A batch whose payload goes unreadable BEFORE its first in-session delivery has
+# no receipt to adopt an identity from, so the store falls back to the identity of
+# its own validated active version. Without that the prefix could never be opened
+# and every retry would repeat the lines captain chat already has.
+test_away_first_chat_delivery_under_a_corrupt_ledger_opens_a_receipt() {
+  local home state buf injected count
+  home=$(make_home away-corrupt-first-chat)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event under an unreadable ledger' \
+    || fail "the append must succeed"
+  assert_absent "$state/.subsuper-chat-delivery" \
+    "the batch must reach its first flush with no in-session receipt"
+  printf 'garbage\n' > "$buf.since"
+
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    away_ledger_truncate() { return 1; }
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+  [ "$(away_ledger_chat_delivered "$state")" = 1 ] \
+    || fail "an unreadable ledger must still be able to open a confirmed chat prefix"
+
+  escalate_add "$state" 'blocked: second event under an unreadable ledger' \
+    || fail "the append onto the delivered batch must succeed"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the retry must settle the batch"
+  count=$(grep -c 'first event under an unreadable ledger' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "the prefix opened under an unreadable ledger must not be re-delivered (got $count)"
+  grep -F 'second event under an unreadable ledger' "$injected" >/dev/null \
+    || fail "the unconfirmed suffix must still reach captain chat"
+  pass "a first in-session delivery under an unreadable ledger still opens a confirmed prefix"
+}
+
 # The daemon's TERM/INT cleanup runs its final flush inside the same shell, so a
 # transition must be able to nest inside a transaction this process already holds -
 # and a nested release must never drop the outer transaction's lock.
@@ -2178,6 +2220,7 @@ test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate
 test_away_confirmed_chat_prefix_survives_a_growing_batch
 test_away_failed_inject_never_lowers_the_confirmed_chat_prefix
 test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix
+test_away_first_chat_delivery_under_a_corrupt_ledger_opens_a_receipt
 test_away_store_lock_is_reentrant_for_its_own_holder
 test_away_diverged_live_unit_retains_its_predecessor
 test_away_lifecycle_sweeps_leaked_unit_staging_temps

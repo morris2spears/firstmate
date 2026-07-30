@@ -277,14 +277,40 @@ _away_ledger_chat_parse() {  # <state>  -> "<id> <confirmed> <from> <to>"
   printf 'none 0 0 0\n'
 }
 
+# The identity the STORE itself can vouch for: the batch named by the validated
+# active version pointer. It is read from the pointer and its completeness proof,
+# never from the (possibly unreadable) ledger payload or from message text, so it
+# stays available exactly when the payload cannot be trusted. The `v-` prefix
+# keeps its provenance explicit and cannot collide with a minted ledger id, which
+# always starts with an epoch digit.
+_away_ledger_chat_version_id() {  # <state>
+  local dir name
+  dir=$(away_ledger_versions_dir "$1")
+  name=$(away_ledger_pointer_read "$dir/active") || return 1
+  away_ledger_version_is_complete "$dir/$name" || return 1
+  name=${name#v.}
+  case "$name" in
+    ''|*[!0-9a-zA-Z-]*) return 1 ;;
+  esac
+  printf 'v-%s\n' "$name"
+}
+
 # The receipt names its own batch, so it stays usable when the ledger sidecar
 # itself is unreadable: a caller with no id (or the placeholder `none`) adopts
-# the recorded identity rather than clobbering it with a nameless record.
-_away_ledger_chat_effective_id() {  # <recorded-id> <requested-id>
-  case "${2:-}" in
-    ''|none) printf '%s\n' "$1" ;;
-    *) printf '%s\n' "$2" ;;
+# the recorded identity rather than clobbering it with a nameless record, and a
+# batch whose payload went unreadable BEFORE it ever had a receipt falls back to
+# the active version's identity so the confirmed prefix can still be opened.
+_away_ledger_chat_effective_id() {  # <state> <recorded-id> <requested-id>
+  case "${3:-}" in
+    ''|none) ;;
+    *) printf '%s\n' "$3"; return 0 ;;
   esac
+  case "${2:-}" in
+    ''|none) ;;
+    *) printf '%s\n' "$2"; return 0 ;;
+  esac
+  _away_ledger_chat_version_id "$1" || printf 'none\n'
+  return 0
 }
 
 # Open an attempt on the (from, to] suffix. The confirmed prefix is carried
@@ -295,7 +321,7 @@ away_ledger_chat_mark_attempt() {  # <state> <batch-id> <from> <to>
   away_ledger_is_count "$from" "$to" || return 1
   rec=$(_away_ledger_chat_parse "$state")
   IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
-  id=$(_away_ledger_chat_effective_id "$rid" "$id")
+  id=$(_away_ledger_chat_effective_id "$state" "$rid" "$id")
   case "$id" in
     ''|none|*[!0-9a-zA-Z-]*) return 1 ;;
   esac
@@ -313,7 +339,7 @@ away_ledger_chat_mark_confirmed() {  # <state> <batch-id> <to>
   away_ledger_is_count "$to" || return 1
   rec=$(_away_ledger_chat_parse "$state")
   IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
-  id=$(_away_ledger_chat_effective_id "$rid" "$id")
+  id=$(_away_ledger_chat_effective_id "$state" "$rid" "$id")
   case "$id" in
     ''|none|*[!0-9a-zA-Z-]*) return 1 ;;
   esac
