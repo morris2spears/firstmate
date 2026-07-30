@@ -204,6 +204,8 @@ test_static_contract() {
   assert_contains "$nonconversation_layout" 'Firstmate Calm requires Pi InteractiveMode.addMessageToChat' "Pi Calm non-conversation adapter does not probe the hidden-row spacing seam"
   assert_contains "$nonconversation_layout" 'calmPresentationHides(itemClass)' "Pi Calm non-conversation adapter does not read the centralized visibility policy"
   assert_contains "$nonconversation_layout" 'row instanceof entry.rowClass' "Pi Calm non-conversation adapter drops the spacer beside a row whose adapter degraded"
+  assert_contains "$nonconversation_layout" 'calmConditionalRow(spacer, () => calmRegisteredRowHides(exportName))' "Pi Calm hidden-row spacer bakes in a hides closure instead of reading the shared registry per render"
+  assert_contains "$nonconversation_layout" 'calmHiddenRowClasses().classes.get(exportName)' "Pi Calm hidden-row spacer does not resolve its row policy from the registry shared across extension reloads"
   assert_not_contains "$nonconversation_layout" 'chatContainer.clear' "Pi Calm non-conversation adapter rebuilds the transcript instead of rendering at zero height"
   assert_not_contains "$text" 'calm transcript' "Pi calm extension still adds a persistent Calm status row"
   assert_not_contains "$text" 'pi.on("input"' "Pi calm extension still intercepts semantic input"
@@ -750,6 +752,126 @@ JS
   [ "$status" -eq 0 ] || fail "Pi calm adapter reload turn scope failed: $out"
   [ -z "$out" ] || fail "Pi calm adapter reload test printed output: $out"
   pass "reloading the Calm adapters keeps actionable tool errors scoped to one assistant turn without stacking Pi wrappers"
+}
+
+test_hidden_row_spacer_reload() {
+  local fixture out status generation
+  if ! command -v node >/dev/null 2>&1; then
+    echo "skip: node not found for Pi calm hidden-row spacer reload test"
+    return 0
+  fi
+  if [ ! -f "$PI_PACKAGE_DIR/package.json" ]; then
+    echo "skip: installed @earendil-works/pi-coding-agent package not found"
+    return 0
+  fi
+
+  fixture="$TMP_ROOT/spacer-reload"
+  mkdir -p "$fixture/node_modules/@earendil-works"
+  # A reload re-evaluates the whole Calm lib graph, so each generation gets its own module copies
+  # and therefore its own visibility state, exactly as Pi reloads the extension.
+  for generation in 1 2; do
+    mkdir -p "$fixture/lib-gen$generation"
+    cp "$NONCONVERSATION_LAYOUT" "$fixture/lib-gen$generation/fm-calm-nonconversation-layout.ts"
+    cp "$VISIBILITY" "$fixture/lib-gen$generation/fm-calm-visibility.ts"
+  done
+  ln -s "$PI_PACKAGE_DIR" "$fixture/node_modules/@earendil-works/pi-coding-agent"
+  ln -s "$PI_PACKAGE_DIR/node_modules/@earendil-works/pi-tui" "$fixture/node_modules/@earendil-works/pi-tui"
+  ln -s "$PI_PACKAGE_DIR/node_modules/typebox" "$fixture/node_modules/typebox"
+  printf '%s\n' '{"type":"module"}' >"$fixture/package.json"
+
+  out=$(cd "$fixture" && PI_PACKAGE_DIR="$PI_PACKAGE_DIR" node --input-type=module 2>&1 <<'JS'
+import { pathToFileURL } from "node:url";
+
+const packageRoot = process.env.PI_PACKAGE_DIR;
+const [{ InteractiveMode }, { initTheme }, { setCapabilities }] = await Promise.all([
+  import(pathToFileURL(`${packageRoot}/dist/modes/interactive/interactive-mode.js`).href),
+  import(pathToFileURL(`${packageRoot}/dist/modes/interactive/theme/theme.js`).href),
+  import(pathToFileURL(`${packageRoot}/node_modules/@earendil-works/pi-tui/dist/index.js`).href),
+]);
+initTheme("dark");
+setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+
+const compactionMessage = {
+  role: "compactionSummary",
+  tokensBefore: 1234,
+  summary: "CALM_SPACER_RELOAD_SUMMARY",
+};
+const visibleText = "Compacted from 1,234 tokens";
+
+async function loadGeneration(generation) {
+  const dir = `${process.cwd()}/lib-gen${generation}`;
+  const layout = await import(pathToFileURL(`${dir}/fm-calm-nonconversation-layout.ts`).href);
+  const visibility = await import(pathToFileURL(`${dir}/fm-calm-visibility.ts`).href);
+  layout.installCalmCompactionSummaryLayout();
+  layout.installCalmLeadingSpacerLayout();
+  return { layout, visibility };
+}
+
+function addCompactionRow() {
+  const chat = {
+    children: [],
+    addChild(component) {
+      this.children.push(component);
+    },
+  };
+  InteractiveMode.prototype.addMessageToChat.call(
+    {
+      chatContainer: chat,
+      editor: { addToHistory() {} },
+      getMarkdownThemeWithSettings: () => undefined,
+      getUserMessageText: (message) => message.content,
+      outputPad: 1,
+      toolOutputExpanded: false,
+    },
+    compactionMessage,
+  );
+  if (chat.children.length !== 2) {
+    throw new Error("Pi no longer pairs a compaction summary with one leading spacer");
+  }
+  return chat;
+}
+
+const gen1 = await loadGeneration(1);
+gen1.visibility.setCalmPresentation(true);
+const chat = addCompactionRow();
+const renderChat = () => chat.children.flatMap((component) => component.render(100));
+if (renderChat().length !== 0) {
+  throw new Error("Calm left the compaction summary or its leading spacer visible");
+}
+
+// The reload installs a fresh module instance whose visibility state is the only one the
+// extension drives from here on; the old instance keeps its now stale flag forever.
+const gen2 = await loadGeneration(2);
+gen2.visibility.setCalmPresentation(false);
+const restored = renderChat();
+if (!restored.join("\n").includes(visibleText)) {
+  throw new Error("Calm off after a reload did not restore the compaction summary row");
+}
+if (restored[0] !== "") {
+  throw new Error("Calm off after a reload restored the compaction row without its leading spacer");
+}
+
+gen2.visibility.setCalmPresentation(true);
+if (renderChat().length !== 0) {
+  throw new Error("Calm on after a reload did not hide the compaction summary and its spacer again");
+}
+
+// A row wrapped after the reload must follow the live policy just as an older one does.
+const reloadedChat = addCompactionRow();
+if (reloadedChat.children.flatMap((component) => component.render(100)).length !== 0) {
+  throw new Error("Calm did not hide a compaction row appended after the reload");
+}
+gen2.visibility.setCalmPresentation(false);
+const reloadedRestored = reloadedChat.children.flatMap((component) => component.render(100));
+if (!reloadedRestored.join("\n").includes(visibleText) || reloadedRestored[0] !== "") {
+  throw new Error("Calm off did not restore a compaction row appended after the reload");
+}
+JS
+)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi calm hidden-row spacer reload failed: $out"
+  [ -z "$out" ] || fail "Pi calm hidden-row spacer reload test printed output: $out"
+  pass "a hidden row's leading spacer follows the live Calm policy across extension reloads"
 }
 
 test_rendering_and_session_lifecycle() {
@@ -2955,6 +3077,7 @@ test_pi_compat_no_upper_bound
 test_pi_compat_degraded_adapter
 test_pi_compat_missing_adapter_exports
 test_adapter_reload_turn_scope
+test_hidden_row_spacer_reload
 test_rendering_and_session_lifecycle
 test_operational_followup_turn_e2e
 test_hidden_block_geometry_e2e

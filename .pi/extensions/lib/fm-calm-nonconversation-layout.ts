@@ -78,11 +78,18 @@ function calmHiddenRowClasses(): CalmHiddenRowRegistry {
   return entry;
 }
 
-function calmHidesRow(row: CalmRow): (() => boolean) | undefined {
-  for (const entry of calmHiddenRowClasses().classes.values()) {
-    if (row instanceof entry.rowClass) return entry.hides;
+function calmHiddenRowExportName(row: CalmRow): string | undefined {
+  for (const [exportName, entry] of calmHiddenRowClasses().classes) {
+    if (row instanceof entry.rowClass) return exportName;
   }
   return undefined;
+}
+
+// The registry lives on globalThis, so reading the row policy by export name on every render keeps
+// a spacer wrapped by an earlier module instance following the live policy after a reload.
+function calmRegisteredRowHides(exportName: string): boolean {
+  const entry = calmHiddenRowClasses().classes.get(exportName);
+  return entry ? entry.hides() : false;
 }
 
 function calmConditionalRow(row: CalmRow, hides: () => boolean): CalmRow {
@@ -221,9 +228,9 @@ export function installCalmLeadingSpacerLayout(): void {
       const spacer = children[index];
       const row = children[index + 1];
       if (!spacer || !row || !(spacer instanceof Spacer)) continue;
-      const rowHides = calmHidesRow(row);
-      if (!rowHides) continue;
-      children[index] = calmConditionalRow(spacer, rowHides);
+      const exportName = calmHiddenRowExportName(row);
+      if (!exportName) continue;
+      children[index] = calmConditionalRow(spacer, () => calmRegisteredRowHides(exportName));
     }
   };
 
