@@ -258,17 +258,23 @@ away_ledger_chat_mark() {  # <state> <batch-id> <lines> attempting|confirmed
     "$(away_ledger_wedge_of "$state")" _away_ledger_mut_chat "$id" "$lines" "$phase"
 }
 
-# Whether captain chat PROVABLY already received exactly this batch and line
-# count. Only a confirmed submit answers yes, so an interrupted attempt still
-# retries rather than silently dropping an escalation - and a confirmed one is
-# never re-injected even if the truncation that should have followed it failed.
-away_ledger_chat_confirmed() {  # <state> <batch-id> <lines>
+# How many lines of <batch-id> captain chat PROVABLY already received: the
+# CONFIRMED PREFIX of the batch, printed as a count. A batch only ever grows, so
+# the prefix is monotonic and a later flush may only ever offer chat the lines
+# PAST it - an append landing between a confirmed submit and the truncation that
+# should have followed can no longer drag the already-delivered lines back into
+# captain chat. Only a confirmed submit counts; an interrupted attempt answers 0
+# so it retries in full rather than silently dropping an escalation.
+away_ledger_chat_delivered() {  # <state> <batch-id>
   local id lines phase extra
   IFS=' ' read -r id lines phase extra \
     < <(head -n 1 "$(away_ledger_chat_of "$1")" 2>/dev/null || true)
-  [ -z "${extra:-}" ] || return 1
-  [ "${phase:-}" = confirmed ] || return 1
-  [ "${id:-}" = "$2" ] && [ "${lines:-}" = "$3" ]
+  if [ -z "${extra:-}" ] && [ "${phase:-}" = confirmed ] && [ "${id:-}" = "$2" ] \
+    && away_ledger_is_count "${lines:-}"; then
+    printf '%s\n' "$lines"
+    return 0
+  fi
+  printf '0\n'
 }
 
 _away_ledger_mut_wedge() {  # <text-file> <staging>

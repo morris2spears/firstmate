@@ -174,7 +174,20 @@ fm_afk_start_main() {
       fi
       return 1
     fi
-    fm_afk_clear_stale_artifacts "$FM_AFK_STATE" "$had_afk"
+    # The clear is an owner transaction too, so it can legitimately refuse (owner
+    # lock busy, a live artifact that will not go). Under this script's errexit
+    # an unguarded call would end the run silently, mid-retirement, with away
+    # mode already flagged and no daemon. Fail honestly instead: the captured
+    # version above retains every owed line, so nothing is lost.
+    local clear_rc=0
+    fm_afk_clear_stale_artifacts "$FM_AFK_STATE" "$had_afk" || clear_rc=$?
+    if [ "$clear_rc" -ne 0 ]; then
+      echo "afk: could not retire the prior away batch through the ledger owner (its immutable version is retained); refusing to start the daemon" >&2
+      if [ "$had_afk" -eq 0 ]; then
+        rm -f "$FM_AFK_STATE/.afk" 2>/dev/null || true
+      fi
+      return 1
+    fi
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"

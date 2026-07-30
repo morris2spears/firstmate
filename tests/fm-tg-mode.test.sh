@@ -1401,6 +1401,45 @@ test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate() {
   pass "a confirmed in-session delivery is never repeated after a failed truncation"
 }
 
+# A batch only ever grows, so the confirmed in-session delivery is a PREFIX, not
+# an exact line count: a line appended between a confirmed submit and the
+# truncation that should have followed must not drag the already-delivered lines
+# back into captain chat.
+test_away_confirmed_chat_prefix_survives_a_growing_batch() {
+  local home state buf injected count
+  home=$(make_home away-confirmed-prefix)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event the captain already saw' \
+    || fail "the first append must succeed"
+
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    away_ledger_truncate() { return 1; }
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+
+  escalate_add "$state" 'blocked: second event arriving after the confirmed submit' \
+    || fail "the append onto the confirmed batch must succeed"
+  (
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the grown batch must still flush"
+
+  count=$(grep -c 'first event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "a confirmed prefix must not be re-injected when the batch grows (got $count)"
+  grep -F 'second event arriving after the confirmed submit' "$injected" >/dev/null \
+    || fail "the line appended past the confirmed prefix must still reach captain chat"
+  [ ! -s "$buf" ] || fail "the grown batch must be retired once its flush settles"
+  pass "a confirmed in-session prefix is never repeated when the batch grows"
+}
+
 # The daemon's TERM/INT cleanup runs its final flush inside the same shell, so a
 # transition must be able to nest inside a transaction this process already holds -
 # and a nested release must never drop the outer transaction's lock.
@@ -2054,6 +2093,7 @@ test_away_gc_clears_a_dangling_active_pointer
 test_away_store_lock_steal_never_removes_a_new_owner
 test_away_refused_append_keeps_the_wake_re_derivable
 test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate
+test_away_confirmed_chat_prefix_survives_a_growing_batch
 test_away_store_lock_is_reentrant_for_its_own_holder
 test_away_diverged_live_unit_retains_its_predecessor
 test_away_lifecycle_sweeps_leaked_unit_staging_temps

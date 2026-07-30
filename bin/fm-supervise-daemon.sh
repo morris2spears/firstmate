@@ -945,6 +945,7 @@ telegram_away_recover() {  # <state> <buf> <reserved> <confirmed> <delivery-id>
 escalate_flush() {  # <state>
   local state=$1 buf n body msg rec recovery tg_result tg_status tg_id
   local batch_id reserved confirmed accounted attempt retry did pending_body chat_body chat_pending
+  local chat_delivered chat_start
   local prior_note pointer
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
@@ -959,10 +960,11 @@ escalate_flush() {  # <state>
     # ledger does not describe this buffer.
     [ "$reserved" -le "$n" ] || rec=unknown
   fi
-  # Captain chat already provably received exactly this batch and line count, and
-  # only the bookkeeping that should have followed is outstanding. Retry that and
-  # nothing else: re-injecting would duplicate an escalation the captain has.
-  if away_ledger_chat_confirmed "$state" "$batch_id" "$n"; then
+  # Captain chat already provably received this whole batch and only the
+  # bookkeeping that should have followed is outstanding. Retry that and nothing
+  # else: re-injecting would duplicate an escalation the captain has.
+  chat_delivered=$(away_ledger_chat_delivered "$state" "$batch_id")
+  if [ "$chat_delivered" -ge "$n" ]; then
     away_ledger_truncate "$buf" || return 1
     return 0
   fi
@@ -993,14 +995,27 @@ escalate_flush() {  # <state>
     tg_id=$did
     tg_status=uncertain
   fi
-  chat_pending=$(( n - accounted ))
+  # Captain chat is owed the lines past BOTH suppressors: the digest-accounted
+  # prefix (already on the phone, deliberately not repeated here) and the
+  # confirmed-delivered prefix (already in chat from an earlier submit whose
+  # bookkeeping failed). The batch may have grown since that submit, so this is a
+  # prefix skip, never an all-or-nothing equality check.
+  chat_delivered=$(away_ledger_chat_delivered "$state" "$batch_id")
+  chat_start=$accounted
+  if [ "$chat_delivered" -gt "$chat_start" ]; then
+    chat_start=$chat_delivered
+  fi
+  chat_pending=$(( n - chat_start ))
   [ "$chat_pending" -gt 0 ] || chat_pending=0
-  chat_body=$(tail -n "+$((accounted + 1))" "$buf" 2>/dev/null \
+  chat_body=$(tail -n "+$((chat_start + 1))" "$buf" 2>/dev/null \
     | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
   pointer=$(away_ledger_digest_pointer "$batch_id")
   prior_note=''
   if [ "$accounted" -gt 0 ] && [ "$tg_status" != accepted ]; then
     prior_note=$(printf ' Telegram already delivered and recorded %s earlier event(s) of this batch in %s; do not repeat those in captain chat.' "$accounted" "$pointer")
+  fi
+  if [ "$chat_delivered" -gt "$accounted" ] && [ "$tg_status" != accepted ]; then
+    prior_note="$prior_note$(printf ' The first %s event(s) of this batch were already delivered to captain chat by an earlier submit and are not repeated here.' "$chat_delivered")"
   fi
   case "$tg_status" in
     accepted)
@@ -1022,10 +1037,10 @@ escalate_flush() {  # <state>
       msg=$(printf 'Supervisor escalate (%s event(s)): %s (Telegram delivery unavailable; the away batch ledger is unreadable so nothing was sent to the phone. Use the existing in-session fallback. Pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
       ;;
     *)
-      if [ "$accounted" -gt 0 ]; then
+      if [ -n "$prior_note" ]; then
         msg=$(printf 'Supervisor escalate (%s event(s)): %s (%s Pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body" "${prior_note# }")
       else
-        msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed - watcher daemon-managed)' "$n" "$body")
+        msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed - watcher daemon-managed)' "$chat_pending" "$chat_body")
       fi
       ;;
   esac
@@ -1405,8 +1420,15 @@ housekeeping() {  # <state>
     case "$?" in
       0) rm -f "$marker" ;;
       2) rm -f "$marker" ;;
-      *) escalate_add "$state" "stale persisted ${age}s (possible wedge): $win"
-         stale_marker_remove "$win" "$state" ;;
+      *) # The marker is the suppressor this recheck fires from, so it is only
+         # dropped once the escalation is provably buffered in a committed
+         # version. A refused append leaves the marker aged, so the next
+         # housekeeping tick retries this same wedge immediately.
+         if escalate_add "$state" "stale persisted ${age}s (possible wedge): $win"; then
+           stale_marker_remove "$win" "$state"
+         else
+           log "ERROR: possible-wedge escalation NOT buffered; stale marker left aged so the next tick retries: $win"
+         fi ;;
     esac
   done
 
@@ -1439,8 +1461,11 @@ housekeeping() {  # <state>
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
-          escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
-          _now > "$marker"
+          if escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"; then
+            _now > "$marker"
+          else
+            log "ERROR: pause recheck escalation NOT buffered; pause marker left aged so the next tick retries: $win"
+          fi
         else
           rm -f "$marker"
         fi
