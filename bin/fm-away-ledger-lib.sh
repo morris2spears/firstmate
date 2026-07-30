@@ -321,7 +321,9 @@ away_ledger_retire_working_records() {  # <state> [preserve-digests]
   local state=$1 preserve=${2:-0}
   [ "$preserve" -eq 1 ] || rm -rf "$(away_ledger_digest_dir "$state")" 2>/dev/null
   rm -f "$(away_ledger_delivery_dir "$state")"/.spool.* \
-        "$state"/.subsuper-escalations.since.* 2>/dev/null
+        "$state"/.subsuper-escalations.since.* \
+        "$state"/.subsuper-escalations.reclaim.* \
+        "$state"/.subsuper-inject-wedged.reclaim.* 2>/dev/null
   return 0
 }
 
@@ -446,7 +448,12 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 #
 # Group adoption itself writes each artifact through the same same-directory
 # mktemp-then-mv pattern away_ledger_write uses for the sidecar, so a reader
-# elsewhere can never observe a half-copied file.
+# elsewhere can never observe a half-copied file. Adoption is only ever
+# attempted when all three live paths are provably absent, so if a later
+# artifact in the group fails partway through, every artifact this call
+# already committed live is unlinked before the failure is reported - the
+# live unit is restored to the same absence it started this call in, and the
+# backup remains the single complete copy, never a sidecar-less live buffer.
 #
 # Return status distinguishes an ordinary wait state from a real fault:
 #   0  every backup was fully reconciled (or none matched the glob)
@@ -459,10 +466,16 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-only]
   local state=$1 buf=$2 wedge=$3 pattern=$4 digests_only=${5:-0}
   local backup digest_dir artifact base f ok real_fail group_clear_to_adopt group_ok
-  local dir tmp result=0 deferred=0
+  local dir tmp committed result=0 deferred=0
   digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
+    case "$backup" in
+      *.consumed)
+        rm -rf "$backup" || result=1
+        continue
+        ;;
+    esac
     ok=1
     real_fail=0
     if [ -d "$backup/tg-away-digest" ]; then
@@ -488,26 +501,34 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [digests-
       fi
       if [ "$group_clear_to_adopt" -eq 1 ]; then
         group_ok=1
+        committed=''
         for artifact in "$buf" "${buf}.since" "$wedge"; do
           base=${artifact##*/}
           [ -e "$backup/$base" ] || continue
           dir=${artifact%/*}
-          if tmp=$(umask 077; mktemp "$dir/.${base}.reclaim.XXXXXX" 2>/dev/null) \
+          if tmp=$(umask 077; mktemp "$dir/${base}.reclaim.XXXXXX" 2>/dev/null) \
             && cp -p "$backup/$base" "$tmp" 2>/dev/null && mv -f "$tmp" "$artifact" 2>/dev/null; then
-            :
+            committed="$committed $artifact"
           else
             rm -f -- "${tmp:-}" 2>/dev/null
             group_ok=0; ok=0; real_fail=1
+            break
           fi
         done
-        # Consume the group from the backup as soon as it is fully adopted,
-        # independent of any unrelated digest-merge outcome above, so a
-        # digest failure alone can never leave an already-adopted group
-        # sitting in the backup to be folded a second time by
-        # away_ledger_fold_retained_backups.
         if [ "$group_ok" -eq 1 ]; then
+          # Consume the group from the backup as soon as it is fully adopted,
+          # independent of any unrelated digest-merge outcome above, so a
+          # digest failure alone can never leave an already-adopted group
+          # sitting in the backup to be folded a second time by
+          # away_ledger_fold_retained_backups.
           rm -f "$backup/${buf##*/}" "$backup/${buf##*/}.since" "$backup/${wedge##*/}" \
             || { ok=0; real_fail=1; }
+        else
+          # A partial group was never valid without every artifact - undo
+          # whatever this call already committed live, so the live unit stays
+          # exactly as absent as it was before adoption began and the backup
+          # remains the single complete copy.
+          rm -f $committed 2>/dev/null
         fi
       else
         ok=0

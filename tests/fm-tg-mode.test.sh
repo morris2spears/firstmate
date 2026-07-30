@@ -1151,7 +1151,62 @@ test_away_reclaim_backups_group_adoption_is_atomic_per_file() {
     || fail "the backup must survive a mid-group adoption failure"
   [ ! -e "${buf}.since" ] \
     || fail "a failed sidecar copy must never leave a partial file at the live path"
-  pass "group adoption writes atomically and reports failure without a partial live write"
+  [ ! -e "$buf" ] \
+    || fail "a failed later artifact must roll back an already-committed earlier one, never leaving a sidecar-less live buffer"
+  [ -f "$backup/.subsuper-escalations" ] \
+    || fail "the rolled-back buffer must remain in the backup as the single complete copy"
+  [ -f "$backup/.subsuper-escalations.since" ] \
+    || fail "the backup's sidecar must remain intact after a rolled-back adoption"
+  pass "group adoption writes atomically and rolls back a partial group without a partial live write"
+}
+
+# A `.consumed` marker left by an interrupted away_ledger_fold_retained_backups
+# removal must never be treated as an ordinary unreconciled backup by reclaim -
+# it already had its evidence published, so reclaim must only retry removing
+# it, never adopt or merge from it, which would publish the same content twice.
+test_away_reclaim_backups_never_adopts_a_consumed_marker() {
+  local home state backup consumed buf rc
+  home=$(make_home away-reclaim-consumed-marker)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: already published by an earlier fold\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+  consumed="${backup}.consumed"
+  mv "$backup" "$consumed"
+
+  rc=0
+  away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    "$state/.afk-launch-backup.*" || rc=$?
+  [ "$rc" -eq 0 ] \
+    || fail "reclaim must succeed once a consumed marker's removal is no longer blocked (got: $rc)"
+  [ ! -e "$buf" ] \
+    || fail "reclaim must never adopt a consumed marker's buffer - its evidence was already published"
+  assert_absent "$consumed" "reclaim must remove a consumed marker once recovery succeeds"
+  pass "reclaim never adopts from a consumed marker, only retries its removal"
+}
+
+# Reclaim's own staging temp files must fall inside the cleanup sweep that
+# retires an away session's working records, so a crash between mktemp and mv
+# can never leak a private copy of escalation text into the state directory
+# permanently.
+test_away_reclaim_backups_staging_temp_falls_inside_the_cleanup_sweep() {
+  local home state
+  home=$(make_home away-reclaim-temp-sweep)
+  state="$home/state"
+  : > "$state/.subsuper-escalations.reclaim.XXXXXX"
+  : > "$state/.subsuper-escalations.since.reclaim.XXXXXX"
+  : > "$state/.subsuper-inject-wedged.reclaim.XXXXXX"
+
+  away_ledger_retire_working_records "$state"
+
+  assert_absent "$state/.subsuper-escalations.reclaim.XXXXXX" \
+    "a leaked buffer staging temp must be swept by working-records retirement"
+  assert_absent "$state/.subsuper-escalations.since.reclaim.XXXXXX" \
+    "a leaked sidecar staging temp must be swept by working-records retirement"
+  assert_absent "$state/.subsuper-inject-wedged.reclaim.XXXXXX" \
+    "a leaked wedge staging temp must be swept by working-records retirement"
+  pass "reclaim's staging temps fall inside the working-records cleanup sweep"
 }
 
 # away_ledger_fold_retained_backups must surface exactly the lines a retained
@@ -1741,6 +1796,8 @@ test_away_reclaim_backups_returns_zero_when_nothing_to_reclaim
 test_away_reclaim_backups_returns_failure_on_real_copy_error
 test_away_reclaim_backups_digests_only_defers_the_group
 test_away_reclaim_backups_group_adoption_is_atomic_per_file
+test_away_reclaim_backups_never_adopts_a_consumed_marker
+test_away_reclaim_backups_staging_temp_falls_inside_the_cleanup_sweep
 test_away_fold_retained_backups_folds_only_undigested_lines
 test_away_fold_retained_backups_folds_wedge_evidence
 test_away_fold_retained_backups_never_publishes_on_digest_merge_failure
