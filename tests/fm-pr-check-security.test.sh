@@ -66,6 +66,29 @@ SH
 printf '%s\n' "$*" >> "$FM_TEST_GH_LOG"
 case " $* " in
   *" headRefOid "*) printf '%s\n' "${FM_TEST_GH_HEAD:-0123456789abcdef0123456789abcdef01234567}" ;;
+  # The authenticated account. Unset by default, which is how every pre-decline
+  # fixture keeps a closed pull request silent.
+  *" api user "*)
+    [ "${FM_TEST_GH_LOGIN_FAIL:-0}" = 0 ] || exit 1
+    [ -z "${FM_TEST_GH_LOGIN-}" ] || printf '%s\n' "$FM_TEST_GH_LOGIN"
+    ;;
+  # One "<author-login>\t<comment-id>\t<seconds-from-closedAt>" fixture line per
+  # comment, oldest first. The real query drops every comment made more than six
+  # hours before the close inside gh's own jq, so the fake applies that same
+  # window here and prints what the poll actually parses, a "<login>\t<id>" line
+  # per surviving comment. A missing offset field means the comment was made at
+  # the close. FM_TEST_GH_CLOSED_AT_FAIL models a null or unparseable closedAt,
+  # which makes fromdateiso8601 error and gh exit non-zero with no output.
+  *" closedAt,comments "*)
+    [ "${FM_TEST_GH_COMMENTS_FAIL:-0}" = 0 ] || exit 1
+    [ "${FM_TEST_GH_CLOSED_AT_FAIL:-0}" = 0 ] || exit 1
+    [ -n "${FM_TEST_GH_COMMENTS-}" ] || exit 0
+    while IFS=$'\t' read -r login comment_id offset; do
+      [ -n "$login$comment_id" ] || continue
+      [ "${offset:-0}" -ge -21600 ] || continue
+      printf '%s\t%s\n' "$login" "$comment_id"
+    done <<< "$FM_TEST_GH_COMMENTS"
+    ;;
   *" state "*)
     [ "${FM_TEST_GH_FAIL:-0}" = 0 ] || exit 1
     [ "${FM_TEST_GH_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_GH_SLEEP"
@@ -2617,6 +2640,8 @@ test_teardown_removes_poll_artifacts() {
   printf 'data\n' > "$dir/home/state/task-a.pr-poll"
   printf 'registration\n' > "$dir/home/state/task-a.pr-poll-registration"
   printf 'trust\n' > "$dir/home/state/task-a.check-trust"
+  printf 'fm-pr-decline-seen-v1\nhttps://github.com/o/r/pull/1\nIC_first\n' \
+    > "$dir/home/state/task-a.pr-decline-seen"
   mkdir -p "$dir/home/state/.pr-check-quarantine"
   chmod 0700 "$dir/home/state/.pr-check-quarantine"
   printf 'legacy\n' > "$dir/home/state/.pr-check-quarantine/task-a.check.abc123"
@@ -2635,6 +2660,7 @@ SH
   [ ! -e "$dir/home/state/task-a.pr-poll" ] || fail "teardown left the sidecar"
   [ ! -e "$dir/home/state/task-a.pr-poll-registration" ] || fail "teardown left the PR poll registration"
   [ ! -e "$dir/home/state/task-a.check-trust" ] || fail "teardown left the custom check registration"
+  [ ! -e "$dir/home/state/task-a.pr-decline-seen" ] || fail "teardown left the decline delivery record"
   ! find "$dir/home/state/.pr-check-quarantine" -name 'task-a.*' -print 2>/dev/null | grep . >/dev/null \
     || fail "teardown left task quarantine artifacts"
 
@@ -3330,8 +3356,246 @@ test_gitlab_merged_poll_retires() {
   pass "GitHub and GitLab exact merged results share one retirement path"
 }
 
+# One comment fixture line: login, comment identifier, and optionally when it
+# was made relative to the close, in seconds, defaulting to the close itself.
+comment_line() {
+  printf '%s\t%s\t%s' "$1" "$2" "${3:-0}"
+}
+
+test_declined_pull_request_detection() {
+  local dir out captain bot
+  dir=$(make_case declined-detection)
+  make_poll_fixture "$dir"
+  captain=capn
+  bot=github-actions
+
+  # Neither an open nor a merged pull request is a decline, whatever was said
+  # on it: the captain declines by closing without merging.
+  out=$(FM_TEST_GH_STATE=OPEN FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "open pull request with a captain comment reported a decline"
+  out=$(FM_TEST_GH_STATE=MERGED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ "$out" = merged ] || fail "merged pull request with a captain comment did not report exactly merged"
+
+  # Closed without merging is the decline signal, but only a captain comment
+  # carries an instruction.
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" run_poll "$dir")
+  [ -z "$out" ] || fail "closed pull request with no comments reported a decline"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$bot" IC_bot)" run_poll "$dir")
+  [ -z "$out" ] || fail "bot-authored comment was read as a captain decline"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_first" ] || fail "captain decline was not reported: [$out]"
+
+  # The newest captain comment wins, and a later bot comment never displaces it.
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$bot" IC_bot)
+$(comment_line "$captain" IC_first)
+$(comment_line "$captain" IC_second)
+$(comment_line "$bot" IC_bot2)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_second" ] || fail "newest captain comment was not selected: [$out]"
+
+  # Only a comment bound to the close carries the instruction behind it. One
+  # made well before the close is an incidental remark on work that was later
+  # superseded, and never a decline; one just inside the window is the captain
+  # closing what he was already commenting on, and one made after the close is a
+  # fresh instruction whenever it lands.
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_stale -604800)" run_poll "$dir")
+  [ -z "$out" ] || fail "comment from long before the close was relayed as a decline: [$out]"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_edge -21600)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_edge" ] || fail "comment inside the close window was not relayed: [$out]"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_after 2592000)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_after" ] || fail "comment made after the close was not relayed: [$out]"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_stale -604800)
+$(comment_line "$captain" IC_fresh -60)" run_poll "$dir")
+  [ "$out" = "declined 1 IC_fresh" ] || fail "stale comment displaced the fresh one: [$out]"
+
+  # Every unresolved identity or unreadable lookup stays silent, exactly as the
+  # merge branch does, so a failure can never be read as an instruction.
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" FM_TEST_GH_CLOSED_AT_FAIL=1 \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "unreadable close timestamp still reported a decline"
+  out=$(FM_TEST_GH_STATE=CLOSED \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "unresolved captain identity still reported a decline"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN_FAIL=1 FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "failed identity lookup still reported a decline"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" FM_TEST_GH_COMMENTS_FAIL=1 \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "failed comment lookup still reported a decline"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN='capn;id' \
+    FM_TEST_GH_COMMENTS="$(comment_line 'capn;id' IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "out-of-charset login was accepted as the captain"
+  out=$(FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" 'IC_x;rm -rf /')" run_poll "$dir")
+  [ -z "$out" ] || fail "out-of-charset comment identifier reached a wake line"
+
+  # Decline detection is GitHub-only; a merge request keeps watching its merge.
+  printf '%s\n%s\n%s\n%s\n%s\n' \
+    gitlab https://gl.example.com/g/p/-/merge_requests/1 gl.example.com g/p 1 \
+    > "$dir/home/state/task-a.pr-poll"
+  out=$(FM_TEST_GLAB_STATE=closed FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" run_poll "$dir")
+  [ -z "$out" ] || fail "GitLab merge request reported a decline"
+  pass "closed-without-merge plus a captain comment is the only decline signal"
+}
+
+test_declined_comment_delivers_exactly_once() {
+  local dir state url rc captain
+  dir=$(make_case decline-once)
+  state="$dir/home/state"
+  url=https://github.com/o/r/pull/11
+  captain=capn
+  write_poll_meta "$state" task-a "$url"
+  seed_canonical_poll "$dir" task-a "$url"
+
+  # First observation of the captain's comment wakes firstmate and records the
+  # delivery next to the poll's other private artifacts.
+  set +e
+  FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/first.out" 2> "$dir/first.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "declined watcher cycle failed: $(cat "$dir/first.err")"
+  case "$(cat "$dir/first.out")" in
+    check:*task-a.check.sh:*"declined 11 IC_first") ;;
+    *) fail "decline wake was missing: $(cat "$dir/first.out")" ;;
+  esac
+  grep -qF 'declined 11 IC_first' "$state/.wake-queue" \
+    || fail "decline was not queued durably"
+  [ "$(file_mode "$state/task-a.pr-decline-seen")" = 600 ] \
+    || fail "delivery record is not private"
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    || fail "delivery record does not bind this pull request and comment"
+
+  # The poll keeps reporting the same comment; the record makes it one delivery.
+  # A control check proves the cycle really ran and simply had nothing to say.
+  add_stop_custom_check "$dir"
+  rm -f "$state/.last-check"
+  : > "$state/.wake-queue"
+  set +e
+  FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/repeat.out" 2> "$dir/repeat.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "repeat watcher cycle failed: $(cat "$dir/repeat.err")"
+  case "$(cat "$dir/repeat.out")" in
+    check:*z-stop.check.sh:*stop-cycle) ;;
+    *) fail "repeat cycle did not reach the control check: $(cat "$dir/repeat.out")" ;;
+  esac
+  grep -qF "declined 11 IC_first" "$state/.wake-queue" \
+    && fail "the same comment was delivered twice"
+
+  # A newer comment is a new instruction and wakes again.
+  rm -f "$state/z-stop.check.sh" "$state/z-stop.check-trust" "$state/.last-check"
+  : > "$state/.wake-queue"
+  set +e
+  FM_TEST_GH_STATE=CLOSED FM_TEST_GH_LOGIN="$captain" \
+    FM_TEST_GH_COMMENTS="$(comment_line "$captain" IC_first)
+$(comment_line "$captain" IC_second)" \
+    run_watcher_bounded "$dir/home" "$dir/fakebin" > "$dir/second.out" 2> "$dir/second.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "second decline watcher cycle failed: $(cat "$dir/second.err")"
+  case "$(cat "$dir/second.out")" in
+    check:*task-a.check.sh:*"declined 11 IC_second") ;;
+    *) fail "newer captain comment did not wake: $(cat "$dir/second.out")" ;;
+  esac
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_second \
+    || fail "delivery record did not advance to the newer comment"
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    && fail "delivery record still matches the superseded comment"
+
+  # A decline is not terminal, so the poll stays armed and can still retire on
+  # the merge that follows the captain's revisions.
+  fm_pr_poll_artifacts_valid "$state" task-a "$POLL" \
+    || fail "decline disarmed the poll"
+  rm -f "$state/.last-check"
+  set +e
+  FM_TEST_GH_STATE=MERGED run_watcher_bounded "$dir/home" "$dir/fakebin" \
+    > "$dir/merged.out" 2> "$dir/merged.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || fail "merge after decline failed: $(cat "$dir/merged.err")"
+  case "$(cat "$dir/merged.out")" in check:*task-a.check.sh:*merged) ;; *) fail "merge after decline did not notify" ;; esac
+  assert_poll_absent "$state" task-a
+  pass "each captain comment on a declined pull request is delivered exactly once"
+}
+
+test_decline_delivery_record_is_identity_bound() {
+  local dir state url other
+  dir=$(make_case decline-record)
+  state="$dir/home/state"
+  url=https://github.com/o/r/pull/12
+  other=https://github.com/o/r/pull/13
+
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    && fail "absent record reported a prior delivery"
+  fm_pr_decline_seen_record "$state" task-a "$url" IC_first \
+    || fail "could not record a delivery"
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    || fail "recorded delivery was not recognised"
+  # Bound to the comment AND the pull request, so re-arming the task on a new
+  # pull request can never be silenced by the previous one's record.
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_other \
+    && fail "record suppressed a different comment"
+  fm_pr_decline_already_delivered "$state" task-a "$other" IC_first \
+    && fail "record suppressed the same comment on a different pull request"
+  fm_pr_decline_already_delivered "$state" task-b "$url" IC_first \
+    && fail "record suppressed another task"
+
+  # A damaged record re-delivers rather than silently swallowing the captain.
+  printf 'fm-pr-decline-seen-v1\n%s\n' "$url" > "$state/task-a.pr-decline-seen"
+  chmod 0600 "$state/task-a.pr-decline-seen"
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    && fail "truncated record suppressed a delivery"
+  printf 'fm-pr-decline-seen-v0\n%s\n%s\n' "$url" IC_first > "$state/task-a.pr-decline-seen"
+  chmod 0600 "$state/task-a.pr-decline-seen"
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    && fail "unrecognised record version suppressed a delivery"
+  chmod 0644 "$state/task-a.pr-decline-seen"
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    && fail "world-readable record suppressed a delivery"
+  rm -f "$state/task-a.pr-decline-seen"
+  ln -s /dev/null "$state/task-a.pr-decline-seen"
+  fm_pr_decline_already_delivered "$state" task-a "$url" IC_first \
+    && fail "symlinked record suppressed a delivery"
+  fm_pr_decline_seen_record "$state" task-a "$url" IC_first \
+    && fail "symlinked destination accepted a delivery record"
+  rm -f "$state/task-a.pr-decline-seen"
+
+  # Malformed poll output is never parsed into a delivery.
+  fm_pr_decline_output_parse 'declined 11 IC_first' || fail "valid decline line was refused"
+  [ "$FM_PR_DECLINE_NUMBER" = 11 ] || fail "decline line lost its pull request number"
+  [ "$FM_PR_DECLINE_COMMENT" = IC_first ] || fail "decline line lost its comment identifier"
+  fm_pr_decline_output_parse merged && fail "merged was parsed as a decline"
+  fm_pr_decline_output_parse 'declined' && fail "bare verb was parsed as a decline"
+  fm_pr_decline_output_parse 'declined 11' && fail "missing comment identifier was accepted"
+  fm_pr_decline_output_parse 'declined 0 IC_first' && fail "zero pull request number was accepted"
+  fm_pr_decline_output_parse 'declined 11x IC_first' && fail "non-numeric number was accepted"
+  fm_pr_decline_output_parse 'declined 11 IC_first extra' && fail "trailing field was accepted"
+  fm_pr_decline_output_parse 'declined 11 IC;rm -rf /' && fail "shell metacharacters were accepted"
+  fm_pr_decline_seen_record "$state" task-a "$url" 'IC;rm -rf /' \
+    && fail "out-of-charset comment identifier was recorded"
+  fm_pr_decline_seen_record "$state" task-a 'https://evil.example/x' IC_first \
+    && fail "non-canonical pull request URL was recorded"
+  pass "the delivery record and decline line refuse every malformed or foreign input"
+}
+
 test_parser_matrix
 test_gitlab_merge_watch
+test_declined_pull_request_detection
+test_declined_comment_delivers_exactly_once
+test_decline_delivery_record_is_identity_bound
 test_merged_poll_retires_once
 test_persistent_secondmate_retirement_is_poll_only
 test_retirement_crash_recovery

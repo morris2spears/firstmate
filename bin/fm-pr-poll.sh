@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
 # Static watcher program for a validated PR/MR poll sidecar.
-# It emits exactly one merged line for a merged PR or MR and stays silent
-# otherwise, including on every error, so a failed lookup can never be read as
-# a merge. The provider-tagged identity is data in the sidecar and is never
-# interpolated into this source: these bytes are identical for every task.
+# It emits exactly one merged line for a merged PR or MR, one declined line for
+# a GitHub pull request the captain closed without merging after commenting on
+# it, and stays silent otherwise, including on every error, so a failed lookup
+# can never be read as a merge or a decline. The provider-tagged identity is
+# data in the sidecar and is never interpolated into this source: these bytes
+# are identical for every task.
 # Each provider is read through its own standard CLI, gh for GitHub and glab
 # for GitLab, so an upstream checkout needs no extra tooling to follow either.
+#
+# Decline detection is GitHub-only. It needs a comment author identity, and the
+# merge request path already reads state through glab's plain field output
+# rather than a JSON processor firstmate does not require, so a GitLab merge
+# request keeps watching only for its merge. That matches bin/fm-pr-merge.sh,
+# which also serves GitHub alone.
+#
+# This program never writes. It reports the newest captain comment it can see
+# on every cycle, and the watcher's durable seen record decides whether that is
+# a fresh instruction, so a killed or timed-out poll can never lose or
+# half-record a delivery.
 set -u
 LC_ALL=C
 export LC_ALL
@@ -63,7 +76,67 @@ case "$provider" in
     esac
     [ "$url" = "https://github.com/$owner/$repo/pull/$number" ] || exit 0
     state=$(gh pr view "$url" --json state -q .state 2>/dev/null) || exit 0
-    [ "$state" = MERGED ] && printf '%s\n' merged
+    if [ "$state" = MERGED ]; then
+      printf '%s\n' merged
+      exit 0
+    fi
+    # Closing a pull request without merging it, after leaving a comment on it,
+    # is how the captain declines work and says what to change. Only a comment
+    # authored by the account this home is authenticated to the forge as counts
+    # as the captain speaking, so a review bot, a CI bot, or a pipeline comment
+    # can never be read as his instruction. Every lookup below stays silent on
+    # failure for the same reason the merge branch does.
+    [ "$state" = CLOSED ] || exit 0
+    captain=$(gh api user -q .login 2>/dev/null) || exit 0
+    [ "${#captain}" -ge 1 ] && [ "${#captain}" -le 39 ] || exit 0
+    case "$captain" in
+      *[!A-Za-z0-9-]*|-*|*-) exit 0 ;;
+    esac
+    # Only the author login and the comment identifier are read. A comment body
+    # is arbitrary captain prose that would have to survive a wake line intact,
+    # so firstmate fetches it from the forge when it handles the wake instead.
+    #
+    # A comment only counts as the instruction behind this close if it was made
+    # at or after six hours before it. The captain comments and closes in one
+    # sitting, so six hours covers a distracted same-session close with margin
+    # while excluding an incidental early comment on a pull request that is only
+    # closed much later, after the work was superseded. There is no upper bound:
+    # a comment written after the close is always a fresh instruction on a
+    # closed pull request, however long after it lands. The window errs generous
+    # rather than tight because the two failures are not symmetric - a missed
+    # decline is silent and defeats the feature, while a stale relay is loud and
+    # firstmate reads the comment before it acts on it.
+    #
+    # The window arithmetic runs inside gh's own jq rather than in date(1),
+    # whose relative-time flags differ between the BSD and GNU builds firstmate
+    # has to run on. A null or unparseable closedAt makes fromdateiso8601 error,
+    # gh exits non-zero, and this poll stays silent, which is the safe
+    # direction.
+    #
+    # gh returns only the first 100 issue comments, oldest first, so on a pull
+    # request with more than 100 comments the captain's decline can fall outside
+    # the window gh reports. The close binding above makes that failure silent
+    # rather than wrong, which is again the safe direction; a paginated or
+    # reversed query is the follow-up if a pull request ever gets that long.
+    # shellcheck disable=SC2016 # single quotes are deliberate: jq expands its own variables.
+    comments=$(gh pr view "$url" --json closedAt,comments -q '(.closedAt|fromdateiso8601) as $c | .comments[] | select((.createdAt|fromdateiso8601) >= ($c - 21600)) | [.author.login, .id] | @tsv' 2>/dev/null) || exit 0
+    [ -n "$comments" ] || exit 0
+    latest=
+    while IFS=$'\t' read -r author comment_id _rest; do
+      [ "$author" = "$captain" ] || continue
+      latest=$comment_id
+    done <<EOF
+$comments
+EOF
+    [ -n "$latest" ] || exit 0
+    # The identifier reaches a wake reason line, so it is accepted only as the
+    # opaque token shape a forge issues for a comment and never as a path, an
+    # option, or more than one word.
+    [ "${#latest}" -le 200 ] || exit 0
+    case "$latest" in
+      *[!A-Za-z0-9_-]*) exit 0 ;;
+    esac
+    printf 'declined %s %s\n' "$number" "$latest"
     ;;
   gitlab)
     [ "${#host}" -ge 1 ] && [ "${#host}" -le 253 ] || exit 0

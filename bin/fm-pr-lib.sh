@@ -16,6 +16,13 @@
 # after its durable wake is appended.
 # The receipt binds the terminal observation to the canonical registration and
 # lets a restart finish fixed-path removal without executing state-file bytes.
+#
+# A declined pull request - closed without merging, carrying a captain comment -
+# is not terminal, so it retires nothing. The poll is stateless and reports the
+# same newest captain comment on every cycle, and the private
+# <id>.pr-decline-seen record is what makes one comment one delivery. It is
+# bound to the pull request URL as well as the comment, so re-arming a task on a
+# different pull request can never be silenced by the previous one's record.
 
 FM_PR_PROVIDER=
 FM_PR_URL=
@@ -89,6 +96,10 @@ FM_PR_RETIRE_REG_IDENTITY=
 FM_PR_RETIRE_RECEIPT_HASH=
 FM_PR_RETIRE_RECEIPT_IDENTITY=
 FM_PR_POLL_RETIREMENT_REJECTED=
+FM_PR_DECLINE_NUMBER=
+FM_PR_DECLINE_COMMENT=
+FM_PR_DECLINE_SEEN_URL=
+FM_PR_DECLINE_SEEN_COMMENT=
 
 fm_task_id_path_safe() {
   local id=${1-}
@@ -939,4 +950,104 @@ fm_pr_poll_retirement_recover_all() {
     fi
   done
   [ -z "$FM_PR_POLL_RETIREMENT_REJECTED" ]
+}
+
+# A forge comment identifier is an opaque token. It is accepted only as the
+# bounded single-word shape the poll emits, because it reaches a wake reason
+# line and a private file name's contents.
+fm_pr_comment_id_valid() {
+  local comment=${1-}
+  local LC_ALL=C
+  [[ "$comment" =~ ^[A-Za-z0-9_-]{1,200}$ ]]
+}
+
+# Parse a poll's decline line, "declined <number> <comment-id>". Anything else,
+# including a bare word, extra fields, or an out-of-shape identifier, is refused
+# rather than partially accepted.
+fm_pr_decline_output_parse() {
+  local out=${1-} rest number comment
+  local LC_ALL=C
+  FM_PR_DECLINE_NUMBER=
+  FM_PR_DECLINE_COMMENT=
+  case "$out" in
+    'declined '*) rest=${out#declined } ;;
+    *) return 1 ;;
+  esac
+  number=${rest%% *}
+  comment=${rest#* }
+  [ "$number" != "$rest" ] || return 1
+  [[ "$number" =~ ^[1-9][0-9]*$ ]] || return 1
+  fm_pr_comment_id_valid "$comment" || return 1
+  # Consumed by bin/fm-watch.sh, which dedupes and reports the decline.
+  # shellcheck disable=SC2034
+  FM_PR_DECLINE_NUMBER=$number
+  # shellcheck disable=SC2034
+  FM_PR_DECLINE_COMMENT=$comment
+}
+
+# Seen-record layout: version tag, the pull request URL, the comment identifier.
+fm_pr_decline_seen_parse() {
+  local file=$1 version url comment _extra
+  FM_PR_DECLINE_SEEN_URL=
+  FM_PR_DECLINE_SEEN_COMMENT=
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  exec 5< "$file" || return 1
+  IFS= read -r version <&5 || { exec 5<&-; return 1; }
+  IFS= read -r url <&5 || { exec 5<&-; return 1; }
+  IFS= read -r comment <&5 || { exec 5<&-; return 1; }
+  if IFS= read -r _extra <&5; then
+    exec 5<&-
+    return 1
+  fi
+  exec 5<&-
+  [ "$version" = fm-pr-decline-seen-v1 ] || return 1
+  fm_pr_url_parse "$url" || return 1
+  fm_pr_comment_id_valid "$comment" || return 1
+  FM_PR_DECLINE_SEEN_URL=$FM_PR_URL
+  FM_PR_DECLINE_SEEN_COMMENT=$comment
+}
+
+# 0 only when this exact comment on this exact pull request was already
+# delivered. Every other outcome - no record, an unreadable record, a record for
+# another pull request or another comment - reports "not delivered", so a
+# damaged record costs a repeated relay rather than a silently dropped captain
+# instruction.
+fm_pr_decline_already_delivered() {
+  local state=$1 id=$2 url=$3 comment=$4 seen state_device
+  fm_pr_task_id_valid "$id" || return 1
+  fm_pr_comment_id_valid "$comment" || return 1
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  state_device=$(fm_pr_file_device "$state") || return 1
+  seen="$state/$id.pr-decline-seen"
+  [ -e "$seen" ] || [ -L "$seen" ] || return 1
+  fm_pr_private_file_valid "$seen" 600 "$state_device" || return 1
+  fm_pr_decline_seen_parse "$seen" || return 1
+  [ "$FM_PR_DECLINE_SEEN_URL" = "$url" ] || return 1
+  [ "$FM_PR_DECLINE_SEEN_COMMENT" = "$comment" ]
+}
+
+fm_pr_decline_seen_record() {
+  local state=$1 id=$2 url=$3 comment=$4 seen state_device tmp
+  fm_pr_task_id_valid "$id" || return 1
+  fm_pr_url_parse "$url" || return 1
+  [ "$FM_PR_URL" = "$url" ] || return 1
+  fm_pr_comment_id_valid "$comment" || return 1
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  state_device=$(fm_pr_file_device "$state") || return 1
+  seen="$state/$id.pr-decline-seen"
+  fm_pr_regular_destination_on_device_or_absent "$seen" "$state_device" || return 1
+  umask 077
+  tmp=$(mktemp "$state/.fm-pr-decline-seen.XXXXXX") || return 1
+  if ! printf '%s\n%s\n%s\n' fm-pr-decline-seen-v1 "$url" "$comment" > "$tmp" \
+    || ! chmod 0600 "$tmp" \
+    || ! fm_pr_private_file_valid "$tmp" 600 "$state_device" \
+    || ! fm_pr_decline_seen_parse "$tmp" \
+    || [ "$FM_PR_DECLINE_SEEN_URL" != "$url" ] \
+    || [ "$FM_PR_DECLINE_SEEN_COMMENT" != "$comment" ] \
+    || ! fm_pr_regular_destination_on_device_or_absent "$seen" "$state_device" \
+    || ! mv -f -- "$tmp" "$seen"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  fm_pr_decline_already_delivered "$state" "$id" "$url" "$comment"
 }
