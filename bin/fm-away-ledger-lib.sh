@@ -317,10 +317,10 @@ _away_ledger_chat_effective_id() {  # <state> <recorded-id> <requested-id>
 # forward untouched for the same batch, so this transition can only ever add
 # information about what is in flight.
 away_ledger_chat_mark_attempt() {  # <state> <batch-id> <from> <to>
-  local state=$1 id=$2 from=$3 to=$4 rec rid rconfirmed rfrom rto confirmed
+  local state=$1 id=$2 from=$3 to=$4 rec rid rconfirmed confirmed
   away_ledger_is_count "$from" "$to" || return 1
   rec=$(_away_ledger_chat_parse "$state")
-  IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
+  IFS=' ' read -r rid rconfirmed _ _ <<< "$rec"
   id=$(_away_ledger_chat_effective_id "$state" "$rid" "$id")
   case "$id" in
     ''|none|*[!0-9a-zA-Z-]*) return 1 ;;
@@ -335,10 +335,10 @@ away_ledger_chat_mark_attempt() {  # <state> <batch-id> <from> <to>
 # A verified submit advances the confirmed prefix and closes the attempt. The
 # advance is monotonic: a stale or smaller count can never walk it back.
 away_ledger_chat_mark_confirmed() {  # <state> <batch-id> <to>
-  local state=$1 id=$2 to=$3 rec rid rconfirmed rfrom rto confirmed
+  local state=$1 id=$2 to=$3 rec rid rconfirmed confirmed
   away_ledger_is_count "$to" || return 1
   rec=$(_away_ledger_chat_parse "$state")
-  IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
+  IFS=' ' read -r rid rconfirmed _ _ <<< "$rec"
   id=$(_away_ledger_chat_effective_id "$state" "$rid" "$id")
   case "$id" in
     ''|none|*[!0-9a-zA-Z-]*) return 1 ;;
@@ -358,9 +358,9 @@ away_ledger_chat_mark_confirmed() {  # <state> <batch-id> <to>
 # whichever batch the receipt itself names, so an unreadable ledger over-reports
 # only the lines chat has NOT been shown.
 away_ledger_chat_delivered() {  # <state> [batch-id]
-  local rec rid rconfirmed rfrom rto
+  local rec rid rconfirmed
   rec=$(_away_ledger_chat_parse "$1")
-  IFS=' ' read -r rid rconfirmed rfrom rto <<< "$rec"
+  IFS=' ' read -r rid rconfirmed _ _ <<< "$rec"
   [ "$rid" != none ] || { printf '0\n'; return 0; }
   case "${2:-}" in
     ''|none) ;;
@@ -531,12 +531,12 @@ away_ledger_reserve() {  # <buf> <reserved> <delivery-id>
 # a fresh evidence record) on every housekeeping tick.
 away_ledger_release() {  # <buf> <reserved> <delivery-id> [retry-delay-secs]
   local buf=$1 reserved=$2 did=$3 delay=${4:-0}
-  local rec id r c a attempt retry current
+  local rec id c a attempt retry current
   away_ledger_is_count "$reserved" || return 1
   away_ledger_is_count "$delay" || delay=0
   rec=$(away_ledger_read "$buf")
   [ "$rec" != unknown ] || return 1
-  IFS=' ' read -r id r c a attempt retry current <<< "$rec"
+  IFS=' ' read -r id _ c a attempt retry current <<< "$rec"
   [ -n "$did" ] || did=$current
   [ "$reserved" -ge "$c" ] || reserved=$c
   retry=0
@@ -1017,6 +1017,7 @@ _away_ledger_unit_matches_version() {  # <state> <buf> <wedge> <version-dir>
   digest_dir=$(away_ledger_digest_dir "$state")
   if [ -d "$vdir/tg-away-digest" ]; then
     [ -d "$digest_dir" ] || return 1
+    # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
     [ "$(cd "$vdir/tg-away-digest" && ls -1 2>/dev/null | sort)" \
       = "$(cd "$digest_dir" && ls -1 2>/dev/null | sort)" ] || return 1
   else
@@ -1137,7 +1138,7 @@ _away_ledger_transact_locked() {  # <state> <buf> <wedge> <mutator> [args...]
   # already collapses identical lines.
   if [ -n "$previous" ] && [ "$previous" != "$name" ] \
     && [ -d "$dir/$previous" ]; then
-    rm -rf -- "$dir/$previous" 2>/dev/null || true
+    rm -rf -- "${dir:?}/${previous:?}" 2>/dev/null || true
   fi
   return 0
 }

@@ -512,15 +512,17 @@ ledger_field() {
 # reach the phone without those, so tests go through the same door.
 away_deliver() {
   local home=$1 state=$2 tg_bin=${3:-} fake_exit=${4:-0}
-  local buf rec id reserved confirmed accounted did n pending
+  local buf rec id reserved accounted did n pending
   buf="$state/.subsuper-escalations"
   rec=$(away_ledger_read "$buf")
-  IFS=' ' read -r id reserved confirmed accounted did <<< "$rec"
+  IFS=' ' read -r id reserved _ accounted did <<< "$rec"
   n=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
   pending=$(tail -n "+$((reserved + 1))" "$buf" 2>/dev/null \
     | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
   (
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FMTG_TG_BIN="$tg_bin" FAKE_TG_EXIT="$fake_exit"
     telegram_away_deliver "$state" "$pending" "$reserved" "$n" "$accounted" "$id"
   )
@@ -608,6 +610,7 @@ test_away_delivery_failure_classes_and_safe_chat_fallback() {
   escalate_add "$state" 'blocked: safe fallback required'
   injected="$home/injected.log"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
@@ -630,6 +633,7 @@ test_away_delivery_acceptance_does_not_duplicate_alert_in_chat() {
   injected="$home/injected.log"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -660,6 +664,7 @@ test_away_batch_never_resends_accepted_events() {
   printf 'stale persisted 300s (possible wedge): fm-task-3\n' > "$state/.subsuper-escalations"
   printf '1700000010\n' > "$state/.subsuper-escalations.since"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -671,6 +676,7 @@ test_away_batch_never_resends_accepted_events() {
   printf 'needs-decision: approve privileged cutover\n' >> "$state/.subsuper-escalations"
   cp "$state/.subsuper-escalations" "$home/expected-items.txt"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -710,12 +716,14 @@ test_away_batch_never_resends_accepted_events() {
   printf 'blocked: credential needed\n' > "$state/.subsuper-escalations"
   printf '1700000020\n' > "$state/.subsuper-escalations.since"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
   ) && fail "a wedged receipt must leave the second batch unconfirmed"
   printf 'paused 600s (awaiting external): fm-task-9\n' >> "$state/.subsuper-escalations"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 escalate_flush "$state"
@@ -738,6 +746,7 @@ test_away_unusable_bookkeeping_never_sends_to_the_phone() {
   printf 'not-a-batch record here\n' > "$state/.subsuper-escalations.since"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -774,6 +783,7 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
   chmod 0600 "$state/tg-away-delivery/$did.status"
   printf '1700000030-abcdef0123456789 1 0 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -794,6 +804,7 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
   chmod 0600 "$state/tg-away-delivery/$did.status"
   printf '1700000035-abcdef0123456789 1 0 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -808,6 +819,7 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
   printf 'blocked: crashed before the send\n' > "$state/.subsuper-escalations"
   printf '1700000040-fedcba9876543210 1 0 0 0 0 none\n' > "$state/.subsuper-escalations.since"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -830,6 +842,7 @@ test_away_off_mid_batch_never_repeats_delivered_events() {
   injected="$home/injected.log"
   escalate_add "$state" 'blocked: already on the phone'
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -840,6 +853,7 @@ test_away_off_mid_batch_never_repeats_delivered_events() {
   rm "$home/config/telegram-mode"
   escalate_add "$state" 'blocked: after the opt-out'
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -1136,21 +1150,25 @@ test_away_every_transition_goes_through_the_version_transaction() {
   body=$(fn_body "$daemon" escalate_add)
   assert_contains "$body" 'away_ledger_append' \
     "the daemon's escalation append must be a version transition"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
   assert_not_contains "$body" '>> "$buf"' \
     "the daemon must not append straight into the live escalation buffer"
 
   body=$(fn_body "$daemon" escalate_flush)
   assert_contains "$body" 'away_ledger_truncate' \
     "the in-session truncation must be a version transition"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
   assert_not_contains "$body" ': > "$buf"' \
     "the daemon must not truncate the live escalation buffer directly"
 
   body=$(fn_body "$daemon" inject_wedge_alarm)
   assert_contains "$body" 'away_ledger_wedge_record' \
     "the wedge evidence must be a version transition"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
   assert_not_contains "$body" '> "$marker"' \
     "the daemon must not write the live wedge marker directly"
 
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
   body=$(grep -nE '>>?[[:space:]]*"\$state/\.subsuper-(escalations|inject-wedged|chat-delivery)' "$daemon" || true)
   [ -z "$body" ] || fail "no live away artifact may be written outside the transaction: $body"
   pass "every ledger transition commits a successor version and no live write remains"
@@ -1346,7 +1364,9 @@ test_away_refused_append_keeps_the_wake_re_derivable() {
   seen="$state/.subsuper-seen-status-t1"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     away_ledger_append() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     handle_wake "signal: $state/t1.status" "$state"
   ) >/dev/null 2>&1
@@ -1355,6 +1375,7 @@ test_away_refused_append_keeps_the_wake_re_derivable() {
   [ ! -s "$state/.subsuper-escalations" ] \
     || fail "a refused append must leave nothing buffered"
 
+  # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
   ( log() { :; }; handle_wake "signal: $state/t1.status" "$state" ) >/dev/null 2>&1
   assert_grep 'the captain must decide' "$state/.subsuper-escalations" \
     "the retried wake must buffer the escalation the refused append dropped"
@@ -1377,8 +1398,11 @@ test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate() {
     || fail "the append must succeed"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) && fail "a failed truncation must still be reported as a flush failure"
@@ -1388,7 +1412,9 @@ test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate() {
     || fail "a confirmed submit must be recorded in the unit before the truncation"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) || fail "the retry must settle the batch once the truncation can land"
@@ -1417,8 +1443,11 @@ test_away_confirmed_chat_prefix_survives_a_growing_batch() {
     || fail "the first append must succeed"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) && fail "a failed truncation must still be reported as a flush failure"
@@ -1426,7 +1455,9 @@ test_away_confirmed_chat_prefix_survives_a_growing_batch() {
   escalate_add "$state" 'blocked: second event arriving after the confirmed submit' \
     || fail "the append onto the confirmed batch must succeed"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) || fail "the grown batch must still flush"
@@ -1455,8 +1486,11 @@ test_away_failed_inject_never_lowers_the_confirmed_chat_prefix() {
     || fail "the first append must succeed"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) && fail "a failed truncation must still be reported as a flush failure"
@@ -1464,7 +1498,9 @@ test_away_failed_inject_never_lowers_the_confirmed_chat_prefix() {
   escalate_add "$state" 'blocked: second event arriving after the confirmed submit' \
     || fail "the append onto the confirmed batch must succeed"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) && fail "a refused inject must be reported as a flush failure"
@@ -1472,7 +1508,9 @@ test_away_failed_inject_never_lowers_the_confirmed_chat_prefix() {
     || fail "an attempt that failed to submit must not lower the confirmed prefix"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) || fail "the retry after a refused inject must settle the batch"
@@ -1499,8 +1537,11 @@ test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix() {
     || fail "the first append must succeed"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) && fail "a failed truncation must still be reported as a flush failure"
@@ -1509,7 +1550,9 @@ test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix() {
     || fail "the append onto the confirmed batch must succeed"
   printf 'garbage\n' > "$buf.since"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) || fail "an unreadable ledger must still flush to the in-session fallback"
@@ -1541,8 +1584,11 @@ test_away_first_chat_delivery_under_a_corrupt_ledger_opens_a_receipt() {
   printf 'garbage\n' > "$buf.since"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) && fail "a failed truncation must still be reported as a flush failure"
@@ -1552,7 +1598,9 @@ test_away_first_chat_delivery_under_a_corrupt_ledger_opens_a_receipt() {
   escalate_add "$state" 'blocked: second event under an unreadable ledger' \
     || fail "the append onto the delivered batch must succeed"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     log() { :; }
     escalate_flush "$state"
   ) || fail "the retry must settle the batch"
@@ -1681,6 +1729,7 @@ test_away_only_the_owner_writes_the_version_store() {
     "$ROOT/bin" 2>/dev/null | grep -v '/fm-away-ledger-lib\.sh:' | grep -v '^[^:]*:[0-9]*:#' || true)
   [ -z "$hits" ] \
     || fail "only the away ledger owner may write the version store: $hits"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
   hits=$(grep -rn -E 'away_ledger_read "\$(vdir|staging)' "$ROOT/bin" 2>/dev/null || true)
   [ -z "$hits" ] \
     || fail "the migrating record read must never be pointed at a version or staging directory: $hits"
@@ -1828,6 +1877,7 @@ test_away_uncertain_send_stops_the_batch_from_reaching_the_phone() {
 
   escalate_add "$state" 'blocked: first event, response lost'
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 escalate_flush "$state"
@@ -1838,6 +1888,7 @@ test_away_uncertain_send_stops_the_batch_from_reaching_the_phone() {
 
   escalate_add "$state" 'blocked: second event after the uncertainty'
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -1872,6 +1923,7 @@ test_away_client_exit_125_is_never_proven_local() {
   escalate_add "$state" 'blocked: client exited 125 after issuing the request'
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" FAKE_TG_EXIT=125 escalate_flush "$state"
@@ -1885,6 +1937,7 @@ test_away_client_exit_125_is_never_proven_local() {
     "a client exit 125 must never be reported as a proven-local failure"
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -1905,7 +1958,9 @@ test_away_delivery_refuses_untracked_sends() {
   escalate_add "$state" 'blocked: needs the ledger'
 
   out=$(
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FMTG_TG_BIN="$tg"
     telegram_away_deliver "$state" 'blocked: needs the ledger'
   )
@@ -1913,7 +1968,9 @@ test_away_delivery_refuses_untracked_sends() {
     || fail "a send without ledger arguments must refuse (got: $out)"
 
   out=$(
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FMTG_TG_BIN="$tg"
     telegram_away_deliver "$state" 'blocked: needs the ledger' 0 1 0 not-this-batch
   )
@@ -1922,7 +1979,9 @@ test_away_delivery_refuses_untracked_sends() {
 
   rm -f "$state/.subsuper-escalations.since"
   out=$(
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
     export FMTG_TG_BIN="$tg"
     telegram_away_deliver "$state" 'blocked: needs the ledger' 0 1 0 1700000000-abcdef0123456789
   )
@@ -1949,6 +2008,7 @@ test_away_proven_local_failure_retries_the_same_lines() {
   # The client is not runnable yet, and the in-session receipt is wedged too, so
   # the batch survives with its ledger.
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FM_TG_AWAY_RETRY_SECS=3600 FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
@@ -1956,6 +2016,7 @@ test_away_proven_local_failure_retries_the_same_lines() {
   assert_absent "$home/tg-sent.log" "a missing client cannot have sent anything"
   ledger_field "$state" 2 0 "a proven-local failure must release its reservation"
   ledger_field "$state" 5 1 "a proven-local failure must retire its attempt"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
   first_evidence=$(ls "$state/tg-away-delivery"/*.status | head -n 1)
   grep -Eq '^unavailable [0-9]+ sender_missing$' "$first_evidence" \
     || fail "the retired attempt must keep its durable evidence"
@@ -1963,6 +2024,7 @@ test_away_proven_local_failure_retries_the_same_lines() {
   # The retry is scheduled, not immediate: while the backoff is unelapsed the flush
   # neither contacts the phone nor mints another evidence record.
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FM_TG_AWAY_RETRY_SECS=3600 FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -1970,6 +2032,7 @@ test_away_proven_local_failure_retries_the_same_lines() {
   assert_absent "$home/tg-sent.log" "a deferred retry must not contact the phone"
   assert_grep 'Telegram delivery deferred' "$injected" \
     "a deferred retry must say so in the in-session fallback"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
   [ "$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')" -eq 1 ] \
     || fail "a deferred retry must not mint another evidence record per tick"
   ledger_field "$state" 5 1 "a deferred retry must not advance the attempt ordinal"
@@ -1982,6 +2045,7 @@ test_away_proven_local_failure_retries_the_same_lines() {
   away_ledger_write "$state/.subsuper-escalations" "$1" "$2" "$3" "$4" "$5" 0 "$7" \
     || fail "could not elapse the retry schedule"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -2011,7 +2075,9 @@ test_away_delivery_refuses_malformed_counts() {
   malformed_refused() {  # <label> <offset> <total> <accounted>
     local label=$1 out
     out=$(
+      # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
       export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+      # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
       export FMTG_TG_BIN="$tg"
       telegram_away_deliver "$state" 'blocked: must not slip through' \
         "$2" "$3" "$4" "$batch_id" 2>&1
@@ -2050,6 +2116,7 @@ test_away_unwritable_ledger_leaves_the_id_retryable() {
   # cannot be recorded.
   chmod 0500 "$state"
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -2065,6 +2132,7 @@ test_away_unwritable_ledger_leaves_the_id_retryable() {
 
   # Writable again: the same lines must now reach the phone.
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FMTG_TG_BIN="$tg" escalate_flush "$state"
@@ -2120,6 +2188,7 @@ test_away_retry_throttle_survives_immediate_batching() {
   escalate_add "$state" 'blocked: client offline under immediate batching'
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FM_ESCALATE_BATCH_SECS=0 FM_TG_AWAY_RETRY_SECS=0 \
@@ -2129,9 +2198,11 @@ test_away_retry_throttle_survives_immediate_batching() {
   retry_after=$(away_ledger_read "$state/.subsuper-escalations" | cut -d' ' -f6)
   [ "$retry_after" -gt 0 ] \
     || fail "a retired proven-local attempt must arm a positive retry schedule (got: $retry_after)"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
   evidence_count=$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')
 
   (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
     FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
       FM_ESCALATE_BATCH_SECS=0 FM_TG_AWAY_RETRY_SECS=0 \
@@ -2141,6 +2212,7 @@ test_away_retry_throttle_survives_immediate_batching() {
   assert_grep 'Telegram delivery deferred' "$injected" \
     "an armed retry schedule must defer the next tick's attempt"
   assert_absent "$home/tg-sent.log" "a deferred tick must not contact the phone"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
   [ "$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')" -eq "$evidence_count" ] \
     || fail "a deferred tick must not mint another evidence record"
   pass "the proven-local retry schedule stays bounded under immediate batching"
