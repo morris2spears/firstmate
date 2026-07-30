@@ -23,6 +23,7 @@ Routine per-tool failures carry the same `isError` flag but are not turn-level f
 `.pi/extensions/lib/fm-calm-operational-user-layout.ts` renders canonically classified text-only Firstmate operational user rows at zero height.
 `.pi/extensions/lib/fm-calm-nonconversation-layout.ts` renders the remaining non-conversation rows at zero height through one probed seam each: `SkillInvocationMessageComponent`, `CompactionSummaryMessageComponent`, `BranchSummaryMessageComponent`, and `CustomMessageComponent` prototype renders, plus `InteractiveMode.addCustomEntryToChat` and `InteractiveMode.addCacheMissNotice` for the rows Pi builds without an exported class.
 It also replaces the standalone spacer `InteractiveMode.addMessageToChat` adds beside a compaction summary, a branch summary, or a skill invocation, so a hidden row leaves no blank line; a render adapter that failed to install keeps its own spacer.
+Each replaced spacer resolves its row's hide policy from the shared registry by export name on every render, so a spacer wrapped by an earlier module instance still follows the live policy after an extension reload.
 `bin/fm-operational-input.sh` remains the single owner of operational-input construction and parsing.
 The seven built-in definitions and `fm_watch_arm_pi` retain per-renderer zero-height behavior as an independent fallback if the complete tool-row adapter is unavailable.
 
@@ -93,6 +94,7 @@ ok - Pi calm compatibility evidence never rejects a Pi version for being newer t
 ok - a missing collapsed-thinking presentation API degrades only that Calm adapter with a clear skip reason, while the rest of Calm still registers
 ok - missing Pi presentation class exports and error-surface seams reach the independent adapter degradation path
 ok - reloading the Calm adapters keeps actionable tool errors scoped to one assistant turn without stacking Pi wrappers
+ok - a hidden row's leading spacer follows the live Calm policy across extension reloads
 ok - Pi calm centralizes transcript visibility, preserves execution/export data, hides working activity, and persists its choice across session starts
 ok - Pi operational follow-up E2E processes exact user-role notifications once while Calm hides current and adjacent rows, Calm off and absent render them, and restart preserves semantics
 ok - Pi Calm native /skill:ahoy geometry keeps every thinking, tool, and skill-invocation block at zero height while preserving the captain's own message, history, restart, and Calm-off rendering
