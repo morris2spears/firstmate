@@ -221,30 +221,33 @@ return_reconcile() {
   fi
 
   scan_open_blockers > "$blockers"
-  # Retirement is part of acknowledgement, so it is attempted BEFORE the gate can
-  # close and a failure gates the catch-up exactly like an unresolved blocker.
-  # Re-running is safe and does not duplicate: the gate preserves this evidence
-  # and append_evidence dedupes exact records, so the next pass folds the same
+  # This pass's folded evidence is made durable in the gate BEFORE anything is
+  # retired, so a gate write that fails can never leave freshly folded escalation
+  # text deleted from disk and recorded nowhere. Only once the gate holds it is
+  # retirement attempted, and retirement is itself part of acknowledgement: a
+  # failure keeps the gate open exactly like an unresolved blocker. Re-running is
+  # safe and does not duplicate - the gate preserves this evidence and
+  # append_evidence dedupes exact records, so the next pass folds the same
   # surviving version into the same records it already published.
-  if [ "$lifecycle_ok" -eq 1 ] && [ ! -s "$blockers" ] && ! clear_delivery_artifacts; then
+  write_gate "$evidence" "$blockers" || { rm -f "$evidence" "$blockers"; return 1; }
+  if [ "$lifecycle_ok" -eq 1 ] && [ ! -s "$blockers" ]; then
+    if clear_delivery_artifacts; then
+      print_evidence "$evidence"
+      rm -f "$GATE"
+      rm -f "$evidence" "$blockers"
+      printf 'fm-afk-return: catch-up clear; ordinary captain work may proceed\n'
+      return 0
+    fi
     append_evidence lifecycle 'away batch records could not be retired; retry catch-up before ordinary work' "$evidence"
     lifecycle_ok=0
-  fi
-  if [ "$lifecycle_ok" -ne 1 ] || [ -s "$blockers" ]; then
     write_gate "$evidence" "$blockers" || { rm -f "$evidence" "$blockers"; return 1; }
-    printf 'fm-afk-return: catch-up must finish before the captain request\n' >&2
-    print_evidence "$GATE" >&2
-    print_blockers "$GATE" >&2
-    printf 'fm-afk-return: handle each blocker now, or close it with resolved [key=...] and append a durable reclassification reason, then run bin/fm-afk-return.sh check\n' >&2
-    rm -f "$evidence" "$blockers"
-    return 3
   fi
-
-  print_evidence "$evidence"
-  rm -f "$GATE"
+  printf 'fm-afk-return: catch-up must finish before the captain request\n' >&2
+  print_evidence "$GATE" >&2
+  print_blockers "$GATE" >&2
+  printf 'fm-afk-return: handle each blocker now, or close it with resolved [key=...] and append a durable reclassification reason, then run bin/fm-afk-return.sh check\n' >&2
   rm -f "$evidence" "$blockers"
-  printf 'fm-afk-return: catch-up clear; ordinary captain work may proceed\n'
-  return 0
+  return 3
 }
 
 main() {

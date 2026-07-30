@@ -165,6 +165,13 @@ fm_afk_start_main() {
         "$FM_AFK_STATE/.subsuper-escalations" \
         "$FM_AFK_STATE/.subsuper-inject-wedged" >/dev/null; then
       echo "afk: could not capture the prior away batch as an immutable version; refusing to clear it" >&2
+      # Away mode never actually started, so roll back the flag THIS invocation
+      # wrote rather than leaving the system flagged away with no daemon
+      # supervising it. A flag that predates this call belongs to the session
+      # already in progress and is left alone.
+      if [ "$had_afk" -eq 0 ]; then
+        rm -f "$FM_AFK_STATE/.afk" 2>/dev/null || true
+      fi
       return 1
     fi
     fm_afk_clear_stale_artifacts "$FM_AFK_STATE" "$had_afk"

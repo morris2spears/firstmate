@@ -1097,6 +1097,242 @@ test_away_no_adoption_or_merge_apis_remain() {
   pass "no adoption or per-file merge API survives in bin/"
 }
 
+# fn_body <file> <function-name>: the source text of one shell function, so a
+# structural assertion can be made about that function alone rather than about a
+# whole file.
+fn_body() {
+  awk -v fn="$2() {" 'index($0, fn) == 1 { f = 1 } f { print } f && /^}$/ { exit }' "$1"
+}
+
+# Structural, not behavioural: EVERY ledger transition must go through the version
+# transaction, and no transition may write a legacy live path as its source of
+# truth. Behaviour tests below prove the transaction works; this one proves nothing
+# quietly bypasses it.
+test_away_every_transition_goes_through_the_version_transaction() {
+  local lib daemon body fn
+  lib="$ROOT/bin/fm-away-ledger-lib.sh"
+  daemon="$ROOT/bin/fm-supervise-daemon.sh"
+
+  for fn in away_ledger_write away_ledger_append away_ledger_truncate \
+    away_ledger_wedge_record away_ledger_wedge_clear away_ledger_digest_record; do
+    body=$(fn_body "$lib" "$fn")
+    [ -n "$body" ] || fail "$fn must exist as an owner transition"
+    assert_contains "$body" 'away_ledger_transact' \
+      "$fn must commit a successor version through away_ledger_transact"
+  done
+
+  # The reservation, acceptance and retry-state transitions reach the transaction
+  # through the single record-write path.
+  for fn in away_ledger_reserve away_ledger_confirm away_ledger_release \
+    away_ledger_transition; do
+    body=$(fn_body "$lib" "$fn")
+    [ -n "$body" ] || fail "$fn must exist as an owner transition"
+    case "$body" in
+      *away_ledger_write*|*away_ledger_transition*) ;;
+      *) fail "$fn must route its record change through away_ledger_write" ;;
+    esac
+  done
+
+  body=$(fn_body "$daemon" escalate_add)
+  assert_contains "$body" 'away_ledger_append' \
+    "the daemon's escalation append must be a version transition"
+  assert_not_contains "$body" '>> "$buf"' \
+    "the daemon must not append straight into the live escalation buffer"
+
+  body=$(fn_body "$daemon" escalate_flush)
+  assert_contains "$body" 'away_ledger_truncate' \
+    "the in-session truncation must be a version transition"
+  assert_not_contains "$body" ': > "$buf"' \
+    "the daemon must not truncate the live escalation buffer directly"
+
+  body=$(fn_body "$daemon" inject_wedge_alarm)
+  assert_contains "$body" 'away_ledger_wedge_record' \
+    "the wedge evidence must be a version transition"
+  assert_not_contains "$body" '> "$marker"' \
+    "the daemon must not write the live wedge marker directly"
+
+  body=$(grep -nE '>>?[[:space:]]*"\$state/\.subsuper-(escalations|inject-wedged)' "$daemon" || true)
+  [ -z "$body" ] || fail "no live away artifact may be written outside the transaction: $body"
+  pass "every ledger transition commits a successor version and no live write remains"
+}
+
+# The append transition: the line is durable in a published version, the active
+# pointer names it, and the live buffer is that version's projection.
+test_away_append_transition_publishes_and_projects() {
+  local home state buf name
+  home=$(make_home away-append-transition)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+
+  escalate_add "$state" 'blocked: first event' || fail "the append transition must succeed"
+  escalate_add "$state" 'blocked: second event' || fail "the second append must succeed"
+
+  name=$(cat "$state/tg-away-versions/active" 2>/dev/null)
+  [ -n "$name" ] || fail "an append must leave an active version"
+  [ "$(cat "$state/tg-away-versions/active.applied")" = "$name" ] \
+    || fail "an applied append must record the version it projected"
+  [ "$(cat "$buf")" = "$(cat "$state/tg-away-versions/$name/escalations")" ] \
+    || fail "the live buffer must be the active version's projection"
+  assert_grep 'blocked: second event' "$state/tg-away-versions/$name/escalations" \
+    "the appended line must be durable in the published version"
+  [ "$(away_ledger_version_names "$state" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "a superseded predecessor must be retired by its successor"
+  pass "the append transition publishes a successor version and projects it live"
+}
+
+# The reservation, acceptance, digest and accounted transitions each publish their
+# own successor version, and the digest item and the count that accounts for it
+# land in the SAME version.
+test_away_record_and_digest_transitions_publish_versions() {
+  local home state buf name rec
+  home=$(make_home away-record-transition)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+  escalate_add "$state" 'blocked: needs the captain' || fail "the append must succeed"
+
+  away_ledger_reserve "$buf" 1 d-1 || fail "the reservation transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  rec=$(away_ledger_peek "$state/tg-away-versions/$name/escalations")
+  case "$rec" in
+    *' 1 0 0 0 0 d-1') ;;
+    *) fail "the reservation must be durable in its own successor version: $rec" ;;
+  esac
+
+  away_ledger_confirm "$buf" 0 1 d-1 || fail "the acceptance transition must succeed"
+  away_ledger_digest_record "$state" "$buf" d-1 0 1 \
+    || fail "the digest transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  assert_grep 'blocked: needs the captain' \
+    "$state/tg-away-versions/$name/tg-away-digest/d-1.items" \
+    "the digest item must be durable in the successor version"
+  rec=$(away_ledger_peek "$state/tg-away-versions/$name/escalations")
+  case "$rec" in
+    *' 1 1 1 0 0 d-1') ;;
+    *) fail "the accounted count must land in the same version as its digest: $rec" ;;
+  esac
+  assert_grep 'blocked: needs the captain' "$state/tg-away-digest/d-1.items" \
+    "the live digest directory must be the version's projection"
+  pass "record and digest transitions each publish a successor version"
+}
+
+# The wedge evidence and the in-session truncation are transitions too: the
+# truncation empties the buffer and drops the record and the wedge marker as ONE
+# version, so no half-retired unit is ever published or projected.
+test_away_wedge_and_truncate_transitions_publish_versions() {
+  local home state buf name
+  home=$(make_home away-wedge-transition)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+  escalate_add "$state" 'blocked: wedged event' || fail "the append must succeed"
+
+  printf 'fm away-mode inject WEDGED: 900s undelivered\n' \
+    | away_ledger_wedge_record "$state" || fail "the wedge transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  assert_grep 'WEDGED: 900s' "$state/tg-away-versions/$name/wedge" \
+    "the wedge evidence must be durable in the successor version"
+  assert_grep 'WEDGED: 900s' "$state/.subsuper-inject-wedged" \
+    "the live wedge marker must be the version's projection"
+
+  away_ledger_truncate "$buf" || fail "the truncate transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  [ ! -s "$buf" ] || fail "the truncation must empty the live buffer"
+  assert_absent "$buf.since" "the truncation must drop the live record"
+  assert_absent "$state/.subsuper-inject-wedged" \
+    "the truncation must drop the live wedge marker"
+  assert_absent "$state/tg-away-versions/$name/escalations.since" \
+    "the successor version must hold the retired record state"
+  pass "the wedge and truncate transitions publish successor versions"
+}
+
+# An unreadable predecessor record must be quarantined as immutable evidence, not
+# treated as a publication failure: away-mode entry can never be wedged by
+# bookkeeping nobody can parse, and no owed line is dropped.
+test_away_unparseable_record_is_quarantined_not_fatal() {
+  local home state buf version out
+  home=$(make_home away-unparseable-record)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: owed, with an unreadable record\n' > "$buf"
+  : > "$buf.since"
+
+  version=$(away_ledger_entry_capture "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "an unparseable record must never wedge an away entry"
+  assert_grep 'owed, with an unreadable record' \
+    "$state/tg-away-versions/$version/escalations" \
+    "the quarantined version must still hold every owed line"
+  [ -e "$state/tg-away-versions/$version/escalations.since" ] \
+    || fail "the malformed record itself must be quarantined as evidence"
+  [ ! -s "$buf.since" ] || fail "the live record must be left exactly as found"
+
+  away_ledger_retire_batch "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    || fail "the entry clear must succeed"
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding a quarantined version must succeed"
+  assert_contains "$out" 'owed, with an unreadable record' \
+    "an unreadable record must make the fold over-report, never drop a line"
+  pass "an unparseable predecessor record is quarantined instead of wedging entry"
+}
+
+# A pointer left aiming at a version that is gone would otherwise refuse every
+# later apply, and so every away entry, for good.
+test_away_gc_clears_a_dangling_active_pointer() {
+  local home state buf
+  home=$(make_home away-dangling-pointer)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  (umask 077; mkdir -p "$state/tg-away-versions")
+  printf 'v.1700000000-gone\n' > "$state/tg-away-versions/active"
+  printf 'v.1700000000-gone\n' > "$state/tg-away-versions/active.applied"
+
+  away_ledger_version_gc "$state" || fail "the sweep must succeed"
+  assert_absent "$state/tg-away-versions/active" \
+    "a pointer naming a version that is gone must be cleared"
+  assert_absent "$state/tg-away-versions/active.applied" \
+    "an applied pointer naming a version that is gone must be cleared"
+  away_ledger_version_apply_pending "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    || fail "away entry must not stay wedged once the dangling pointer is cleared"
+  pass "the sweep clears a dangling pointer instead of wedging every away entry"
+}
+
+# Mutual exclusion is what stops a publish interleaving with a materialise, so a
+# stale-lock reclaim must never remove a lock a NEW owner has since taken - the
+# double-remove race two reclaimers that saw the same dead holder would hit.
+test_away_store_lock_steal_never_removes_a_new_owner() {
+  local home state dir lock dead
+  home=$(make_home away-lock-steal)
+  state="$home/state"
+  dir="$state/tg-away-versions"
+  (umask 077; mkdir -p "$dir")
+  lock="$dir/.owner.lock"
+
+  # A holder that is provably gone is reclaimed.
+  dead=$(bash -c 'echo $$')
+  while kill -0 "$dead" 2>/dev/null; do dead=$((dead + 1)); done
+  mkdir "$lock"
+  printf '%s\n' "$dead" > "$lock/pid"
+  _away_ledger_lock_steal "$lock" "$dead"
+  assert_absent "$lock" "a lock whose holder is provably gone must be reclaimed"
+
+  # The loser of the steal race re-reads the holder and must leave the new owner
+  # alone, even though it decided to reclaim while observing the dead one.
+  mkdir "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+  _away_ledger_lock_steal "$lock" "$dead"
+  assert_present "$lock" "a reclaim must never remove a lock a new owner holds"
+  [ "$(cat "$lock/pid")" = "$$" ] || fail "the new owner's lock identity was replaced"
+  assert_absent "$lock.steal" "the steal lock must not be left behind"
+  rm -rf "$lock"
+
+  away_ledger_lock_acquire "$dir" || fail "acquiring the store lock must succeed"
+  [ "$(cat "$lock/pid")" = "$$" ] || fail "the acquired lock must record its holder"
+  away_ledger_lock_release "$dir"
+  assert_absent "$lock" "releasing the store lock must remove it"
+  pass "a stale store-lock reclaim can never hand the store to two owners"
+}
+
 # Enforcement, not behaviour: the version store has exactly one writer, and the
 # migrating record read is never pointed at a version or staging directory. Both
 # are the invariants the immutability of a published version rests on, so they are
@@ -1634,6 +1870,13 @@ test_away_version_switch_is_refused_while_a_daemon_is_live
 test_away_version_switch_installs_the_whole_unit_and_replays
 test_away_fold_versions_emits_each_escalation_once
 test_away_no_adoption_or_merge_apis_remain
+test_away_every_transition_goes_through_the_version_transaction
+test_away_append_transition_publishes_and_projects
+test_away_record_and_digest_transitions_publish_versions
+test_away_wedge_and_truncate_transitions_publish_versions
+test_away_unparseable_record_is_quarantined_not_fatal
+test_away_gc_clears_a_dangling_active_pointer
+test_away_store_lock_steal_never_removes_a_new_owner
 test_away_only_the_owner_writes_the_version_store
 test_away_peek_never_writes_and_read_migrates_only_live
 test_away_version_publish_migrates_into_the_successor_only

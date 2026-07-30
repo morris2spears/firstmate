@@ -452,8 +452,9 @@ classify_unknown() {  # <reason>
 #           state/tg-away-digest/<id>.items        private 0600 copy of the
 #           accepted items, the working record the receipt points Firstmate at.
 #           state/tg-away-versions/v.<id>/         one complete immutable copy
-#           of that whole unit per lifecycle transaction, reached only by the
-#           store's single active pointer and only while the daemon is stopped.
+#           of that whole unit per ledger transition, published under the store's
+#           owner lock; every live artifact above is the projection of whichever
+#           version the store's single active pointer names.
 
 _stale_key() { printf '%s' "$1" | tr ':/.' '___'; }
 
@@ -654,7 +655,11 @@ escalate_add() {  # <state> <distilled-item>
   if [ ! -s "$buf" ]; then
     away_ledger_open "$buf" || away_ledger_retire "$buf"
   fi
-  printf '%s\n' "$item" >> "$buf"
+  if ! away_ledger_append "$buf" "$item"; then
+    log "ERROR: away batch append refused; the escalation is NOT buffered (ledger owner could not commit a successor version). The heartbeat scan and wake queue re-derive it."
+    return 1
+  fi
+  return 0
 }
 
 # Send one batched away alert through Telegram mode's existing phone-inbox tg
@@ -1015,9 +1020,7 @@ escalate_flush() {  # <state>
       ;;
   esac
   if inject_msg "$msg" "$state"; then
-    : > "$buf"
-    away_ledger_retire "$buf"
-    rm -f "$state/.subsuper-inject-wedged"
+    away_ledger_truncate "$buf" || return 1
     return 0
   fi
   return 1
@@ -1280,7 +1283,7 @@ inject_wedge_alarm() {  # <state> <age-seconds>
     printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf 'The supervisor pane could not accept an escalation. Buffered items:\n'
     cat "$state/.subsuper-escalations" 2>/dev/null
-  } 2>/dev/null > "$marker" || true
+  } 2>/dev/null | away_ledger_wedge_record "$state" || true
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
   # Best-effort status-line flash. tmux's display-message is a client-side OSD
@@ -1353,7 +1356,7 @@ housekeeping() {  # <state>
        && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
       if escalate_flush "$state"; then
         log "inject recovered: max-defer flush succeeded after ${oldest}s undelivered"
-        rm -f "$state/.subsuper-inject-wedged"
+        away_ledger_wedge_clear "$state" || true
       else
         inject_wedge_alarm "$state" "$oldest"
       fi
