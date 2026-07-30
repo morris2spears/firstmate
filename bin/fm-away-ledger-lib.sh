@@ -400,28 +400,47 @@ away_ledger_retire_batch() {  # <state> <buf> <wedge> [preserve-digests]
 # Reclaim every leftover rollback-backup directory matching <backup-glob>: a
 # backup only survives past its own transaction when away_ledger_restore
 # reported a failure and the caller (fm-afk-launch.sh) deliberately kept it
-# rather than risk a partial restore. Every artifact such a backup holds -
-# digest text, the escalation buffer, its ledger sidecar, and the wedge marker
-# - is merged into the live unit, never overwriting anything already live (a
-# live copy is either current or was already reconciled, so an orphaned
-# backup's copy can only ever fill a gap, never take precedence), so nothing
-# it holds ages out silently in an orphaned copy. The backup is removed only
-# once every one of its artifacts has been reconciled onto the live unit or
-# was already redundant with it; a partial failure anywhere leaves the
-# complete backup in place for the next reclaim attempt rather than discarding
-# a copy that was never actually merged. <exclude>, when given, skips one path
-# even if it matches the glob - the caller's own in-flight backup, which is
-# not yet an orphan and must not be consumed before its own transaction
-# resolves. Called before a new transaction begins and after return's fold, so
-# no copy of actionable escalation text can outlive recovery, and never while
-# a transaction is open, so a rollback can never erase what reclaim merged in.
-away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [exclude]
-  local state=$1 buf=$2 wedge=$3 pattern=$4 exclude=${5:-}
-  local backup digest_dir artifact base f ok result=0
+# rather than risk a partial restore. Two kinds of artifact inside it are
+# treated differently:
+#
+#   digest text        merged into the live digest directory by delivery id,
+#                       never overwriting an existing file there - a live
+#                       <delivery-id>.items is always the same content, since
+#                       delivery ids are unique per attempt, so this is always
+#                       safe regardless of what else is live.
+#
+#   buffer + sidecar +  treated as ONE opaque unit, never gap-filled
+#   wedge marker        artifact-by-artifact: the sidecar's reserved/confirmed/
+#                       accounted counts are offsets into that EXACT buffer, so
+#                       pairing a live buffer with a foreign backup sidecar (or
+#                       vice versa) would silently misattribute counts onto
+#                       unrelated escalation lines. The unit is adopted whole
+#                       only when the live buffer, sidecar, and wedge marker
+#                       are ALL absent (nothing live to conflict with); if any
+#                       one of them is already live, the whole unit is left
+#                       untouched inside the backup rather than partially
+#                       merged or discarded, so a live session's lines are
+#                       never shadowed and a backup's undigested lines are
+#                       never silently lost - the backup simply waits for a
+#                       later reclaim once the live unit clears (e.g. after
+#                       the away session that owns it ends).
+#
+# The backup is removed only once every artifact it holds has been reconciled
+# onto the live unit (digest merge) or adopted as a whole (buffer/sidecar/
+# wedge) or was already redundant with what is live; any failure anywhere -
+# including "the live unit already conflicts" - leaves the complete backup in
+# place rather than discarding a copy that was never actually merged. Called
+# before a new transaction begins (an already-running daemon's refresh) or
+# after a launch transaction fully resolves (success or rollback), and at
+# return, so no copy of actionable escalation text can outlive recovery, and
+# never while a transaction is open, so a rollback can never erase what
+# reclaim merged in.
+away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob>
+  local state=$1 buf=$2 wedge=$3 pattern=$4
+  local backup digest_dir artifact base f ok group_clear_to_adopt result=0
   digest_dir=$(away_ledger_digest_dir "$state")
   for backup in $pattern; do
     [ -d "$backup" ] || continue
-    [ -z "$exclude" ] || [ "$backup" != "$exclude" ] || continue
     ok=1
     if [ -d "$backup/tg-away-digest" ]; then
       if fmx_private_artifact_dir_prepare "$digest_dir" >/dev/null 2>&1; then
@@ -438,12 +457,20 @@ away_ledger_reclaim_backups() {  # <state> <buf> <wedge> <backup-glob> [exclude]
         ok=0
       fi
     fi
-    for artifact in "$buf" "${buf}.since" "$wedge"; do
-      base=${artifact##*/}
-      if [ -e "$backup/$base" ] && [ ! -e "$artifact" ]; then
-        cp -p "$backup/$base" "$artifact" || ok=0
+    if [ -e "$backup/${buf##*/}" ] || [ -e "$backup/${buf##*/}.since" ] \
+      || [ -e "$backup/${wedge##*/}" ]; then
+      group_clear_to_adopt=0
+      [ -e "$buf" ] || [ -e "${buf}.since" ] || [ -e "$wedge" ] || group_clear_to_adopt=1
+      if [ "$group_clear_to_adopt" -eq 1 ]; then
+        for artifact in "$buf" "${buf}.since" "$wedge"; do
+          base=${artifact##*/}
+          [ -e "$backup/$base" ] || continue
+          cp -p "$backup/$base" "$artifact" || ok=0
+        done
+      else
+        ok=0
       fi
-    done
+    fi
     if [ "$ok" -eq 1 ]; then
       rm -rf "$backup" || result=1
     else

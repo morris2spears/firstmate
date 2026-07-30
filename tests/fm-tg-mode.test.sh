@@ -939,27 +939,66 @@ test_away_reclaim_backups_fills_missing_buffer_and_sidecar() {
   pass "reclaim fills a missing buffer, sidecar, and wedge marker from an orphaned backup"
 }
 
-# Reclaim must never overwrite a buffer, sidecar, or wedge marker that is
-# already live - only an orphaned backup's digest text is proven safe to
-# merge; anything already present on the live unit has already been
-# reconciled (or is the current session's own) and must win.
-test_away_reclaim_backups_never_overwrites_a_live_buffer() {
+# The buffer, its ledger sidecar, and the wedge marker are one opaque unit -
+# the sidecar's counts are offsets into that exact buffer. When a live buffer
+# already exists, reclaim must never gap-fill the backup's sidecar or wedge
+# marker onto it (that would misattribute counts onto unrelated live escalation
+# lines), and it must not discard the backup's own undigested buffer either -
+# it must leave the whole group untouched and keep the backup intact for a
+# later reclaim once the live unit clears.
+test_away_reclaim_backups_never_mixes_a_live_buffer_with_a_foreign_group() {
   local home state backup buf
-  home=$(make_home away-reclaim-buffer-no-clobber)
+  home=$(make_home away-reclaim-buffer-no-mix)
   state="$home/state"
   buf="$state/.subsuper-escalations"
   printf 'live buffer\n' > "$buf"
   backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
   printf 'stale backup buffer\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 0 0 0 0 none\n' > "$backup/.subsuper-escalations.since"
+  printf 'wedged\n' > "$backup/.subsuper-inject-wedged"
 
   away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
     "$state/.afk-launch-backup.*" \
-    || fail "reclaim must succeed"
+    && fail "reclaim must report failure when a live buffer conflicts with a backup's group"
 
   [ "$(cat "$buf" 2>/dev/null)" = 'live buffer' ] \
     || fail "reclaim must never overwrite an existing live escalation buffer"
-  assert_absent "$backup" "reclaim must still remove the orphaned backup"
-  pass "reclaim never overwrites a live escalation buffer with an orphaned backup's copy"
+  [ ! -e "${buf}.since" ] \
+    || fail "reclaim must never pair a live buffer with a foreign backup sidecar"
+  [ ! -e "$state/.subsuper-inject-wedged" ] \
+    || fail "reclaim must never adopt a foreign wedge marker while a live buffer exists"
+  [ -f "$backup/.subsuper-escalations" ] && [ -f "$backup/.subsuper-escalations.since" ] \
+    || fail "reclaim must keep the backup's buffer and sidecar intact for a later reclaim"
+  pass "reclaim never mixes a live buffer with a foreign backup's sidecar or wedge marker"
+}
+
+# The exact reachable sequence the mixing bug came from: escalate_add's
+# fail-closed path can retire the sidecar while still appending the line,
+# leaving a live buffer with NO sidecar at all. An orphaned backup's sidecar
+# must still never be paired onto that live buffer merely because the live
+# sidecar happens to be absent - the live buffer's mere presence is what rules
+# out adoption, independent of whether its own sidecar exists.
+test_away_reclaim_backups_never_pairs_orphan_sidecar_with_sidecarless_live_buffer() {
+  local home state backup buf
+  home=$(make_home away-reclaim-sidecarless-live)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'live: escalation with no sidecar yet\n' > "$buf"
+  backup=$(mktemp -d "$state/.afk-launch-backup.XXXXXX")
+  printf 'blocked: unrelated orphaned batch\n' > "$backup/.subsuper-escalations"
+  printf '1700000000-abc 1 1 2 0 0 none\n' > "$backup/.subsuper-escalations.since"
+
+  away_ledger_reclaim_backups "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    "$state/.afk-launch-backup.*" \
+    && fail "reclaim must report failure rather than adopt a foreign sidecar"
+
+  [ ! -e "${buf}.since" ] \
+    || fail "an orphaned sidecar must never attach to a live buffer it does not describe"
+  [ "$(cat "$buf" 2>/dev/null)" = 'live: escalation with no sidecar yet' ] \
+    || fail "the live buffer's own escalation line must survive untouched"
+  [ -f "$backup/.subsuper-escalations.since" ] \
+    || fail "the orphaned backup's sidecar must be preserved for a later reclaim"
+  pass "reclaim never pairs an orphaned sidecar with a live buffer, sidecar-less or not"
 }
 
 # A copy failure partway through a backup's reconciliation must never destroy
@@ -1410,7 +1449,8 @@ test_away_lifecycle_retires_tg_working_records
 test_away_reclaim_backups_folds_orphaned_digest_text
 test_away_reclaim_backups_never_overwrites_a_live_digest
 test_away_reclaim_backups_fills_missing_buffer_and_sidecar
-test_away_reclaim_backups_never_overwrites_a_live_buffer
+test_away_reclaim_backups_never_mixes_a_live_buffer_with_a_foreign_group
+test_away_reclaim_backups_never_pairs_orphan_sidecar_with_sidecarless_live_buffer
 test_away_reclaim_backups_keeps_backup_on_partial_merge_failure
 test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
 test_away_client_exit_125_is_never_proven_local
