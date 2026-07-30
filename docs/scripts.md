@@ -93,7 +93,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-x-dismiss.sh`        | Dismiss a skipped X-mode mention at the relay without replying                       |
 | `fm-x-link.sh`           | Link a spawned task to its originating X-mode mention in task meta                   |
 | `fm-x-followup.sh`       | Detect, post, and cap completion follow-ups for an X-mode-linked task                |
-| `fm-tg-lib.sh`           | Shared Telegram-mode opt-in, pending-note, shim-identity, and task-link helpers      |
+| `fm-away-ledger-lib.sh`  | Single owner of the away escalation batch ledger, its private digests, and their retirement |
+| `fm-tg-lib.sh`           | Shared Telegram-mode opt-in, pending-note, shim-identity, task-link, and outbound `tg` client helpers |
 | `fm-tg-poll.sh`          | One local phone-inbox sweep: offer each pending note id once and emit its wake       |
 | `fm-tg-link.sh`          | Link a spawned task to its originating Telegram note in task meta                    |
 | `fm-tg-followup.sh`      | Detect, send, and cap completion follow-ups for a Telegram-linked task               |

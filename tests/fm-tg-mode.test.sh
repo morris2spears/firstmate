@@ -21,6 +21,8 @@ set -u
 
 # shellcheck source=/dev/null
 . "$ROOT/bin/fm-tg-lib.sh"
+# shellcheck source=/dev/null
+. "$ROOT/bin/fm-supervise-daemon.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-tg-mode-tests)
 
@@ -497,6 +499,1725 @@ test_supervision_needed_by_tg_shim() {
   pass "fm_supervision_status counts the Telegram poll as supervision-needed"
 }
 
+# ledger_field <state> <field-index> <expected> <message>: assert one ledger count.
+ledger_field() {
+  local state=$1 idx=$2 want=$3 msg=$4 got
+  got=$(away_ledger_read "$state/.subsuper-escalations" | cut -d' ' -f"$idx")
+  [ "$got" = "$want" ] || fail "$msg (ledger field $idx = $got, want $want)"
+}
+
+# away_deliver <home> <state> [tg-bin] [fake-tg-exit]: drive telegram_away_deliver
+# exactly the way escalate_flush does - read the ledger, hand it the pending body
+# plus the current reserved/total/accounted counts and the batch id. Nothing may
+# reach the phone without those, so tests go through the same door.
+away_deliver() {
+  local home=$1 state=$2 tg_bin=${3:-} fake_exit=${4:-0}
+  local buf rec id reserved accounted did n pending
+  buf="$state/.subsuper-escalations"
+  rec=$(away_ledger_read "$buf")
+  IFS=' ' read -r id reserved _ accounted did <<< "$rec"
+  n=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
+  pending=$(tail -n "+$((reserved + 1))" "$buf" 2>/dev/null \
+    | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
+  (
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FMTG_TG_BIN="$tg_bin" FAKE_TG_EXIT="$fake_exit"
+    telegram_away_deliver "$state" "$pending" "$reserved" "$n" "$accounted" "$id"
+  )
+}
+
+test_away_delivery_is_inert_outside_away_mode() {
+  local home state tg out
+  home=$(make_home away-inactive)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  printf '1700000000\n' > "$state/.subsuper-escalations.since"
+
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+    FMTG_TG_BIN="$tg" telegram_away_deliver "$state" 'blocked: should stay in session')
+  [ "$out" = 'off|none' ] || fail "Telegram away delivery must be off outside away mode (got: $out)"
+  assert_absent "$home/tg-sent.log" "Telegram delivery outside away mode must not call the outbound client"
+  assert_absent "$state/tg-away-delivery" "Telegram delivery outside away mode must not create evidence"
+  pass "Telegram escalation delivery is inert outside away mode"
+}
+
+test_away_delivery_is_accepted_once_and_records_no_content() {
+  local home state tg out first_id second_id
+  home=$(make_home away-accepted)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  escalate_add "$state" 'needs-decision: approve privileged cutover'
+
+  out=$(away_deliver "$home" "$state" "$tg")
+  first_id=${out#*|}
+  [ "${out%%|*}" = accepted ] || fail "away delivery must report accepted (got: $out)"
+
+  # A repeat of the very same (batch, offset, body) delivery must re-derive the
+  # same id, settle from the existing accepted evidence, and never produce a
+  # second phone alert.
+  away_ledger_write "$state/.subsuper-escalations" \
+    "$(printf '%s' "$first_id" | cut -d- -f1-2)" 0 0 0 0 0 none \
+    || fail "could not rewind the ledger for the repeat-delivery case"
+  out=$(away_deliver "$home" "$state" "$tg")
+  second_id=${out#*|}
+  [ "${out%%|*}" = accepted ] || fail "accepted away delivery must remain accepted (got: $out)"
+  [ "$first_id" = "$second_id" ] || fail "the same away batch must keep one delivery id"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "the same away batch reached the outbound client more than once"
+  grep -Eq '^accepted [0-9]+$' "$state/tg-away-delivery/$first_id.status" \
+    || fail "accepted delivery must have non-secret durable evidence"
+  assert_no_grep 'privileged cutover' "$state/tg-away-delivery/$first_id.status" \
+    "delivery evidence must not contain message text"
+  pass "away delivery records Telegram acceptance and sends each batch exactly once"
+}
+
+test_away_delivery_failure_classes_and_safe_chat_fallback() {
+  local home state tg out injected
+  home=$(make_home away-failure)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+
+  # A client that RAN and exited non-zero cannot be distinguished from a lost
+  # response to an accepted send, so it is uncertain, not failed, and its
+  # reservation is kept.
+  escalate_add "$state" 'blocked: credential needed'
+  out=$(away_deliver "$home" "$state" "$tg" 1)
+  [ "${out%%|*}" = uncertain ] \
+    || fail "a client that ran and rejected must report uncertain (got: $out)"
+  grep -Eq '^failed [0-9]+ sender_uncertain_response$' "$state/tg-away-delivery/${out#*|}.status" \
+    || fail "an uncertain delivery must have non-secret durable evidence"
+  ledger_field "$state" 2 1 "an uncertain send must keep its phone reservation"
+  ledger_field "$state" 3 0 "an uncertain send must not be confirmed"
+  ledger_field "$state" 5 0 "an ambiguous outcome must never retire its attempt for retry"
+
+  # A missing client provably never left the box: unavailable, reservation released.
+  : > "$state/.subsuper-escalations"
+  away_ledger_retire "$state/.subsuper-escalations"
+  escalate_add "$state" 'blocked: second credential needed'
+  out=$(away_deliver "$home" "$state" "$home/missing-tg")
+  [ "${out%%|*}" = unavailable ] || fail "a missing Telegram client must report unavailable (got: $out)"
+  grep -Eq '^unavailable [0-9]+ sender_missing$' "$state/tg-away-delivery/${out#*|}.status" \
+    || fail "unavailable delivery must have non-secret durable evidence"
+  ledger_field "$state" 2 0 "a send that never left the box must release its reservation"
+  ledger_field "$state" 5 1 "a proven-local failure must retire its attempt for retry"
+
+  : > "$state/.subsuper-escalations"
+  away_ledger_retire "$state/.subsuper-escalations"
+  escalate_add "$state" 'blocked: safe fallback required'
+  injected="$home/injected.log"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
+  ) || fail "failed Telegram delivery must retain the in-session fallback"
+  assert_grep 'blocked: safe fallback required' "$injected" \
+    "the fallback must preserve the captain-relevant escalation"
+  assert_grep 'Telegram delivery unavailable; the captain was not contacted there' "$injected" \
+    "the fallback must never claim Telegram delivery"
+  pass "away delivery distinguishes failed and unavailable transport and falls back safely"
+}
+
+test_away_delivery_acceptance_does_not_duplicate_alert_in_chat() {
+  local home state tg injected
+  home=$(make_home away-no-chat-duplicate)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  printf 'needs-decision: approve privileged cutover\n' > "$state/.subsuper-escalations"
+  printf '1700000004\n' > "$state/.subsuper-escalations.since"
+  injected="$home/injected.log"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "accepted Telegram delivery must complete the away flush"
+
+  assert_grep 'Telegram accepted away-mode alert' "$injected" \
+    "Firstmate must receive a non-secret accepted receipt"
+  assert_no_grep 'approve privileged cutover' "$injected" \
+    "an accepted Telegram alert must not be duplicated into captain chat"
+  assert_grep 'needs-decision: approve privileged cutover' "$home/tg-sent.log" \
+    "the existing outbound client must receive the actual batched alert"
+  assert_grep 'does not approve a merge, privileged change, destructive action, or security-sensitive action' "$home/tg-sent.log" \
+    "the phone notice must preserve approval boundaries"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "confirmed receipt injection must clear the away buffer"
+  pass "accepted away alerts reach Telegram once without duplicating their contents in captain chat"
+}
+
+test_away_batch_never_resends_accepted_events() {
+  local home state tg injected sends pointer digests digest delivery_id
+  home=$(make_home away-grown-batch)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+
+  # First event: Telegram accepts it, but the in-session receipt is wedged, so
+  # the buffer and its batch identity are preserved for retry.
+  printf 'stale persisted 300s (possible wedge): fm-task-3\n' > "$state/.subsuper-escalations"
+  printf '1700000010\n' > "$state/.subsuper-escalations.since"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+  assert_grep 'fm-task-3' "$home/tg-sent.log" "the first event must reach the phone"
+
+  # A second event appends while the receipt is still wedged. The phone must
+  # receive ONLY the new event, never a repeat of the accepted one.
+  printf 'needs-decision: approve privileged cutover\n' >> "$state/.subsuper-escalations"
+  cp "$state/.subsuper-escalations" "$home/expected-items.txt"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "the grown away batch must flush once the receipt lands"
+  sends=$(grep -c '^---$' "$home/tg-sent.log")
+  [ "$sends" -eq 2 ] || fail "the grown batch must reach the phone once per new event (got $sends sends)"
+  [ "$(grep -c 'fm-task-3' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "an already-accepted away event must never be sent to the phone twice"
+  assert_grep 'approve privileged cutover' "$home/tg-sent.log" \
+    "the newly appended event must reach the phone"
+  assert_no_grep 'approve privileged cutover' "$injected" \
+    "an accepted away alert must not be duplicated into captain chat"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "the confirmed receipt must clear the away buffer"
+
+  # The receipt must point at digests that actually exist and, together, hold
+  # EVERY accepted item of the grown batch - not just the last delivery's - so a
+  # one-shot escalation stays actionable after the buffer is truncated.
+  pointer=$(sed -n 's|.*private away digests state/tg-away-digest/\([^ ;]*\)\.items.*|\1|p' "$injected")
+  [ -n "$pointer" ] || fail "the accepted receipt must point at the batch digests"
+  digests=$(eval ls "$state/tg-away-digest/$pointer.items" 2>/dev/null || true)
+  [ -n "$digests" ] || fail "the receipt's digest pointer must match real files ($pointer)"
+  for digest in $digests; do
+    [ -f "$digest" ] && [ ! -L "$digest" ] || fail "a pointed-at digest must be a regular file"
+    case "$(ls -l "$digest")" in
+      -rw-------*) ;;
+      *) fail "the away digest must be private (0600)" ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  [ "$(cat $digests | sort)" = "$(sort "$home/expected-items.txt")" ] \
+    || fail "the pointed-at digests must hold exactly the accepted items of the batch"
+  delivery_id=$(sed -n 's/^Telegram accepted away-mode alert \([^ ,]*\).*/\1/p' "$injected")
+  assert_no_grep 'privileged cutover' "$state/tg-away-delivery/$delivery_id.status" \
+    "delivery evidence must stay text-free"
+
+  # A later failure must not repeat the events Telegram already delivered.
+  printf 'blocked: credential needed\n' > "$state/.subsuper-escalations"
+  printf '1700000020\n' > "$state/.subsuper-escalations.since"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave the second batch unconfirmed"
+  printf 'paused 600s (awaiting external): fm-task-9\n' >> "$state/.subsuper-escalations"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 escalate_flush "$state"
+  ) || fail "a failed Telegram send must still complete the in-session fallback"
+  assert_grep 'fm-task-9' "$injected" \
+    "the undelivered event must reach the in-session fallback"
+  assert_no_grep 'credential needed' "$injected" \
+    "the fallback must not repeat an event Telegram already delivered"
+  pass "an away batch that grows while the receipt is wedged never re-sends accepted events"
+}
+
+test_away_unusable_bookkeeping_never_sends_to_the_phone() {
+  local home state tg injected
+  home=$(make_home away-bad-bookkeeping)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  printf 'blocked: needs a decision\n' > "$state/.subsuper-escalations"
+  printf 'not-a-batch record here\n' > "$state/.subsuper-escalations.since"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "unreadable bookkeeping must still complete the in-session flush"
+
+  assert_absent "$home/tg-sent.log" \
+    "unreadable away bookkeeping must never risk a duplicate phone alert"
+  assert_grep 'blocked: needs a decision' "$injected" \
+    "the visible in-session fallback must carry every buffered event"
+  assert_grep 'ledger is unreadable' "$injected" \
+    "the fallback must say why the phone was not contacted"
+  pass "unusable away bookkeeping fails closed to the visible in-session fallback"
+}
+
+# The ledger reserves lines BEFORE the network call, so a reservation alone never
+# proves the captain was contacted. A restart must resolve it from the durable
+# delivery evidence: an unresolved attempt stays honestly uncertain and is never
+# re-sent, while a reservation with no evidence at all is released so those lines
+# can still reach the phone.
+test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
+  local home state tg injected did
+  home=$(make_home away-reserved-recovery)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+
+  # (a) reserved with an unresolved `attempting` record: uncertain, never re-sent.
+  printf 'blocked: mid-send crash\n' > "$state/.subsuper-escalations"
+  did='1700000030-abcdef0123456789-0-0123456789abcdef'
+  mkdir -p "$state/tg-away-delivery"
+  chmod 0700 "$state/tg-away-delivery"
+  printf 'attempting 1700000030\n' > "$state/tg-away-delivery/$did.status"
+  chmod 0600 "$state/tg-away-delivery/$did.status"
+  printf '1700000030-abcdef0123456789 1 0 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "an uncertain reservation must still complete the in-session flush"
+  assert_absent "$home/tg-sent.log" \
+    "a reserved-but-unconfirmed line must never be re-sent to the phone"
+  assert_grep 'Telegram delivery uncertain' "$injected" \
+    "an unconfirmed reservation must never be reported as accepted"
+  assert_grep 'blocked: mid-send crash' "$injected" \
+    "the uncertain event must still reach the visible in-session fallback"
+
+  # (a2) reserved with durable `accepted` evidence: the crash landed between the
+  # send and the ledger commit, so recovery confirms it from the evidence and never
+  # sends again.
+  printf 'blocked: crashed after acceptance\n' > "$state/.subsuper-escalations"
+  did='1700000035-abcdef0123456789-0-fedcba9876543210'
+  printf 'accepted 1700000035\n' > "$state/tg-away-delivery/$did.status"
+  chmod 0600 "$state/tg-away-delivery/$did.status"
+  printf '1700000035-abcdef0123456789 1 0 0 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "a recoverable acceptance must complete the away flush"
+  assert_absent "$home/tg-sent.log" \
+    "a line with durable accepted evidence must never be sent again"
+  assert_grep 'Telegram accepted away-mode alert' "$injected" \
+    "durable accepted evidence must be reported as accepted"
+
+  # (b) reserved with no evidence at all: the claim is released and the line is
+  # offered to the phone.
+  printf 'blocked: crashed before the send\n' > "$state/.subsuper-escalations"
+  printf '1700000040-fedcba9876543210 1 0 0 0 0 none\n' > "$state/.subsuper-escalations.since"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "a released reservation must complete the away flush"
+  assert_grep 'crashed before the send' "$home/tg-sent.log" \
+    "a reservation with no delivery evidence must be released back to the phone"
+  assert_grep 'Telegram accepted away-mode alert' "$injected" \
+    "the re-offered event must report its real accepted outcome"
+  pass "reserved away lines resolve from durable evidence, never from the claim alone"
+}
+
+# Turning Telegram mode off mid-batch must not replay into captain chat what the
+# captain already received on his phone.
+test_away_off_mid_batch_never_repeats_delivered_events() {
+  local home state tg injected
+  home=$(make_home away-off-mid-batch)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: already on the phone'
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+  assert_grep 'already on the phone' "$home/tg-sent.log" "the first event must reach the phone"
+
+  # Telegram mode is switched off, then a second event appends.
+  rm "$home/config/telegram-mode"
+  escalate_add "$state" 'blocked: after the opt-out'
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "an opted-out away flush must still deliver in session"
+  assert_grep 'after the opt-out' "$injected" \
+    "the undelivered event must reach captain chat once Telegram mode is off"
+  assert_no_grep 'already on the phone' "$injected" \
+    "an event the captain already received on his phone must not be replayed in chat"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "an opted-out flush must not contact the phone again"
+  pass "an opt-out mid-batch never repeats phone-delivered events in captain chat"
+}
+
+test_away_lifecycle_retires_tg_working_records() {
+  local home state
+  home=$(make_home away-retirement)
+  state="$home/state"
+  mkdir -p "$state/tg-away-digest" "$state/tg-away-delivery"
+  printf 'stale persisted 300s: fm-task-1\n' > "$state/tg-away-digest/abc.items"
+  printf 'text' > "$state/tg-away-delivery/.spool.zzz"
+  printf 'accepted 1700000000\n' > "$state/tg-away-delivery/abc.status"
+  : > "$state/.subsuper-escalations.since.tmpXYZ"
+
+  FM_HOME="$home" FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1"; fm_afk_clear_stale_artifacts "$2"' _ "$ROOT/bin/fm-afk-start.sh" "$state" \
+    || fail "the away-start clear must succeed"
+
+  assert_absent "$state/tg-away-digest" \
+    "the private away digest must retire with the away session"
+  assert_absent "$state/tg-away-delivery/.spool.zzz" \
+    "a leaked outbound spool must retire with the away session"
+  assert_absent "$state/.subsuper-escalations.since.tmpXYZ" \
+    "a leaked sidecar temp must retire with the away session"
+  [ -f "$state/tg-away-delivery/abc.status" ] \
+    || fail "durable text-free delivery evidence must outlive the away session"
+  pass "the away lifecycle retires the Telegram working records and keeps the evidence"
+}
+
+# --- the immutable versioned batch store -----------------------------------
+#
+# Recovery is one mechanism only: the complete owned unit is published as an
+# immutable version directory and reaches the live paths through ONE atomic
+# active-pointer switch, performed only while no daemon is live. Nothing is ever
+# merged file-by-file into the live unit or into a published version.
+
+seed_live_unit() {  # <state>: a two-line batch, one line already digested
+  local state=$1 buf="$1/.subsuper-escalations"
+  printf 'blocked: already digested\nblocked: still owed to captain chat\n' > "$buf"
+  printf '1700000000-abc 2 1 1 0 0 1700000000-abc-a0-0-d1\n' > "$buf.since"
+  printf 'fm away-mode inject WEDGED: 900s undelivered\n' > "$state/.subsuper-inject-wedged"
+  (umask 077; mkdir -p "$state/tg-away-digest")
+  printf 'blocked: already digested\n' > "$state/tg-away-digest/1700000000-abc-a0-0-d1.items"
+  chmod 600 "$state/tg-away-digest/1700000000-abc-a0-0-d1.items"
+}
+
+# Publication is all-or-nothing: the version carries the WHOLE unit plus the
+# manifest it was validated against and the completion marker written last, and
+# a single rename makes it visible - so no staging directory outlives it and the
+# live unit it was copied from is never disturbed.
+test_away_version_publish_is_complete_and_atomic() {
+  local home state buf version vdir staging
+  home=$(make_home away-version-publish)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  seed_live_unit "$state"
+
+  version=$(away_ledger_version_publish "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "publishing the live unit as an immutable version must succeed"
+  case "$version" in
+    v.*) ;;
+    *) fail "a published version must carry this owner's minted name: $version" ;;
+  esac
+  vdir="$state/tg-away-versions/$version"
+  assert_present "$vdir/.complete" "a published version must carry its completion marker"
+  assert_present "$vdir/manifest" "a published version must carry the manifest it was validated against"
+  [ "$(cat "$vdir/escalations")" = "$(cat "$buf")" ] \
+    || fail "a published version must hold the escalation buffer verbatim"
+  [ "$(cat "$vdir/escalations.since")" = "$(cat "$buf.since")" ] \
+    || fail "a published version must hold the ledger sidecar verbatim"
+  assert_present "$vdir/wedge" "a published version must hold the wedge marker"
+  assert_present "$vdir/tg-away-digest/1700000000-abc-a0-0-d1.items" \
+    "a published version must hold the private digest directory"
+  staging=$(printf '%s' "$state"/tg-away-versions/.staging.*)
+  [ ! -d "$staging" ] || fail "publication must leave no staging directory behind"
+  assert_present "$buf" "publishing must never disturb the live unit it copied"
+  [ "$(away_ledger_version_names "$state")" = "$version" ] \
+    || fail "the published version must be the one complete version listed"
+  assert_absent "$state/tg-away-versions/active" \
+    "publishing must never switch the active pointer by itself"
+  pass "a batch version is published complete, validated, and atomically visible"
+}
+
+# Crash safety: only the rename publishes, so an interrupted build can leave a
+# staging directory or (defensively) a marker-less version directory - and
+# neither may ever be listed, activated, or reach the live paths. Both are swept.
+test_away_version_incomplete_publication_is_never_visible() {
+  local home state buf rc=0
+  home=$(make_home away-version-incomplete)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  mkdir -p "$state/tg-away-versions/v.1700000000-broken" \
+           "$state/tg-away-versions/.staging.zzzzzz"
+  printf 'blocked: never validated\n' > "$state/tg-away-versions/v.1700000000-broken/escalations"
+  printf 'blocked: never published\n' > "$state/tg-away-versions/.staging.zzzzzz/escalations"
+
+  [ -z "$(away_ledger_version_names "$state")" ] \
+    || fail "an incomplete version must never be listed"
+  away_ledger_version_activate "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    v.1700000000-broken || rc=$?
+  expect_code 1 "$rc" "activating an incomplete version must be refused"
+  assert_absent "$buf" "an incomplete version must never reach the live paths"
+  assert_absent "$state/tg-away-versions/active" \
+    "a refused activation must never leave a pointer behind"
+
+  away_ledger_version_gc "$state" || fail "the sweep must succeed"
+  assert_absent "$state/tg-away-versions/v.1700000000-broken" \
+    "an incomplete version directory must be swept"
+  assert_absent "$state/tg-away-versions/.staging.zzzzzz" \
+    "an abandoned staging build must be swept"
+  pass "an incomplete version publication is never visible, never activated, and swept"
+}
+
+# The daemon is the sole writer of the live buffer and its sidecar with no shared
+# lock, so a pointer switch under a live daemon would overwrite a freshly
+# appended escalation. The owner itself refuses (rc 3) rather than trusting the
+# caller, and leaves every version and the live unit untouched.
+test_away_version_switch_is_refused_while_a_daemon_is_live() {
+  local home state buf version rc=0
+  home=$(make_home away-version-live-daemon)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  seed_live_unit "$state"
+  version=$(away_ledger_version_publish "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "publishing must succeed"
+  rm -f "$buf" "$buf.since" "$state/.subsuper-inject-wedged"
+  mkdir -p "$state/.supervise-daemon.lock"
+  printf '%s\n' "$$" > "$state/.supervise-daemon.lock/pid"
+
+  away_ledger_version_activate "$state" "$buf" "$state/.subsuper-inject-wedged" "$version" || rc=$?
+  expect_code 3 "$rc" "a pointer switch under a live daemon must be refused"
+  assert_absent "$state/tg-away-versions/active" \
+    "a refused switch must not commit the pointer"
+  assert_absent "$buf" "a refused switch must not install anything live"
+  assert_present "$state/tg-away-versions/$version/escalations" \
+    "a refused switch must leave the version untouched"
+
+  # A switch committed before the daemon came up is not replayed under it either.
+  printf '%s\n' "$version" > "$state/tg-away-versions/active"
+  rc=0
+  away_ledger_version_apply_pending "$state" "$buf" "$state/.subsuper-inject-wedged" || rc=$?
+  expect_code 3 "$rc" "replaying a pending switch under a live daemon must be refused"
+  assert_absent "$buf" "a refused replay must not install anything live"
+  pass "no active-pointer switch is ever performed while a daemon is live"
+}
+
+# A switch installs ONE version's whole unit, dropping whatever is live first, so
+# a version's sidecar counts can never end up paired with a foreign buffer. The
+# pointer write is the commit point, so an interrupted materialisation is replayed
+# to completion rather than left half-installed.
+test_away_version_switch_installs_the_whole_unit_and_replays() {
+  local home state buf version mode
+  home=$(make_home away-version-switch)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  seed_live_unit "$state"
+  version=$(away_ledger_version_publish "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "publishing must succeed"
+  # A failed attempt's leftovers: a foreign buffer, no sidecar, no digests.
+  printf 'blocked: foreign line from the failed attempt\n' > "$buf"
+  rm -f "$buf.since" "$state/.subsuper-inject-wedged"
+  rm -rf "$state/tg-away-digest"
+
+  away_ledger_version_activate "$state" "$buf" "$state/.subsuper-inject-wedged" "$version" \
+    || fail "a switch with no daemon running must succeed"
+  assert_no_grep 'foreign line from the failed attempt' "$buf" \
+    "a switch must replace the live buffer wholesale, never merge into it"
+  [ "$(cat "$buf")" = "$(cat "$state/tg-away-versions/$version/escalations")" ] \
+    || fail "the live buffer must hold exactly the activated version's buffer"
+  assert_present "$buf.since" "a switch must install the version's own sidecar"
+  assert_present "$state/.subsuper-inject-wedged" "a switch must install the version's wedge marker"
+  assert_present "$state/tg-away-digest/1700000000-abc-a0-0-d1.items" \
+    "a switch must install the version's private digests"
+  mode=$(path_mode "$state/tg-away-digest")
+  [ "$mode" = 700 ] || fail "the installed digest directory must stay private 0700 (got: $mode)"
+  [ "$(cat "$state/tg-away-versions/active")" = "$version" ] \
+    || fail "the active pointer must name the switched-to version"
+  [ "$(cat "$state/tg-away-versions/active.applied")" = "$version" ] \
+    || fail "a completed switch must record the version it materialised"
+  [ "$(away_ledger_fold_versions "$state" escalations)" \
+    = "$(away_ledger_unaccounted_lines "$buf")" ] \
+    || fail "a version whose unit is live must fold to exactly the live text, so a caller's per-kind dedupe collapses it"
+
+  # Crash between the pointer commit and materialisation: replay converges.
+  rm -f "$state/tg-away-versions/active.applied" "$buf" "$buf.since"
+  away_ledger_version_apply_pending "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    || fail "an interrupted switch must be replayable"
+  [ "$(cat "$buf")" = "$(cat "$state/tg-away-versions/$version/escalations")" ] \
+    || fail "the replay must reinstall the pointed version's whole unit"
+  [ "$(cat "$state/tg-away-versions/active.applied")" = "$version" ] \
+    || fail "the replay must record the materialised version"
+  pass "an active-pointer switch installs one whole version and replays after a crash"
+}
+
+# A retained version reaches the return catch-up exactly once: only the lines
+# past that version's OWN accounted count, and only digest items whose delivery
+# id is not already live. Reading never mutates the version.
+test_away_fold_versions_emits_each_escalation_once() {
+  local home state buf vdir out
+  home=$(make_home away-fold-versions)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  vdir="$state/tg-away-versions/v.1700000000-retained"
+  mkdir -p "$vdir/tg-away-digest"
+  printf 'blocked: already digested\nblocked: still owed to captain chat\n' > "$vdir/escalations"
+  printf '1700000000-abc 2 1 1 0 0 1700000000-abc-a0-0-d1\n' > "$vdir/escalations.since"
+  printf 'fm away-mode inject WEDGED: 900s undelivered\n' > "$vdir/wedge"
+  printf 'blocked: already digested\n' > "$vdir/tg-away-digest/1700000000-abc-a0-0-d1.items"
+  printf 'blocked: digested but never live\n' > "$vdir/tg-away-digest/1700000000-abc-a0-1-d2.items"
+  printf escalations > "$vdir/manifest"
+  : > "$vdir/.complete"
+  (umask 077; mkdir -p "$state/tg-away-digest")
+  printf 'blocked: already digested\n' > "$state/tg-away-digest/1700000000-abc-a0-0-d1.items"
+
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding a retained version's escalations must succeed"
+  assert_contains "$out" 'blocked: still owed to captain chat' \
+    "a retained version's unaccounted line must reach the catch-up"
+  [ "$(printf '%s\n' "$out" | grep -c 'blocked: already digested')" -eq 0 ] \
+    || fail "a line the version's own digest already accounted for must never be folded as owed"
+  out=$(away_ledger_fold_versions "$state" wedges) \
+    || fail "folding a retained version's wedge marker must succeed"
+  assert_contains "$out" 'fm away-mode inject WEDGED: 900s undelivered' \
+    "a retained version's wedge marker must reach the catch-up"
+  out=$(away_ledger_fold_versions "$state" digests) \
+    || fail "folding a retained version's digests must succeed"
+  assert_contains "$out" 'blocked: digested but never live' \
+    "a retained version's digest item that is not live must reach the catch-up"
+  [ "$(printf '%s\n' "$out" | grep -c 'blocked: already digested')" -eq 0 ] \
+    || fail "a digest item whose delivery id is already live must never be folded again"
+  away_ledger_fold_versions "$state" bogus 2>/dev/null \
+    && fail "an unknown fold kind must be refused"
+  assert_present "$vdir/.complete" "folding must never mutate the version it read"
+  pass "a retained version folds each logical escalation exactly once"
+}
+
+# The mechanism this replaced merged single files into live paths and adopted a
+# backup's artifacts under a running daemon. No entry point for that may survive
+# anywhere in bin/, or the class of defect comes back with it.
+test_away_no_adoption_or_merge_apis_remain() {
+  local hits
+  hits=$(grep -rn -E 'away_ledger_(reclaim_backups|fold_retained_backups|snapshot|restore)|afk-launch-backup|digests-only' \
+    "$ROOT/bin" 2>/dev/null || true)
+  [ -z "$hits" ] \
+    || fail "the in-place adoption/merge recovery mechanism must be gone: $hits"
+  pass "no adoption or per-file merge API survives in bin/"
+}
+
+# fn_body <file> <function-name>: the source text of one shell function, so a
+# structural assertion can be made about that function alone rather than about a
+# whole file.
+fn_body() {
+  awk -v fn="$2() {" 'index($0, fn) == 1 { f = 1 } f { print } f && /^}$/ { exit }' "$1"
+}
+
+# Structural, not behavioural: EVERY ledger transition must go through the version
+# transaction, and no transition may write a legacy live path as its source of
+# truth. Behaviour tests below prove the transaction works; this one proves nothing
+# quietly bypasses it.
+test_away_every_transition_goes_through_the_version_transaction() {
+  local lib daemon body fn
+  lib="$ROOT/bin/fm-away-ledger-lib.sh"
+  daemon="$ROOT/bin/fm-supervise-daemon.sh"
+
+  for fn in away_ledger_write away_ledger_append away_ledger_truncate \
+    away_ledger_wedge_record away_ledger_wedge_clear away_ledger_digest_record; do
+    body=$(fn_body "$lib" "$fn")
+    [ -n "$body" ] || fail "$fn must exist as an owner transition"
+    assert_contains "$body" 'away_ledger_transact' \
+      "$fn must commit a successor version through away_ledger_transact"
+  done
+
+  # The reservation, acceptance and retry-state transitions reach the transaction
+  # through the single record-write path.
+  for fn in away_ledger_reserve away_ledger_confirm away_ledger_release \
+    away_ledger_transition; do
+    body=$(fn_body "$lib" "$fn")
+    [ -n "$body" ] || fail "$fn must exist as an owner transition"
+    case "$body" in
+      *away_ledger_write*|*away_ledger_transition*) ;;
+      *) fail "$fn must route its record change through away_ledger_write" ;;
+    esac
+  done
+
+  body=$(fn_body "$daemon" escalate_add)
+  assert_contains "$body" 'away_ledger_append' \
+    "the daemon's escalation append must be a version transition"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
+  assert_not_contains "$body" '>> "$buf"' \
+    "the daemon must not append straight into the live escalation buffer"
+
+  body=$(fn_body "$daemon" escalate_flush)
+  assert_contains "$body" 'away_ledger_truncate' \
+    "the in-session truncation must be a version transition"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
+  assert_not_contains "$body" ': > "$buf"' \
+    "the daemon must not truncate the live escalation buffer directly"
+
+  body=$(fn_body "$daemon" inject_wedge_alarm)
+  assert_contains "$body" 'away_ledger_wedge_record' \
+    "the wedge evidence must be a version transition"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
+  assert_not_contains "$body" '> "$marker"' \
+    "the daemon must not write the live wedge marker directly"
+
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
+  body=$(grep -nE '>>?[[:space:]]*"\$state/\.subsuper-(escalations|inject-wedged|chat-delivery)' "$daemon" || true)
+  [ -z "$body" ] || fail "no live away artifact may be written outside the transaction: $body"
+  pass "every ledger transition commits a successor version and no live write remains"
+}
+
+# The append transition: the line is durable in a published version, the active
+# pointer names it, and the live buffer is that version's projection.
+test_away_append_transition_publishes_and_projects() {
+  local home state buf name
+  home=$(make_home away-append-transition)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+
+  escalate_add "$state" 'blocked: first event' || fail "the append transition must succeed"
+  escalate_add "$state" 'blocked: second event' || fail "the second append must succeed"
+
+  name=$(cat "$state/tg-away-versions/active" 2>/dev/null)
+  [ -n "$name" ] || fail "an append must leave an active version"
+  [ "$(cat "$state/tg-away-versions/active.applied")" = "$name" ] \
+    || fail "an applied append must record the version it projected"
+  [ "$(cat "$buf")" = "$(cat "$state/tg-away-versions/$name/escalations")" ] \
+    || fail "the live buffer must be the active version's projection"
+  assert_grep 'blocked: second event' "$state/tg-away-versions/$name/escalations" \
+    "the appended line must be durable in the published version"
+  [ "$(away_ledger_version_names "$state" | wc -l | tr -d ' ')" = 1 ] \
+    || fail "a superseded predecessor must be retired by its successor"
+  pass "the append transition publishes a successor version and projects it live"
+}
+
+# The reservation, acceptance, digest and accounted transitions each publish their
+# own successor version, and the digest item and the count that accounts for it
+# land in the SAME version.
+test_away_record_and_digest_transitions_publish_versions() {
+  local home state buf name rec
+  home=$(make_home away-record-transition)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+  escalate_add "$state" 'blocked: needs the captain' || fail "the append must succeed"
+
+  away_ledger_reserve "$buf" 1 d-1 || fail "the reservation transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  rec=$(away_ledger_peek "$state/tg-away-versions/$name/escalations")
+  case "$rec" in
+    *' 1 0 0 0 0 d-1') ;;
+    *) fail "the reservation must be durable in its own successor version: $rec" ;;
+  esac
+
+  away_ledger_confirm "$buf" 0 1 d-1 || fail "the acceptance transition must succeed"
+  away_ledger_digest_record "$state" "$buf" d-1 0 1 \
+    || fail "the digest transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  assert_grep 'blocked: needs the captain' \
+    "$state/tg-away-versions/$name/tg-away-digest/d-1.items" \
+    "the digest item must be durable in the successor version"
+  rec=$(away_ledger_peek "$state/tg-away-versions/$name/escalations")
+  case "$rec" in
+    *' 1 1 1 0 0 d-1') ;;
+    *) fail "the accounted count must land in the same version as its digest: $rec" ;;
+  esac
+  assert_grep 'blocked: needs the captain' "$state/tg-away-digest/d-1.items" \
+    "the live digest directory must be the version's projection"
+  pass "record and digest transitions each publish a successor version"
+}
+
+# The wedge evidence and the in-session truncation are transitions too: the
+# truncation empties the buffer and drops the record and the wedge marker as ONE
+# version, so no half-retired unit is ever published or projected.
+test_away_wedge_and_truncate_transitions_publish_versions() {
+  local home state buf name
+  home=$(make_home away-wedge-transition)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+  escalate_add "$state" 'blocked: wedged event' || fail "the append must succeed"
+
+  printf 'fm away-mode inject WEDGED: 900s undelivered\n' \
+    | away_ledger_wedge_record "$state" || fail "the wedge transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  assert_grep 'WEDGED: 900s' "$state/tg-away-versions/$name/wedge" \
+    "the wedge evidence must be durable in the successor version"
+  assert_grep 'WEDGED: 900s' "$state/.subsuper-inject-wedged" \
+    "the live wedge marker must be the version's projection"
+
+  away_ledger_truncate "$buf" || fail "the truncate transition must succeed"
+  name=$(cat "$state/tg-away-versions/active")
+  [ ! -s "$buf" ] || fail "the truncation must empty the live buffer"
+  assert_absent "$buf.since" "the truncation must drop the live record"
+  assert_absent "$state/.subsuper-inject-wedged" \
+    "the truncation must drop the live wedge marker"
+  assert_absent "$state/tg-away-versions/$name/escalations.since" \
+    "the successor version must hold the retired record state"
+  pass "the wedge and truncate transitions publish successor versions"
+}
+
+# An unreadable predecessor record must be quarantined as immutable evidence, not
+# treated as a publication failure: away-mode entry can never be wedged by
+# bookkeeping nobody can parse, and no owed line is dropped.
+test_away_unparseable_record_is_quarantined_not_fatal() {
+  local home state buf version out
+  home=$(make_home away-unparseable-record)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: owed, with an unreadable record\n' > "$buf"
+  : > "$buf.since"
+
+  version=$(away_ledger_entry_capture "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "an unparseable record must never wedge an away entry"
+  assert_grep 'owed, with an unreadable record' \
+    "$state/tg-away-versions/$version/escalations" \
+    "the quarantined version must still hold every owed line"
+  [ -e "$state/tg-away-versions/$version/escalations.since" ] \
+    || fail "the malformed record itself must be quarantined as evidence"
+  [ ! -s "$buf.since" ] || fail "the live record must be left exactly as found"
+
+  away_ledger_retire_batch "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    || fail "the entry clear must succeed"
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding a quarantined version must succeed"
+  assert_contains "$out" 'owed, with an unreadable record' \
+    "an unreadable record must make the fold over-report, never drop a line"
+  pass "an unparseable predecessor record is quarantined instead of wedging entry"
+}
+
+# A pointer left aiming at a version that is gone would otherwise refuse every
+# later apply, and so every away entry, for good.
+test_away_gc_clears_a_dangling_active_pointer() {
+  local home state buf
+  home=$(make_home away-dangling-pointer)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  (umask 077; mkdir -p "$state/tg-away-versions")
+  printf 'v.1700000000-gone\n' > "$state/tg-away-versions/active"
+  printf 'v.1700000000-gone\n' > "$state/tg-away-versions/active.applied"
+
+  away_ledger_version_gc "$state" || fail "the sweep must succeed"
+  assert_absent "$state/tg-away-versions/active" \
+    "a pointer naming a version that is gone must be cleared"
+  assert_absent "$state/tg-away-versions/active.applied" \
+    "an applied pointer naming a version that is gone must be cleared"
+  away_ledger_version_apply_pending "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    || fail "away entry must not stay wedged once the dangling pointer is cleared"
+  pass "the sweep clears a dangling pointer instead of wedging every away entry"
+}
+
+# Mutual exclusion is what stops a publish interleaving with a materialise, so a
+# stale-lock reclaim must never remove a lock a NEW owner has since taken - the
+# double-remove race two reclaimers that saw the same dead holder would hit.
+test_away_store_lock_steal_never_removes_a_new_owner() {
+  local home state dir lock dead
+  home=$(make_home away-lock-steal)
+  state="$home/state"
+  dir="$state/tg-away-versions"
+  (umask 077; mkdir -p "$dir")
+  lock="$dir/.owner.lock"
+
+  # A holder that is provably gone is reclaimed.
+  dead=$(bash -c 'echo $$')
+  while kill -0 "$dead" 2>/dev/null; do dead=$((dead + 1)); done
+  mkdir "$lock"
+  printf '%s\n' "$dead" > "$lock/pid"
+  _away_ledger_lock_steal "$lock" "$dead"
+  assert_absent "$lock" "a lock whose holder is provably gone must be reclaimed"
+
+  # The loser of the steal race re-reads the holder and must leave the new owner
+  # alone, even though it decided to reclaim while observing the dead one.
+  mkdir "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+  _away_ledger_lock_steal "$lock" "$dead"
+  assert_present "$lock" "a reclaim must never remove a lock a new owner holds"
+  [ "$(cat "$lock/pid")" = "$$" ] || fail "the new owner's lock identity was replaced"
+  assert_absent "$lock.steal" "the steal lock must not be left behind"
+  rm -rf "$lock"
+
+  away_ledger_lock_acquire "$dir" || fail "acquiring the store lock must succeed"
+  [ "$(cat "$lock/pid")" = "$$" ] || fail "the acquired lock must record its holder"
+  away_ledger_lock_release "$dir"
+  assert_absent "$lock" "releasing the store lock must remove it"
+  pass "a stale store-lock reclaim can never hand the store to two owners"
+}
+
+# A refused append must leave every suppressor untouched. The seen marker is what
+# the heartbeat catch-all checks, so recording it for an escalation that reached no
+# buffer, no version and no digest would suppress the only re-derivation path and
+# lose a captain-relevant event outright.
+test_away_refused_append_keeps_the_wake_re_derivable() {
+  local home state seen
+  home=$(make_home away-refused-append)
+  state="$home/state"
+  : > "$state/.afk"
+  printf 'blocked [key=needs-captain]: the captain must decide\n' > "$state/t1.status"
+  seen="$state/.subsuper-seen-status-t1"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    away_ledger_append() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    handle_wake "signal: $state/t1.status" "$state"
+  ) >/dev/null 2>&1
+  assert_absent "$seen" \
+    "a refused append must not record the seen suppressor the catch-all scan checks"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a refused append must leave nothing buffered"
+
+  # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+  ( log() { :; }; handle_wake "signal: $state/t1.status" "$state" ) >/dev/null 2>&1
+  assert_grep 'the captain must decide' "$state/.subsuper-escalations" \
+    "the retried wake must buffer the escalation the refused append dropped"
+  assert_present "$seen" "a committed append must record the seen suppressor"
+  pass "a refused append leaves the wake re-derivable instead of suppressing it"
+}
+
+# Once the in-session submit is confirmed, a failure in the bookkeeping that
+# should have followed must never become a second delivery of the same batch into
+# captain chat.
+test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate() {
+  local home state buf injected count
+  home=$(make_home away-confirmed-inject)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: one event the captain already saw' \
+    || fail "the append must succeed"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+  count=$(grep -c 'one event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] || fail "the first flush must inject exactly once (got $count)"
+  [ "$(away_ledger_chat_delivered "$state")" = 1 ] \
+    || fail "a confirmed submit must be recorded in the unit before the truncation"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the retry must settle the batch once the truncation can land"
+  count=$(grep -c 'one event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "a confirmed batch must never be re-injected into captain chat (got $count)"
+  [ ! -s "$buf" ] || fail "the retry must complete the outstanding truncation"
+  assert_absent "$state/.subsuper-chat-delivery" \
+    "a retired batch must not leave its in-session delivery state behind"
+  pass "a confirmed in-session delivery is never repeated after a failed truncation"
+}
+
+# A batch only ever grows, so the confirmed in-session delivery is a PREFIX, not
+# an exact line count: a line appended between a confirmed submit and the
+# truncation that should have followed must not drag the already-delivered lines
+# back into captain chat.
+test_away_confirmed_chat_prefix_survives_a_growing_batch() {
+  local home state buf injected count
+  home=$(make_home away-confirmed-prefix)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event the captain already saw' \
+    || fail "the first append must succeed"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+
+  escalate_add "$state" 'blocked: second event arriving after the confirmed submit' \
+    || fail "the append onto the confirmed batch must succeed"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the grown batch must still flush"
+
+  count=$(grep -c 'first event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "a confirmed prefix must not be re-injected when the batch grows (got $count)"
+  grep -F 'second event arriving after the confirmed submit' "$injected" >/dev/null \
+    || fail "the line appended past the confirmed prefix must still reach captain chat"
+  [ ! -s "$buf" ] || fail "the grown batch must be retired once its flush settles"
+  pass "a confirmed in-session prefix is never repeated when the batch grows"
+}
+
+# Opening an attempt states which suffix is in flight; it must never lower the
+# confirmed prefix. Otherwise a failed inject on a grown batch would erase the
+# proof that the earlier lines already reached captain chat and re-deliver them.
+test_away_failed_inject_never_lowers_the_confirmed_chat_prefix() {
+  local home state buf injected count
+  home=$(make_home away-attempt-prefix)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event the captain already saw' \
+    || fail "the first append must succeed"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+
+  escalate_add "$state" 'blocked: second event arriving after the confirmed submit' \
+    || fail "the append onto the confirmed batch must succeed"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a refused inject must be reported as a flush failure"
+  [ "$(away_ledger_chat_delivered "$state")" = 1 ] \
+    || fail "an attempt that failed to submit must not lower the confirmed prefix"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the retry after a refused inject must settle the batch"
+  count=$(grep -c 'first event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "a refused inject must not re-deliver the confirmed prefix (got $count)"
+  grep -F 'second event arriving after the confirmed submit' "$injected" >/dev/null \
+    || fail "the unconfirmed suffix must still reach captain chat"
+  pass "a refused inject never lowers the confirmed in-session prefix"
+}
+
+# The receipt names its own batch and lives beside the ledger, not inside it, so
+# a sidecar corrupted after a confirmed submit still fails OPEN (the unconfirmed
+# lines are surfaced) without repeating the prefix captain chat already has.
+test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix() {
+  local home state buf injected count
+  home=$(make_home away-corrupt-after-chat)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event the captain already saw' \
+    || fail "the first append must succeed"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+
+  escalate_add "$state" 'blocked: second event after the ledger went bad' \
+    || fail "the append onto the confirmed batch must succeed"
+  printf 'garbage\n' > "$buf.since"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "an unreadable ledger must still flush to the in-session fallback"
+
+  count=$(grep -c 'first event the captain already saw' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "an unreadable ledger must not repeat the confirmed prefix (got $count)"
+  grep -F 'second event after the ledger went bad' "$injected" >/dev/null \
+    || fail "an unreadable ledger must still surface the unconfirmed lines"
+  pass "an unreadable ledger keeps the confirmed in-session prefix out of captain chat"
+}
+
+# A batch whose payload goes unreadable BEFORE its first in-session delivery has
+# no receipt to adopt an identity from, so the store falls back to the identity of
+# its own validated active version. Without that the prefix could never be opened
+# and every retry would repeat the lines captain chat already has.
+test_away_first_chat_delivery_under_a_corrupt_ledger_opens_a_receipt() {
+  local home state buf injected count
+  home=$(make_home away-corrupt-first-chat)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  injected="$home/injected.log"
+  : > "$state/.afk"
+  : > "$injected"
+  escalate_add "$state" 'blocked: first event under an unreadable ledger' \
+    || fail "the append must succeed"
+  assert_absent "$state/.subsuper-chat-delivery" \
+    "the batch must reach its first flush with no in-session receipt"
+  printf 'garbage\n' > "$buf.since"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    away_ledger_truncate() { return 1; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) && fail "a failed truncation must still be reported as a flush failure"
+  [ "$(away_ledger_chat_delivered "$state")" = 1 ] \
+    || fail "an unreadable ledger must still be able to open a confirmed chat prefix"
+
+  escalate_add "$state" 'blocked: second event under an unreadable ledger' \
+    || fail "the append onto the delivered batch must succeed"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" >> "$injected"; return 0; }
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    log() { :; }
+    escalate_flush "$state"
+  ) || fail "the retry must settle the batch"
+  count=$(grep -c 'first event under an unreadable ledger' "$injected")
+  [ "$count" -eq 1 ] \
+    || fail "the prefix opened under an unreadable ledger must not be re-delivered (got $count)"
+  grep -F 'second event under an unreadable ledger' "$injected" >/dev/null \
+    || fail "the unconfirmed suffix must still reach captain chat"
+  pass "a first in-session delivery under an unreadable ledger still opens a confirmed prefix"
+}
+
+# The daemon's TERM/INT cleanup runs its final flush inside the same shell, so a
+# transition must be able to nest inside a transaction this process already holds -
+# and a nested release must never drop the outer transaction's lock.
+test_away_store_lock_is_reentrant_for_its_own_holder() {
+  local home state dir buf
+  home=$(make_home away-lock-reentrant)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  dir="$state/tg-away-versions"
+  (umask 077; mkdir -p "$dir")
+
+  away_ledger_lock_acquire "$dir" || fail "acquiring the store lock must succeed"
+  away_ledger_append "$buf" 'blocked: nested under the holder-owned lock' \
+    || fail "a nested transition must not spin against a lock this process holds"
+  assert_present "$dir/.owner.lock" \
+    "a nested release must not drop the outer transaction's lock"
+  assert_grep 'nested under the holder-owned lock' "$buf" \
+    "the nested transition must still have committed and projected"
+  away_ledger_lock_release "$dir"
+  assert_absent "$dir/.owner.lock" "the outermost release must drop the lock"
+  pass "the store lock is reentrant for its own holder and only the outer release frees it"
+}
+
+# The predecessor is only retired when the successor was provably BUILT from it.
+# A live unit that diverged - an interrupted projection, or a writer outside this
+# owner - is staged from live instead, and its predecessor stays retained for the
+# return fold rather than being deleted on an unverified superset assumption.
+test_away_diverged_live_unit_retains_its_predecessor() {
+  local home state buf first second out
+  home=$(make_home away-diverged-unit)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+
+  escalate_add "$state" 'blocked: first event' || fail "the first append must succeed"
+  first=$(cat "$state/tg-away-versions/active")
+  escalate_add "$state" 'blocked: second event' || fail "the second append must succeed"
+  second=$(cat "$state/tg-away-versions/active")
+  assert_absent "$state/tg-away-versions/$first" \
+    "a successor built from its predecessor must retire it"
+
+  rm -f "$buf.since"
+  escalate_add "$state" 'blocked: third event' || fail "the third append must succeed"
+  [ "$(cat "$state/tg-away-versions/active")" != "$second" ] \
+    || fail "the diverged transition must have published its own successor"
+  assert_present "$state/tg-away-versions/$second/escalations" \
+    "a successor staged from a diverged live unit must retain its predecessor"
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding the retained predecessor must succeed"
+  assert_contains "$out" 'blocked: first event' \
+    "the retained predecessor must still reach the catch-up"
+  pass "a predecessor is retired only when the successor was built from it"
+}
+
+# The wedge and chat staging temps are part of the unit's temp set, so a crash
+# between mktemp and its removal must not outlive a lifecycle boundary.
+test_away_lifecycle_sweeps_leaked_unit_staging_temps() {
+  local home state
+  home=$(make_home away-temp-sweep)
+  state="$home/state"
+  : > "$state/.subsuper-inject-wedged.stage.zzzzzz"
+  : > "$state/.subsuper-chat-delivery.apply.zzzzzz"
+
+  away_ledger_retire_working_records "$state" || fail "the sweep must succeed"
+  assert_absent "$state/.subsuper-inject-wedged.stage.zzzzzz" \
+    "a leaked wedge staging temp must retire with the away session"
+  assert_absent "$state/.subsuper-chat-delivery.apply.zzzzzz" \
+    "a leaked in-session delivery temp must retire with the away session"
+  pass "leaked unit staging temps retire with the away session"
+}
+
+# Every identity this owner mints must be unique, and the mint runs from inside
+# command substitutions where bash 3.2 restarts $RANDOM from the caller's state.
+# Two mints in the same second colliding would give two batches one identity and
+# two versions one directory name - and a rename onto an existing version name
+# publishes the PREDECESSOR as though it were the successor, silently dropping the
+# transition that was just committed.
+test_away_minted_identities_do_not_collide_within_one_second() {
+  local home state buf version first second
+  home=$(make_home away-mint-unique)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  : > "$state/.afk"
+
+  escalate_add "$state" 'blocked: first within the same second' \
+    || fail "the first append must succeed"
+  escalate_add "$state" 'blocked: second within the same second' \
+    || fail "the second append must succeed"
+  [ "$(wc -l < "$buf" | tr -d ' ')" -eq 2 ] \
+    || fail "two appends in the same second must both survive: [$(cat "$buf")]"
+  version=$(cat "$state/tg-away-versions/active")
+  [ "$(wc -l < "$state/tg-away-versions/$version/escalations" | tr -d ' ')" -eq 2 ] \
+    || fail "the active version must hold both appends"
+  [ -z "$(find "$state/tg-away-versions" -name '.staging.*' 2>/dev/null)" ] \
+    || fail "a version must never contain a nested staging directory"
+
+  away_ledger_truncate "$buf" || fail "the truncation must succeed"
+  away_ledger_open "$buf" || fail "opening a fresh batch must succeed"
+  first=$(cut -d ' ' -f1 < "$buf.since")
+  away_ledger_truncate "$buf" || fail "the second truncation must succeed"
+  away_ledger_open "$buf" || fail "opening a second fresh batch must succeed"
+  second=$(cut -d ' ' -f1 < "$buf.since")
+  [ "$first" != "$second" ] \
+    || fail "two batch identities minted in the same second must differ ($first)"
+  pass "minted identities never collide within one second"
+}
+
+# Enforcement, not behaviour: the version store has exactly one writer, and the
+# migrating record read is never pointed at a version or staging directory. Both
+# are the invariants the immutability of a published version rests on, so they are
+# checked structurally rather than left to review.
+test_away_only_the_owner_writes_the_version_store() {
+  local hits
+  hits=$(grep -rn -E '(>>?[[:space:]]*"?[^|]*|cp |mv |rm |mkdir |chmod |touch )tg-away-versions' \
+    "$ROOT/bin" 2>/dev/null | grep -v '/fm-away-ledger-lib\.sh:' | grep -v '^[^:]*:[0-9]*:#' || true)
+  [ -z "$hits" ] \
+    || fail "only the away ledger owner may write the version store: $hits"
+  # shellcheck disable=SC2016 # Literal shell syntax is the asserted pattern.
+  hits=$(grep -rn -E 'away_ledger_read "\$(vdir|staging)' "$ROOT/bin" 2>/dev/null || true)
+  [ -z "$hits" ] \
+    || fail "the migrating record read must never be pointed at a version or staging directory: $hits"
+  pass "the version store has a single writer and no migrating read inside a version"
+}
+
+# The record reader splits in two on purpose: away_ledger_peek must never write,
+# because it is the reader pointed at published immutable versions, while
+# away_ledger_read keeps migrating an earlier record shape in place for the LIVE
+# buffer the daemon owns.
+test_away_peek_never_writes_and_read_migrates_only_live() {
+  local home state buf before rec
+  home=$(make_home away-peek-pure)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: from a pre-ledger session\n' > "$buf"
+  printf '1700000000\n' > "$buf.since"
+  before=$(cat "$buf.since")
+
+  rec=$(away_ledger_peek "$buf")
+  [ "$rec" != unknown ] || fail "peek must normalise a pre-ledger record rather than fail closed"
+  [ "$(cat "$buf.since")" = "$before" ] \
+    || fail "peek must never write the record it read"
+  case "$rec" in
+    *' 0 0 0 0 0 none') ;;
+    *) fail "peek must report zeroed counts for a pre-ledger record: $rec" ;;
+  esac
+
+  rec=$(away_ledger_read "$buf")
+  [ "$rec" != unknown ] || fail "the live read must migrate a pre-ledger record"
+  [ "$(cat "$buf.since")" != "$before" ] \
+    || fail "the live read must still migrate an earlier record shape in place"
+  pass "the pure record read never writes, and only the live read migrates"
+}
+
+# Migration belongs to successor construction: publishing normalises the record
+# inside its own private staging copy, so the version carries a current-shape
+# record and the live sidecar it was copied from is left exactly as it was.
+test_away_version_publish_migrates_into_the_successor_only() {
+  local home state buf version vdir
+  home=$(make_home away-publish-migrates)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: owed since before the ledger\n' > "$buf"
+  printf '1700000000\n' > "$buf.since"
+
+  version=$(away_ledger_version_publish "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "publishing must succeed over an earlier record shape"
+  vdir="$state/tg-away-versions/$version"
+  [ "$(cat "$buf.since")" = 1700000000 ] \
+    || fail "publishing must not migrate the live sidecar it copied"
+  [ "$(awk '{print NF}' "$vdir/escalations.since")" = 7 ] \
+    || fail "the successor version must carry a current-shape record: $(cat "$vdir/escalations.since")"
+  [ "$(away_ledger_peek "$vdir/escalations")" != unknown ] \
+    || fail "the successor version's record must be readable without migration"
+  pass "an earlier record shape is migrated only into the successor version"
+}
+
+# The fold at return is strictly read-only, including over a version that
+# preserved an earlier record shape - the case a migrating read would have
+# rewritten inside a published version.
+test_away_fold_versions_never_mutates_a_legacy_version() {
+  local home state buf vdir before out
+  home=$(make_home away-fold-immutable)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  vdir="$state/tg-away-versions/v.1700000000-legacy"
+  (umask 077; mkdir -p "$vdir")
+  printf 'blocked: legacy shape, still owed\n' > "$vdir/escalations"
+  printf '1700000000\n' > "$vdir/escalations.since"
+  printf 'escalations\n' > "$vdir/manifest"
+  : > "$vdir/.complete"
+  before=$(cat "$vdir/escalations.since")
+
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding a legacy-shape version must succeed"
+  assert_contains "$out" 'blocked: legacy shape, still owed' \
+    "a legacy-shape version's owed line must still reach the catch-up"
+  [ "$(cat "$vdir/escalations.since")" = "$before" ] \
+    || fail "the fold must never write inside a published immutable version"
+  pass "the return fold never mutates a published version, whatever record shape it holds"
+}
+
+# One entry-boundary transaction owns capture-before-clear, so no away entry path
+# can delete a crashed session's un-flushed lines with no surviving copy.
+test_away_entry_capture_keeps_the_predecessor_before_a_clear() {
+  local home state buf version out
+  home=$(make_home away-entry-capture)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  seed_live_unit "$state"
+
+  version=$(away_ledger_entry_capture "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "the entry-boundary capture must succeed"
+  assert_present "$buf" "capture must leave the live unit for the caller to clear"
+  away_ledger_retire_batch "$state" "$buf" "$state/.subsuper-inject-wedged" \
+    || fail "retiring the live unit must succeed"
+  assert_absent "$buf" "the live unit must be gone after the entry clear"
+
+  out=$(away_ledger_fold_versions "$state" escalations) \
+    || fail "folding the captured version must succeed"
+  assert_contains "$out" 'blocked: still owed to captain chat' \
+    "the captured version must still hold what the entry clear removed"
+  [ "$(away_ledger_version_names "$state")" = "$version" ] \
+    || fail "the capture must leave exactly the version it published"
+  pass "the entry boundary captures the predecessor before any clear removes it"
+}
+
+# Retirement is acknowledgement: it must report failure while any version
+# survives, so a caller cannot close its gate over content that will be folded
+# again.
+test_away_versions_retire_all_refuses_while_a_version_survives() {
+  local home state buf version rc=0
+  home=$(make_home away-retire-fault)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  seed_live_unit "$state"
+  version=$(away_ledger_version_publish "$state" "$buf" "$state/.subsuper-inject-wedged") \
+    || fail "publishing must succeed"
+  chmod 500 "$state/tg-away-versions/$version"
+
+  away_ledger_versions_retire_all "$state" || rc=$?
+  expect_code 1 "$rc" "retirement must report failure while a version cannot be removed"
+  [ "$(away_ledger_version_names "$state")" = "$version" ] \
+    || fail "the unremovable version must still be listed as retained"
+
+  chmod 700 "$state/tg-away-versions/$version"
+  away_ledger_versions_retire_all "$state" \
+    || fail "retirement must succeed once the version can be removed"
+  [ -z "$(away_ledger_version_names "$state")" ] \
+    || fail "acknowledged retirement must leave no version behind"
+  pass "whole-version retirement reports failure until the store is provably empty"
+}
+
+# An uncertain outcome poisons the batch for the phone: confirmation can only ever
+# extend a contiguous proven prefix, so a later line is never sent (which would
+# risk a duplicate of the uncertain one) and never presented as delivered.
+test_away_uncertain_send_stops_the_batch_from_reaching_the_phone() {
+  local home state tg injected
+  home=$(make_home away-uncertain-gap)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+
+  escalate_add "$state" 'blocked: first event, response lost'
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "the first event must have been attempted exactly once"
+  ledger_field "$state" 3 0 "an uncertain send must not confirm anything"
+
+  escalate_add "$state" 'blocked: second event after the uncertainty'
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "an uncertain batch must still complete the in-session flush"
+
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "no event may reach the phone after an uncertain send in the same batch"
+  assert_grep 'Telegram delivery uncertain' "$injected" \
+    "an uncertain batch must never be reported as accepted"
+  assert_grep 'first event, response lost' "$injected" \
+    "the uncertain event must reach the visible in-session fallback"
+  assert_grep 'second event after the uncertainty' "$injected" \
+    "the later event must reach the visible in-session fallback"
+  assert_no_grep 'accepted away-mode alert' "$injected" \
+    "an unproven line must never be presented as delivered"
+  pass "an uncertain send keeps its reservation and stops the batch reaching the phone"
+}
+
+# A client that actually ran and exited 125 (or 124) must never be treated as
+# proven-local: those exit codes belong exclusively to wedge_alarm_run_bounded's
+# own pre-launch guard and timeout. A client-produced 125 must stay ambiguous -
+# reservation kept, attempt ordinal unchanged - so the same lines are never
+# offered to the phone again under a fresh delivery id (which would duplicate
+# the captain alert the client may already have sent).
+test_away_client_exit_125_is_never_proven_local() {
+  local home state tg injected
+  home=$(make_home away-client-exit-125)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: client exited 125 after issuing the request'
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" FAKE_TG_EXIT=125 escalate_flush "$state"
+  ) && fail "a client exit 125 must leave escalate_flush unconfirmed"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "the client must have been invoked exactly once"
+  ledger_field "$state" 2 1 "a client exit 125 must keep its reservation"
+  ledger_field "$state" 3 0 "a client exit 125 must not confirm anything"
+  ledger_field "$state" 5 0 "a client exit 125 must not advance the attempt ordinal"
+  assert_grep 'Telegram delivery uncertain' "$injected" \
+    "a client exit 125 must never be reported as a proven-local failure"
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "a poisoned batch must still complete the in-session flush"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "an ambiguous exit 125 must never be retried, which would risk a duplicate phone alert"
+  pass "a client exit 125 stays ambiguous and is never retried as proven-local"
+}
+
+# Every send must come through the ledger: no default arguments, no id minted
+# outside the owner, no bypass of the exactly-once accounting.
+test_away_delivery_refuses_untracked_sends() {
+  local home state tg out
+  home=$(make_home away-untracked)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  escalate_add "$state" 'blocked: needs the ledger'
+
+  out=$(
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FMTG_TG_BIN="$tg"
+    telegram_away_deliver "$state" 'blocked: needs the ledger'
+  )
+  [ "$out" = 'unavailable|none' ] \
+    || fail "a send without ledger arguments must refuse (got: $out)"
+
+  out=$(
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FMTG_TG_BIN="$tg"
+    telegram_away_deliver "$state" 'blocked: needs the ledger' 0 1 0 not-this-batch
+  )
+  [ "$out" = 'unavailable|none' ] \
+    || fail "a send naming another batch must refuse (got: $out)"
+
+  rm -f "$state/.subsuper-escalations.since"
+  out=$(
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+    export FMTG_TG_BIN="$tg"
+    telegram_away_deliver "$state" 'blocked: needs the ledger' 0 1 0 1700000000-abcdef0123456789
+  )
+  [ "$out" = 'unavailable|none' ] \
+    || fail "a send with no readable ledger must refuse (got: $out)"
+
+  assert_absent "$home/tg-sent.log" "an untracked send must never reach the phone"
+  assert_absent "$state/tg-away-delivery" "an untracked send must not mint delivery evidence"
+  pass "away delivery refuses every send that does not come through the ledger"
+}
+
+# A failure that provably never left the box must be genuinely retryable: the
+# retired attempt keeps its evidence, the ordinal advances, and the very same lines
+# reach the phone on the next flush once the client is back.
+test_away_proven_local_failure_retries_the_same_lines() {
+  local home state tg injected first_evidence ledger
+  home=$(make_home away-proven-local-retry)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: needs the captain, client offline'
+
+  # The client is not runnable yet, and the in-session receipt is wedged too, so
+  # the batch survives with its ledger.
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FM_TG_AWAY_RETRY_SECS=3600 FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+  assert_absent "$home/tg-sent.log" "a missing client cannot have sent anything"
+  ledger_field "$state" 2 0 "a proven-local failure must release its reservation"
+  ledger_field "$state" 5 1 "a proven-local failure must retire its attempt"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
+  first_evidence=$(ls "$state/tg-away-delivery"/*.status | head -n 1)
+  grep -Eq '^unavailable [0-9]+ sender_missing$' "$first_evidence" \
+    || fail "the retired attempt must keep its durable evidence"
+
+  # The retry is scheduled, not immediate: while the backoff is unelapsed the flush
+  # neither contacts the phone nor mints another evidence record.
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FM_TG_AWAY_RETRY_SECS=3600 FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "the still-wedged receipt must leave escalate_flush unconfirmed"
+  assert_absent "$home/tg-sent.log" "a deferred retry must not contact the phone"
+  assert_grep 'Telegram delivery deferred' "$injected" \
+    "a deferred retry must say so in the in-session fallback"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
+  [ "$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "a deferred retry must not mint another evidence record per tick"
+  ledger_field "$state" 5 1 "a deferred retry must not advance the attempt ordinal"
+
+  # The client comes back and the schedule elapses. The same buffer, unchanged,
+  # must now reach the phone.
+  ledger=$(away_ledger_read "$state/.subsuper-escalations")
+  # shellcheck disable=SC2086
+  set -- $ledger
+  away_ledger_write "$state/.subsuper-escalations" "$1" "$2" "$3" "$4" "$5" 0 "$7" \
+    || fail "could not elapse the retry schedule"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "the retry must complete the away flush"
+  assert_grep 'needs the captain, client offline' "$home/tg-sent.log" \
+    "a released attempt must be able to reach the phone again"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "the retry must contact the phone exactly once"
+  assert_grep 'Telegram accepted away-mode alert' "$injected" \
+    "the successful retry must report its real accepted outcome"
+  [ -f "$first_evidence" ] \
+    || fail "the retried attempt must not erase the earlier attempt's evidence"
+  pass "a proven-local failure retires its attempt and retries the same lines"
+}
+
+# The counts are validated one by one before any comparison, sender call, or ledger
+# mutation, so a partially-empty argument list cannot mint an id or send.
+test_away_delivery_refuses_malformed_counts() {
+  local home state batch_id tg
+  home=$(make_home away-malformed-counts)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  escalate_add "$state" 'blocked: must not slip through'
+  batch_id=$(away_ledger_read "$state/.subsuper-escalations" | cut -d' ' -f1)
+
+  malformed_refused() {  # <label> <offset> <total> <accounted>
+    local label=$1 out
+    out=$(
+      # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+      export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+      # shellcheck disable=SC2030,SC2031 # The exports are deliberately scoped to this subshell.
+      export FMTG_TG_BIN="$tg"
+      telegram_away_deliver "$state" 'blocked: must not slip through' \
+        "$2" "$3" "$4" "$batch_id" 2>&1
+    )
+    [ "$out" = 'unavailable|none' ] \
+      || fail "$label must refuse before anything else (got: $out)"
+  }
+  malformed_refused 'an empty offset' '' 1 0
+  malformed_refused 'an empty total' 0 '' 0
+  malformed_refused 'an empty accounted' 0 1 ''
+  malformed_refused 'a non-numeric offset' x 1 0
+  malformed_refused 'a non-numeric total' 0 y 0
+  malformed_refused 'a non-numeric accounted' 0 1 z
+  malformed_refused 'a negative offset' -1 1 0
+
+  assert_absent "$home/tg-sent.log" "a malformed call must never reach the phone"
+  assert_absent "$state/tg-away-delivery" "a malformed call must not mint delivery evidence"
+  ledger_field "$state" 2 0 "a malformed call must not mutate the ledger"
+  ledger_field "$state" 5 0 "a malformed call must not retire an attempt"
+  pass "away delivery refuses malformed counts before any send or ledger write"
+}
+
+# A ledger write that fails before any attempt must not tombstone the delivery id:
+# nothing was reserved and nothing was sent, so the next flush has to be able to
+# retry cleanly once the state directory is writable again.
+test_away_unwritable_ledger_leaves_the_id_retryable() {
+  local home state tg injected
+  home=$(make_home away-unwritable-ledger)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: state dir full'
+
+  # A read-only state dir makes the sidecar mktemp/mv fail, so the reservation
+  # cannot be recorded.
+  chmod 0500 "$state"
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "an unwritable ledger must leave escalate_flush unconfirmed"
+  chmod 0755 "$state"
+
+  assert_absent "$home/tg-sent.log" "an unreserved attempt must never reach the phone"
+  assert_grep 'blocked: state dir full' "$injected" \
+    "the unsent event must reach the visible in-session fallback"
+  if [ -d "$state/tg-away-delivery" ] && ls "$state/tg-away-delivery"/*.status >/dev/null 2>&1; then
+    fail "no attempt was made, so no delivery evidence may tombstone that id"
+  fi
+
+  # Writable again: the same lines must now reach the phone.
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "the retry after a writable ledger must complete the away flush"
+  assert_grep 'state dir full' "$home/tg-sent.log" \
+    "an unreserved attempt must stay retryable once the ledger is writable"
+  pass "an unwritable ledger never tombstones an id that made no attempt"
+}
+
+# An in-place daemon upgrade during a live away session must migrate the older
+# ledger shapes instead of failing closed and repeating delivered lines in chat.
+test_away_ledger_migrates_older_record_shapes() {
+  local home state buf rec
+  home=$(make_home away-ledger-migration)
+  state="$home/state"
+  buf="$state/.subsuper-escalations"
+  printf 'blocked: one\nblocked: two\n' > "$buf"
+
+  # Round-5 shape: id reserved confirmed accounted delivery-id.
+  printf '1700000050-abcdef0123456789 1 1 1 1700000050-abcdef0123456789-0-aaaaaaaaaaaaaaaa\n' \
+    > "$buf.since"
+  rec=$(away_ledger_read "$buf")
+  [ "$rec" != unknown ] || fail "the five-field ledger must migrate, not fail closed"
+  [ "$rec" = '1700000050-abcdef0123456789 1 1 1 0 0 1700000050-abcdef0123456789-0-aaaaaaaaaaaaaaaa' ] \
+    || fail "the five-field ledger must keep its counts and default the new fields (got: $rec)"
+  [ "$(away_ledger_read "$buf")" = "$rec" ] \
+    || fail "the migrated ledger must persist in place"
+
+  # Round-6 shape: ... attempt delivery-id.
+  printf '1700000060-abcdef0123456789 2 2 2 3 1700000060-abcdef0123456789-a3-0-bbbbbbbbbbbbbbbb\n' \
+    > "$buf.since"
+  rec=$(away_ledger_read "$buf")
+  [ "$rec" = '1700000060-abcdef0123456789 2 2 2 3 0 1700000060-abcdef0123456789-a3-0-bbbbbbbbbbbbbbbb' ] \
+    || fail "the six-field ledger must keep its attempt ordinal (got: $rec)"
+
+  # A genuinely malformed record still fails closed.
+  printf '1700000070-abcdef0123456789 2 2\n' > "$buf.since"
+  [ "$(away_ledger_read "$buf")" = unknown ] \
+    || fail "a malformed ledger must still fail closed"
+  pass "the ledger owner migrates older record shapes in place and still fails closed"
+}
+
+# The retry schedule must stay armed even in the documented immediate-batching
+# mode, where housekeeping flushes on every tick: a non-positive delay would spin
+# the whole reserve/attempt/spool/release cycle and mint an evidence file per tick.
+test_away_retry_throttle_survives_immediate_batching() {
+  local home state tg injected retry_after evidence_count
+  home=$(make_home away-retry-throttle)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  escalate_add "$state" 'blocked: client offline under immediate batching'
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FM_ESCALATE_BATCH_SECS=0 FM_TG_AWAY_RETRY_SECS=0 \
+      FMTG_TG_BIN="$home/missing-tg" escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+
+  retry_after=$(away_ledger_read "$state/.subsuper-escalations" | cut -d' ' -f6)
+  [ "$retry_after" -gt 0 ] \
+    || fail "a retired proven-local attempt must arm a positive retry schedule (got: $retry_after)"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
+  evidence_count=$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')
+
+  (
+    # shellcheck disable=SC2329 # Runtime override invoked by the code under test.
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FM_ESCALATE_BATCH_SECS=0 FM_TG_AWAY_RETRY_SECS=0 \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) && fail "the still-wedged receipt must leave escalate_flush unconfirmed"
+
+  assert_grep 'Telegram delivery deferred' "$injected" \
+    "an armed retry schedule must defer the next tick's attempt"
+  assert_absent "$home/tg-sent.log" "a deferred tick must not contact the phone"
+  # shellcheck disable=SC2012 # Delivery evidence names are generated ids without spaces.
+  [ "$(ls "$state/tg-away-delivery"/*.status | wc -l | tr -d ' ')" -eq "$evidence_count" ] \
+    || fail "a deferred tick must not mint another evidence record"
+  pass "the proven-local retry schedule stays bounded under immediate batching"
+}
+
 test_supervision_instructions_carry_tg_cadence() {
   local home out
   home="$TMP_ROOT/sup-instructions"; mkdir -p "$home/config"
@@ -544,6 +2265,52 @@ test_watcher_rejects_tampered_tg_shim
 test_link_records_note_and_timestamp
 test_link_rejects_unsafe_and_missing
 test_followup_lifecycle
+test_away_delivery_is_inert_outside_away_mode
+test_away_delivery_is_accepted_once_and_records_no_content
+test_away_delivery_failure_classes_and_safe_chat_fallback
+test_away_delivery_acceptance_does_not_duplicate_alert_in_chat
+test_away_batch_never_resends_accepted_events
+test_away_unusable_bookkeeping_never_sends_to_the_phone
+test_away_reserved_lines_resolve_from_evidence_not_from_the_claim
+test_away_off_mid_batch_never_repeats_delivered_events
+test_away_lifecycle_retires_tg_working_records
+test_away_version_publish_is_complete_and_atomic
+test_away_version_incomplete_publication_is_never_visible
+test_away_version_switch_is_refused_while_a_daemon_is_live
+test_away_version_switch_installs_the_whole_unit_and_replays
+test_away_fold_versions_emits_each_escalation_once
+test_away_no_adoption_or_merge_apis_remain
+test_away_every_transition_goes_through_the_version_transaction
+test_away_append_transition_publishes_and_projects
+test_away_record_and_digest_transitions_publish_versions
+test_away_wedge_and_truncate_transitions_publish_versions
+test_away_unparseable_record_is_quarantined_not_fatal
+test_away_gc_clears_a_dangling_active_pointer
+test_away_store_lock_steal_never_removes_a_new_owner
+test_away_refused_append_keeps_the_wake_re_derivable
+test_away_confirmed_inject_is_never_repeated_after_a_failed_truncate
+test_away_confirmed_chat_prefix_survives_a_growing_batch
+test_away_failed_inject_never_lowers_the_confirmed_chat_prefix
+test_away_corrupt_ledger_keeps_the_confirmed_chat_prefix
+test_away_first_chat_delivery_under_a_corrupt_ledger_opens_a_receipt
+test_away_store_lock_is_reentrant_for_its_own_holder
+test_away_diverged_live_unit_retains_its_predecessor
+test_away_lifecycle_sweeps_leaked_unit_staging_temps
+test_away_minted_identities_do_not_collide_within_one_second
+test_away_only_the_owner_writes_the_version_store
+test_away_peek_never_writes_and_read_migrates_only_live
+test_away_version_publish_migrates_into_the_successor_only
+test_away_fold_versions_never_mutates_a_legacy_version
+test_away_entry_capture_keeps_the_predecessor_before_a_clear
+test_away_versions_retire_all_refuses_while_a_version_survives
+test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
+test_away_client_exit_125_is_never_proven_local
+test_away_delivery_refuses_untracked_sends
+test_away_delivery_refuses_malformed_counts
+test_away_proven_local_failure_retries_the_same_lines
+test_away_unwritable_ledger_leaves_the_id_retryable
+test_away_ledger_migrates_older_record_shapes
+test_away_retry_throttle_survives_immediate_batching
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence
 

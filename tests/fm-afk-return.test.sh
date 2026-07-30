@@ -19,6 +19,8 @@ install_runner() {  # <case-dir>
   cp "$ROOT/bin/fm-afk-return.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-away-ledger-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-x-lib.sh" "$dir/bin/"
   cat > "$dir/bin/fm-afk-launch.sh" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = stop ] || exit 2
@@ -209,7 +211,138 @@ test_check_retries_recorded_terminal_teardown() {
   pass "check retries recorded terminal teardown and keeps catch-up gated until success"
 }
 
+test_return_folds_accepted_away_digest_before_retiring_it() {
+  local dir out
+  dir="$TMP_ROOT/away-digest-fold"
+  install_runner "$dir"
+  : > "$dir/home/state/.afk"
+  mkdir -p "$dir/home/state/tg-away-digest"
+  chmod 0700 "$dir/home/state/tg-away-digest"
+  printf 'stale persisted 300s (possible wedge): fm-task-3\n' \
+    > "$dir/home/state/tg-away-digest/b1-0-abc.items"
+  chmod 0600 "$dir/home/state/tg-away-digest/b1-0-abc.items"
+
+  out=$(run_return "$dir" begin) \
+    || fail "an accepted away digest must not block the return catch-up: $out"
+  case "$out" in
+    *'catch-up away-telegram: stale persisted 300s (possible wedge): fm-task-3'*) ;;
+    *) fail "return catch-up did not fold the accepted away digest: $out" ;;
+  esac
+  [ ! -e "$dir/home/state/tg-away-digest" ] \
+    || fail "the away digest must retire once it has been folded into the catch-up"
+  pass "return catch-up folds every accepted away digest in before retiring it"
+}
+
+
+# A line the ledger already accounted for in a private away digest reaches the
+# catch-up ONCE. Reproduces the accepted-but-unreceipted case: the phone accepted
+# the alert, the in-session receipt injection failed, so the buffer still holds
+# the line with accounted == 1. Appending the whole buffer as well as the digest
+# would present the same escalation as two separate items to act on.
+test_return_evidence_never_duplicates_a_digested_line() {
+  local dir out rc=0 count
+  dir="$TMP_ROOT/no-duplicate-digested"
+  install_runner "$dir"
+  : > "$dir/home/state/.afk"
+  printf 'blocked: accepted on the phone, receipt injection failed\n' \
+    > "$dir/home/state/.subsuper-escalations"
+  printf '1700000000-abc 1 1 1 0 0 1700000000-abc-a0-0-d1\n' \
+    > "$dir/home/state/.subsuper-escalations.since"
+  mkdir -p "$dir/home/state/tg-away-digest"
+  chmod 0700 "$dir/home/state/tg-away-digest"
+  printf 'blocked: accepted on the phone, receipt injection failed\n' \
+    > "$dir/home/state/tg-away-digest/1700000000-abc-a0-0-d1.items"
+
+  out=$(run_return "$dir" begin) || rc=$?
+  [ "$rc" -eq 0 ] || fail "an accounted-for escalation must not gate the catch-up (rc=$rc): $out"
+  count=$(printf '%s\n' "$out" | grep -c 'receipt injection failed')
+  [ "$count" -eq 1 ] \
+    || fail "a digested escalation must reach the catch-up exactly once (got $count): $out"
+  case "$out" in
+    *'catch-up away-telegram: blocked: accepted on the phone, receipt injection failed'*) ;;
+    *) fail "the digested escalation must be reported as the away-telegram item: $out" ;;
+  esac
+  pass "return catch-up never presents an already-digested escalation twice"
+}
+
+# A failed away-mode stop leaves the daemon possibly alive, so nothing may mutate
+# the immutable batch versions: the catch-up only READS them, and retirement waits
+# for the acknowledged pass.
+test_return_failed_stop_leaves_away_versions_untouched() {
+  local dir out rc=0 vdir
+  dir="$TMP_ROOT/failed-stop-versions"
+  install_runner "$dir"
+  vdir="$dir/home/state/tg-away-versions/v.1700000000-retained"
+  mkdir -p "$vdir"
+  printf 'blocked: retained by a refused pointer switch\n' > "$vdir/escalations"
+  printf 'escalations\n' > "$vdir/manifest"
+  : > "$vdir/.complete"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fail-terminal-stop-once"
+
+  out=$(run_return "$dir" begin) || rc=$?
+  [ "$rc" -eq 3 ] || fail "a failed away-mode stop must gate the catch-up (rc=$rc): $out"
+  [ -e "$vdir/.complete" ] \
+    || fail "a failed stop must leave every immutable away batch version untouched"
+  case "$out" in
+    *'catch-up escalation: blocked: retained by a refused pointer switch'*) ;;
+    *) fail "a retained away batch version must be folded into the catch-up: $out" ;;
+  esac
+
+  rc=0
+  out=$(run_return "$dir" check) || rc=$?
+  [ "$rc" -eq 0 ] || fail "check must close the gate once the stop succeeds (rc=$rc): $out"
+  [ ! -e "$dir/home/state/tg-away-versions" ] \
+    || fail "away batch versions must retire only once the catch-up is acknowledged"
+  pass "a failed stop never mutates away batch versions; acknowledgement retires them"
+}
+
+
+# Retirement is part of acknowledgement, so a version that could not be removed
+# keeps the gate open instead of reporting a clear catch-up over content the next
+# pass would fold again. The retry must not duplicate that evidence either.
+test_return_keeps_the_gate_until_versions_retire() {
+  local dir out rc=0 vdir count
+  dir="$TMP_ROOT/retire-fault"
+  install_runner "$dir"
+  vdir="$dir/home/state/tg-away-versions/v.1700000000-stuck"
+  mkdir -p "$vdir"
+  printf 'blocked: retained and not yet acknowledged\n' > "$vdir/escalations"
+  printf 'escalations\n' > "$vdir/manifest"
+  : > "$vdir/.complete"
+  chmod 500 "$vdir"
+
+  out=$(run_return "$dir" begin) || rc=$?
+  [ "$rc" -eq 3 ] || fail "a failed away batch retirement must gate the catch-up (rc=$rc): $out"
+  [ -e "$dir/home/state/.afk-return-catchup" ] \
+    || fail "a failed retirement left no gate behind"
+  case "$out" in
+    *'away batch records could not be retired'*) ;;
+    *) fail "a failed retirement must surface a lifecycle blocker: $out" ;;
+  esac
+  [ -e "$vdir/.complete" ] || fail "the version must survive a failed retirement intact"
+
+  rc=0
+  out=$(run_return "$dir" check) || rc=$?
+  [ "$rc" -eq 3 ] || fail "check must keep gating while retirement still fails (rc=$rc): $out"
+  count=$(grep -c 'retained and not yet acknowledged' "$dir/home/state/.afk-return-catchup")
+  [ "$count" -eq 1 ] \
+    || fail "re-folding the same surviving version must not duplicate its evidence (got $count)"
+
+  chmod 700 "$vdir"
+  rc=0
+  out=$(run_return "$dir" check) || rc=$?
+  [ "$rc" -eq 0 ] || fail "check must close the gate once retirement succeeds (rc=$rc): $out"
+  [ ! -e "$dir/home/state/tg-away-versions" ] \
+    || fail "an acknowledged catch-up must leave no away batch version behind"
+  pass "the return gate stays open until whole-version retirement succeeds, without duplicating evidence"
+}
+
 test_return_gate_orders_catchup_before_bearings
+test_return_folds_accepted_away_digest_before_retiring_it
+test_return_evidence_never_duplicates_a_digested_line
+test_return_failed_stop_leaves_away_versions_untouched
+test_return_keeps_the_gate_until_versions_retire
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
 test_away_reentry_refuses_pending_return_gate

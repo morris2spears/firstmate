@@ -27,6 +27,10 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 GATE="$STATE/.afk-return-catchup"
+# The away batch ledger owner: the return path folds and retires the away records
+# through it rather than deleting them itself.
+# shellcheck source=bin/fm-away-ledger-lib.sh
+. "$SCRIPT_DIR/fm-away-ledger-lib.sh"
 LOCK="$STATE/.afk-return-catchup.lock"
 
 usage() {
@@ -121,10 +125,21 @@ print_blockers() {  # <file>
 }
 
 clear_delivery_artifacts() {
-  rm -f \
-    "$STATE/.subsuper-escalations" \
-    "$STATE/.subsuper-escalations.since" \
-    "$STATE/.subsuper-inject-wedged"
+  # Retire the complete owned unit and every away batch version through the
+  # ledger owner. This is the ACKNOWLEDGEMENT boundary: it only runs once the
+  # catch-up evidence has folded in the live digests and every retained version
+  # and no blocker is left, and it runs BEFORE the gate is removed - its status
+  # decides whether the gate may close at all. A version that survived retirement
+  # would otherwise be folded again by the next catch-up and presented as fresh
+  # work, so a failure here keeps the gate open instead. The text-free
+  # <id>.status delivery evidence is deliberately kept.
+  local result=0
+  away_ledger_retire_batch "$STATE" "$STATE/.subsuper-escalations" \
+    "$STATE/.subsuper-inject-wedged" || result=1
+  away_ledger_versions_retire_all "$STATE" || result=1
+  [ "$result" -eq 0 ] \
+    || printf 'fm-afk-return: some away batch records could not be retired after catch-up\n' >&2
+  return "$result"
 }
 
 return_guard() {
@@ -141,7 +156,8 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations lifecycle_ok=1
+  local evidence blockers drained wedge escalations away_items lifecycle_ok=1
+  local fold_retained_rc=0
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -160,32 +176,78 @@ return_reconcile() {
   }
   append_evidence wake "$drained" "$evidence"
 
-  if [ -s "$STATE/.subsuper-inject-wedged" ]; then
-    wedge=$(head -1 "$STATE/.subsuper-inject-wedged" 2>/dev/null || true)
-    append_evidence wedge "$wedge" "$evidence"
-  fi
-  if [ -s "$STATE/.subsuper-escalations" ]; then
-    escalations=$(cat "$STATE/.subsuper-escalations" 2>/dev/null || true)
-    append_evidence escalation "$escalations" "$evidence"
+  # Every catch-up read below appends into the SAME evidence kind whether the text
+  # came from the live unit or from a retained immutable batch version, because a
+  # retained version's content is a prefix-subset of the live unit whenever the
+  # live unit was materialised from it. append_evidence dedupes exact records per
+  # kind, so each logical escalation reaches Firstmate exactly once instead of
+  # once per source under two different labels.
+  wedge=$(
+    if [ -s "$STATE/.subsuper-inject-wedged" ]; then
+      head -1 "$STATE/.subsuper-inject-wedged" 2>/dev/null || true
+    fi
+    away_ledger_fold_versions "$STATE" wedges 2>/dev/null || true
+  )
+  append_evidence wedge "$wedge" "$evidence"
+  # Only the lines the ledger has NOT already accounted for in a private away
+  # digest: anything at or below `accounted` is reported once below as
+  # away-telegram, and appending the whole buffer here would present the same
+  # escalation to Firstmate as two separate catch-up items to act on. An absent
+  # or unreadable record falls back to the whole buffer, so an unusable ledger
+  # over-reports rather than dropping a captain-relevant line.
+  #
+  # The retained side is every immutable away batch version still in the store:
+  # one whose active-pointer switch was refused (a daemon still live, e.g. after
+  # a failed stop), one whose launch transaction was abandoned, and the one a
+  # fresh away entry published before retiring that content from the live paths.
+  # All of it is read-only here; nothing is retired before the acknowledgement in
+  # clear_delivery_artifacts.
+  escalations=$(
+    away_ledger_unaccounted_lines "$STATE/.subsuper-escalations" 2>/dev/null || true
+    away_ledger_fold_versions "$STATE" escalations 2>/dev/null || exit 1
+  ) || fold_retained_rc=$?
+  append_evidence escalation "$escalations" "$evidence"
+  # An accepted away batch has already been receipted and its buffer truncated, so
+  # the ledger owner's private digests are the only local copy of those events.
+  # Fold them in BEFORE anything retires them.
+  away_items=$(
+    away_ledger_fold_digests "$STATE" 2>/dev/null || true
+    away_ledger_fold_versions "$STATE" digests 2>/dev/null || exit 1
+  ) || fold_retained_rc=$?
+  append_evidence away-telegram "$away_items" "$evidence"
+  if [ "$fold_retained_rc" -ne 0 ]; then
+    append_evidence lifecycle 'a retained away-mode batch version could not be read; retry catch-up before ordinary work' "$evidence"
+    lifecycle_ok=0
   fi
 
   scan_open_blockers > "$blockers"
-  if [ "$lifecycle_ok" -ne 1 ] || [ -s "$blockers" ]; then
+  # This pass's folded evidence is made durable in the gate BEFORE anything is
+  # retired, so a gate write that fails can never leave freshly folded escalation
+  # text deleted from disk and recorded nowhere. Only once the gate holds it is
+  # retirement attempted, and retirement is itself part of acknowledgement: a
+  # failure keeps the gate open exactly like an unresolved blocker. Re-running is
+  # safe and does not duplicate - the gate preserves this evidence and
+  # append_evidence dedupes exact records, so the next pass folds the same
+  # surviving version into the same records it already published.
+  write_gate "$evidence" "$blockers" || { rm -f "$evidence" "$blockers"; return 1; }
+  if [ "$lifecycle_ok" -eq 1 ] && [ ! -s "$blockers" ]; then
+    if clear_delivery_artifacts; then
+      print_evidence "$evidence"
+      rm -f "$GATE"
+      rm -f "$evidence" "$blockers"
+      printf 'fm-afk-return: catch-up clear; ordinary captain work may proceed\n'
+      return 0
+    fi
+    append_evidence lifecycle 'away batch records could not be retired; retry catch-up before ordinary work' "$evidence"
+    lifecycle_ok=0
     write_gate "$evidence" "$blockers" || { rm -f "$evidence" "$blockers"; return 1; }
-    printf 'fm-afk-return: catch-up must finish before the captain request\n' >&2
-    print_evidence "$GATE" >&2
-    print_blockers "$GATE" >&2
-    printf 'fm-afk-return: handle each blocker now, or close it with resolved [key=...] and append a durable reclassification reason, then run bin/fm-afk-return.sh check\n' >&2
-    rm -f "$evidence" "$blockers"
-    return 3
   fi
-
-  print_evidence "$evidence"
-  rm -f "$GATE"
-  clear_delivery_artifacts
+  printf 'fm-afk-return: catch-up must finish before the captain request\n' >&2
+  print_evidence "$GATE" >&2
+  print_blockers "$GATE" >&2
+  printf 'fm-afk-return: handle each blocker now, or close it with resolved [key=...] and append a durable reclassification reason, then run bin/fm-afk-return.sh check\n' >&2
   rm -f "$evidence" "$blockers"
-  printf 'fm-afk-return: catch-up clear; ordinary captain work may proceed\n'
-  return 0
+  return 3
 }
 
 main() {

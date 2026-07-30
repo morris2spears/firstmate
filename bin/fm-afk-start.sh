@@ -42,6 +42,11 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 
+# The away batch ledger owner: this script retires a previous session's ledger
+# and working records through it instead of deleting those files itself.
+# shellcheck source=bin/fm-away-ledger-lib.sh
+. "$FM_AFK_START_DIR/fm-away-ledger-lib.sh"
+
 fm_afk_start_usage() {
   sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -59,11 +64,20 @@ fm_afk_start_usage() {
 # lifecycle" and bin/fm-supervise-daemon.sh's escalate_add/inject_wedge_alarm).
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
-fm_afk_clear_stale_artifacts() {  # <state-dir>
-  local state=$1
-  rm -f "$state/.subsuper-escalations" \
-        "$state/.subsuper-escalations.since" \
-        "$state/.subsuper-inject-wedged" 2>/dev/null
+#
+# <had-afk>, when 1, means state/.afk was already present before this call -
+# a crashed-daemon restart or a failed re-entry mid-away-session, not a
+# genuinely fresh entry - so the digest directory is preserved rather than
+# retired: those items may be accepted-and-receipted but not yet consumed or
+# folded by Firstmate, and this path never re-derives them the way the
+# escalation buffer itself is re-derived by the daemon's heartbeat scan.
+fm_afk_clear_stale_artifacts() {  # <state-dir> [had-afk]
+  local state=$1 had_afk=${2:-0}
+  # The ledger owner retires the complete owned unit (buffer, wedge marker,
+  # sidecar, working records) itself; the text-free <id>.status delivery
+  # evidence is deliberately left in place.
+  away_ledger_retire_batch "$state" "$state/.subsuper-escalations" \
+    "$state/.subsuper-inject-wedged" "$had_afk"
 }
 
 daemon_lock_owner() {
@@ -118,6 +132,8 @@ fm_afk_start_main() {
   esac
 
   mkdir -p "$FM_AFK_STATE"
+  local had_afk=0
+  [ -f "$FM_AFK_STATE/.afk" ] && had_afk=1
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
     [ -f "$FM_AFK_STATE/.afk" ] || { echo "afk: launcher-prepared state is missing" >&2; return 1; }
   else
@@ -137,8 +153,41 @@ fm_afk_start_main() {
 
   # Fresh start: clear the previous away session's stale delivery artifacts
   # before the new daemon can surface them (fix for the leaked-artifact defect).
+  #
+  # A direct start is an away entry like any other, so it goes through the SAME
+  # owner-controlled entry-boundary transaction the launcher uses: sweep, replay
+  # an interrupted active-pointer switch, and capture the predecessor unit as one
+  # immutable version FIRST. Without that capture this clear would delete a
+  # crashed session's un-flushed escalation lines with no surviving copy, so a
+  # failed capture refuses the start instead of clearing anything.
   if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
-    fm_afk_clear_stale_artifacts "$FM_AFK_STATE"
+    if ! away_ledger_entry_capture "$FM_AFK_STATE" \
+        "$FM_AFK_STATE/.subsuper-escalations" \
+        "$FM_AFK_STATE/.subsuper-inject-wedged" >/dev/null; then
+      echo "afk: could not capture the prior away batch as an immutable version; refusing to clear it" >&2
+      # Away mode never actually started, so roll back the flag THIS invocation
+      # wrote rather than leaving the system flagged away with no daemon
+      # supervising it. A flag that predates this call belongs to the session
+      # already in progress and is left alone.
+      if [ "$had_afk" -eq 0 ]; then
+        rm -f "$FM_AFK_STATE/.afk" 2>/dev/null || true
+      fi
+      return 1
+    fi
+    # The clear is an owner transaction too, so it can legitimately refuse (owner
+    # lock busy, a live artifact that will not go). Under this script's errexit
+    # an unguarded call would end the run silently, mid-retirement, with away
+    # mode already flagged and no daemon. Fail honestly instead: the captured
+    # version above retains every owed line, so nothing is lost.
+    local clear_rc=0
+    fm_afk_clear_stale_artifacts "$FM_AFK_STATE" "$had_afk" || clear_rc=$?
+    if [ "$clear_rc" -ne 0 ]; then
+      echo "afk: could not retire the prior away batch through the ledger owner (its immutable version is retained); refusing to start the daemon" >&2
+      if [ "$had_afk" -eq 0 ]; then
+        rm -f "$FM_AFK_STATE/.afk" 2>/dev/null || true
+      fi
+      return 1
+    fi
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"

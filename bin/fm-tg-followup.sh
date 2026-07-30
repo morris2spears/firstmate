@@ -154,14 +154,19 @@ fi
 STRIPPED=$(printf '%s' "$TEXT" | tr -d '[:space:]')
 [ -n "$STRIPPED" ] || { echo "fm-tg-followup: refusing to send an empty follow-up" >&2; exit 2; }
 
-TG_BIN=${FMTG_TG_BIN:-$HOME/dev/phone-inbox/tg}
-if [ ! -f "$TG_BIN" ] || [ ! -x "$TG_BIN" ]; then
-  echo "fm-tg-followup: phone-inbox tg client not runnable at $TG_BIN" >&2
+# "No runnable client" is decided OUT OF BAND, before the client can run at all,
+# so the diagnostic can never be forged by an exit status the client produced for
+# its own reasons (a real client that exits 127 is a rejected send, not a missing
+# client). Past this guard every non-zero status is a send failure.
+if ! fmtg_client_runnable; then
+  echo "fm-tg-followup: phone-inbox tg client not runnable at $(fmtg_tg_bin)" >&2
   exit 1
 fi
 
 # The text travels on stdin only; tg owns the Telegram message limit.
-if ! printf '%s' "$TEXT" | "$TG_BIN"; then
+# fmtg_send_stdin keeps every firstmate outbound path on this same client and
+# owns resolving it.
+if ! printf '%s' "$TEXT" | fmtg_send_stdin; then
   echo "fm-tg-followup: tg send failed; link kept for retry" >&2
   exit 1
 fi

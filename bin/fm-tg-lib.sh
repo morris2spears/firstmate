@@ -30,6 +30,11 @@
 #                                  tg_followups to 0
 #   fmtg_meta_followups_set <meta> <n> - rewrite just the follow-up counter
 #   fmtg_meta_link_clear <meta>  - remove the Telegram note link entirely
+#   fmtg_tg_bin                  - resolved path of that client (FMTG_TG_BIN
+#                                  overrides), the single owner of the default
+#   fmtg_send_stdin              - send one message through phone-inbox's
+#                                  existing authenticated tg client, with text
+#                                  on stdin and no credential handling here
 
 FM_TG_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-x-lib.sh
@@ -44,6 +49,33 @@ fmtg_enabled() {
 
 fmtg_inbox_root() {
   printf '%s\n' "${PHONE_INBOX_ROOT:-$HOME/.claude/inbox}"
+}
+
+# The phone-inbox tg client remains the single outbound transport owner.
+# Callers provide text on stdin only, so alert content never appears in process
+# arguments. The client validates Telegram's accepted response and scrubs its
+# own diagnostics; callers should still classify failures without relaying raw
+# stderr because it can name private local paths.
+# Single owner of the client path and its FMTG_TG_BIN override, so no caller has
+# to re-derive the default in order to describe a missing client.
+fmtg_tg_bin() {
+  printf '%s\n' "${FMTG_TG_BIN:-$HOME/dev/phone-inbox/tg}"
+}
+
+# Whether the client is runnable at all, checked as its own out-of-band signal
+# so a caller can treat "no client to run" as unforgeable and distinct from any
+# exit status the client itself might later return once it actually ran.
+fmtg_client_runnable() {
+  local tg_bin
+  tg_bin=$(fmtg_tg_bin)
+  [ -f "$tg_bin" ] && [ -x "$tg_bin" ]
+}
+
+fmtg_send_stdin() {
+  local tg_bin
+  tg_bin=$(fmtg_tg_bin)
+  [ -f "$tg_bin" ] && [ -x "$tg_bin" ] || return 127
+  "$tg_bin"
 }
 
 # Print the numeric ids of pending phone-inbox notes, one per line, sorted and

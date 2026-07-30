@@ -61,6 +61,7 @@ No `/back` is needed. The first genuine message is the return signal:
 - A message **without** the current operational prefix or a legacy bare marker, and **not** starting with `/afk` -> the captain is back.
   Run `bin/fm-afk-return.sh` before acting on the message that brought the captain back.
   That script owns correct-ordered daemon shutdown, durable wake draining, escalation and wedge evidence, and the return-catch-up gate.
+  Its `away-telegram` evidence records carry the escalation lines an accepted Telegram notice already delivered to the captain's phone, so they never appeared in chat; act on them like any other catch-up evidence rather than re-alerting him.
   If it reports a firstmate-actionable `blocked:` event, remediate it immediately through the normal lifecycle, or explicitly reclassify it with a durable reason and close its decision key with `resolved [key=...]`, then run `bin/fm-afk-return.sh check`.
   Once the daemon stops, resume full per-wake responsiveness through the emitted primary-harness supervision protocol while blocker handling proceeds, so the gate never creates a blind wait.
   Do not answer a Bearings request or perform any other ordinary captain work until the check exits successfully.
@@ -170,17 +171,20 @@ Classify each wake this way:
   captain-relevant status line the per-wake classifier might miss.
 - Unknown reason, or any uncertainty -> escalate fail-safe.
 
-Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 =
-immediate) and flushed as one single-line digest prefixed with the current
-operational prefix, carrying pre-read status summaries and a recommended action.
-The single-line format makes the submission unambiguous across harnesses, and
-the operational prefix lets firstmate distinguish it from a real captain message.
+Escalations are buffered up to `FM_ESCALATE_BATCH_SECS` (default 90s; 0 = immediate) and flushed as one batch.
+When Telegram mode is configured, that same batch first goes through the existing phone-inbox `tg` client as a concise notice with an explicit reminder that the notice grants no approval.
+`bin/fm-away-ledger-lib.sh` is the single owner of the batch ledger (`state/.subsuper-escalations.since`: batch identity plus `reserved`, `confirmed`, and `accounted` counts, an attempt ordinal, and a `retry-after` epoch - the schedule the `deferred` outcome below reads); the phone only ever gets lines past `reserved`, so a batch that grows while the receipt is wedged sends one notice per new increment and never repeats a delivered line.
+An accepted and fully recorded send leaves only a non-secret internal delivery receipt in Firstmate chat, naming the batch's private away digests `state/tg-away-digest/<batch-id>-*.items`; read those to reconcile and act, and do not repeat the alert to the captain there.
+Every other outcome preserves the not-yet-recorded items in the in-session escalation as the safe fallback and labels the outcome honestly: `uncertain` means the send may or may not have reached the captain (a watchdog timeout, or a client that ran and exited non-zero, which cannot be told apart from a lost response to an accepted send) so it keeps its reservation and the rest of that batch goes to chat only, `failed`/`unavailable` means nothing left the box, so he was definitively not contacted there and that attempt is retired for a scheduled retry of the same lines, `deferred` means such a retry is armed but its schedule has not elapsed yet, an accepted send with an incomplete digest carries its items in session once, and an unreadable ledger means nothing was sent to the phone.
+Accepted, failed, and unavailable outcomes persist under `state/tg-away-delivery/` by opaque delivery id without message text, chat id, token, or raw sender diagnostics; the away digests are separate private 0600 working records that DO hold the distilled lines, are folded into the return catch-up evidence before retirement, and retire with the away session.
+The ledger reserves lines before network I/O and advances `confirmed` only from durable accepted evidence, and only over a contiguous prefix, so an accepted increment never implies acceptance of an earlier uncertain line; a restart resolves an interrupted send from that evidence instead of guessing: accepted evidence confirms with no second alert, an unresolved attempt is retired as uncertain and never retried, and a reservation with no evidence is released so those lines can still reach the phone.
+Without Telegram mode configured, away mode keeps its existing in-session fallback behavior.
+The single-line internal format makes submission unambiguous across harnesses, and the operational prefix lets firstmate distinguish it from a real captain message.
 
 ## Injection hardening
 
-- **Single-line digest** - embedded newlines are collapsed to a literal
-  separator before injection, so submission is unambiguous regardless of
-  harness.
+- **Single-line digest** - embedded newlines are collapsed to a literal separator before phone delivery or injection, so submission is unambiguous regardless of harness.
+- **No duplicate captain notice** - accepted Telegram delivery injects only an opaque receipt; firstmate reads the durable fleet records to act and does not repeat the alert in captain chat while away mode remains active.
 - **Composer guard on the supervisor pane** - before injecting, the daemon checks `pane_is_busy` (harness busy footer means agent mid-turn) and reads `fm_backend_composer_state` directly.
   Only `empty` permits injection; `pending` protects half-typed or swallowed input, and `unknown` protects unreadable panes and bare dead-shell prompts.
   Every other result preserves the buffer for retry, so the daemon never merges its digest into the captain's half-typed line or types it into a shell.
@@ -232,6 +236,7 @@ the operational prefix lets firstmate distinguish it from a real captain message
 Treat `state/.subsuper-escalations`, its `.since` sidecar, and `state/.subsuper-inject-wedged` as session-scoped delivery artifacts, not as the durable work record.
 Always enter through `bin/fm-afk-launch.sh`, which clears prior-session artifacts only for a fresh entry and preserves the current session's buffer on refresh.
 Always exit through `bin/fm-afk-launch.sh stop`, which keeps `state/.afk` present through the daemon's shutdown flush and clears it last.
+Never delete those artifacts, the away digests, or the batch versions by hand: entry and return retire them through `bin/fm-away-ledger-lib.sh`, and a retirement that fails deliberately holds the return-catch-up gate open.
 `docs/herdr-backend.md` "Away-mode supervisor support" owns the current mechanism, and `docs/verification/runtime-backends.md` "Away-mode transport" owns active evidence.
 
 ## Reliability properties

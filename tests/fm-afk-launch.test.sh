@@ -230,6 +230,106 @@ unit_failed_start_rolls_back_state() {
   rm -rf "$st"
 }
 
+unit_failed_start_preserves_digests_mid_session() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-failed-start-digest.XXXXXX")
+  mkdir -p "$st/state/tg-away-digest"
+  printf 'was already away\n' > "$st/state/.afk"
+  printf 'pending\n' > "$st/state/.subsuper-escalations"
+  printf '1700000000-abc 1 1 1 0 0 x\n' > "$st/state/.subsuper-escalations.since"
+  printf 'blocked: needs the captain\n' > "$st/state/tg-away-digest/1700000000-abc-a0-0-x.items"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=unused \
+    FM_SUPERVISOR_BACKEND=unsupported "$LAUNCH" start >/dev/null 2>&1; then
+    fail "failed start (mid-session): unsupported backend unexpectedly succeeded"
+  elif [ -f "$st/state/tg-away-digest/1700000000-abc-a0-0-x.items" ] \
+    && [ "$(cat "$st/state/tg-away-digest/1700000000-abc-a0-0-x.items")" = 'blocked: needs the captain' ]; then
+    pass "failed start (mid-session): rollback preserves accepted digests through the owner API"
+  else
+    fail "failed start (mid-session): rollback lost an accepted digest"
+  fi
+  rm -rf "$st"
+}
+
+unit_failed_start_rolls_back_stale_digests() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-failed-start-stale-digest.XXXXXX")
+  mkdir -p "$st/state/tg-away-digest"
+  printf 'leftover from a prior session\n' > "$st/state/tg-away-digest/stale-a0-0-x.items"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=unused \
+    FM_SUPERVISOR_BACKEND=unsupported "$LAUNCH" start >/dev/null 2>&1; then
+    fail "failed start (fresh entry): unsupported backend unexpectedly succeeded"
+  elif [ -f "$st/state/tg-away-digest/stale-a0-0-x.items" ]; then
+    pass "failed start (fresh entry): rollback restores the pre-attempt digest snapshot exactly"
+  else
+    fail "failed start (fresh entry): rollback lost the pre-attempt digest snapshot"
+  fi
+  rm -rf "$st"
+}
+
+# An away batch version whose active-pointer switch was committed but never
+# materialised (a crash mid-rollback) is replayed by the NEXT entry, before any
+# daemon can start - and its content survives in the immutable store for the
+# return catch-up rather than being discarded by the fresh entry's own clear.
+unit_next_entry_replays_a_pending_version_switch() {
+  local st vdir
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-version-replay.XXXXXX")
+  vdir="$st/state/tg-away-versions/v.1700000000-pending"
+  mkdir -p "$st/state"
+  (umask 077; mkdir -p "$vdir/tg-away-digest")
+  printf 'blocked: stranded by an interrupted switch\n' > "$vdir/escalations"
+  printf '1700000000-abc 0 0 0 0 0 none\n' > "$vdir/escalations.since"
+  printf 'blocked: stranded digest text\n' \
+    > "$vdir/tg-away-digest/1700000000-abc-a0-0-x.items"
+  printf 'escalations\n' > "$vdir/manifest"
+  : > "$vdir/.complete"
+  printf 'v.1700000000-pending\n' > "$st/state/tg-away-versions/active"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_ENTRY="$SLEEPER" \
+    bash -c '. "$1"; fm_afk_launch_start_native' _ "$LAUNCH" >/dev/null 2>&1; then
+    if grep -rq 'stranded by an interrupted switch' "$st/state/tg-away-versions" 2>/dev/null \
+      && grep -rq 'stranded digest text' "$st/state/tg-away-versions" 2>/dev/null \
+      && [ ! -e "$st/state/tg-away-versions/active" ]; then
+      pass "next entry: replays a pending version switch and keeps its content for catch-up"
+    else
+      fail "next entry: left the switch pending or lost the stranded version's content"
+    fi
+  else
+    fail "next entry: native start failed unexpectedly"
+  fi
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  rm -rf "$st"
+}
+
+# A refresh runs while the daemon is LIVE and is the sole writer of the live
+# buffer, so the launcher must perform no pointer switch there: a committed
+# pending switch stays pending and the daemon's freshly appended escalation is
+# never overwritten by a version's copy.
+unit_refresh_never_switches_the_version_pointer() {
+  local st vdir
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-refresh-no-switch.XXXXXX")
+  vdir="$st/state/tg-away-versions/v.1700000000-pending"
+  mkdir -p "$st/state/.supervise-daemon.lock"
+  (umask 077; mkdir -p "$vdir")
+  printf '%s\n' "$$" > "$st/state/.supervise-daemon.lock/pid"
+  printf 'blocked: a retired batch, never adopt me\n' > "$vdir/escalations"
+  printf 'escalations\n' > "$vdir/manifest"
+  : > "$vdir/.complete"
+  printf 'v.1700000000-pending\n' > "$st/state/tg-away-versions/active"
+  printf 'blocked: appended by the live daemon\n' > "$st/state/.subsuper-escalations"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    daemon_lock_held_by_live_daemon() { return 0; }
+    fm_afk_launch_start_native
+  ' _ "$LAUNCH" >/dev/null 2>&1 \
+    && [ "$(cat "$st/state/.subsuper-escalations")" = 'blocked: appended by the live daemon' ] \
+    && [ ! -e "$st/state/tg-away-versions/active.applied" ] \
+    && [ -e "$vdir/.complete" ]; then
+    pass "refresh: no pointer switch happens while the daemon is live"
+  else
+    fail "refresh: the launcher switched the version pointer under a live daemon"
+  fi
+  rm -rf "$st"
+}
+
 unit_concurrent_start_serialized() {
   command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found (concurrent start)"; return 0; }
   local st cap_session cap_pane first second rec count
@@ -776,20 +876,24 @@ unit_confirmed_absence_succeeds() {
   rm -rf "$st"
 }
 
-unit_incomplete_restore_retains_backup() {
-  local st backup
-  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-restore-fail.XXXXXX")
+# A rollback whose pointer switch is refused or fails must report the failure and
+# leave the published version in place: it is the only surviving copy of the
+# pre-attempt batch, so the return catch-up folds it instead of losing it.
+unit_failed_rollback_retains_the_version() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-rollback-retain.XXXXXX")
   mkdir -p "$st/state"
-  backup=$(mktemp -d "$st/state/.afk-launch-backup.XXXXXX")
-  printf 'prior\n' > "$backup/.afk"
-  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+  printf 'blocked: still owed to captain chat\n' > "$st/state/.subsuper-escalations"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
-    cp() { return 1; }
-    ! fm_afk_launch_restore_backup "$2" 1
-  ' _ "$LAUNCH" "$backup" && [ -d "$backup" ] && [ -e "$backup/.afk" ]; then
-    pass "rollback restore: incomplete restoration retains its recovery backup"
+    away_ledger_version_activate() { return 3; }
+    fm_afk_launch_flag_write() { return 1; }
+    ! fm_afk_launch_start_native
+  ' _ "$LAUNCH" >/dev/null 2>&1
+  if grep -rq 'still owed to captain chat' "$st/state/tg-away-versions" 2>/dev/null; then
+    pass "rollback: a refused pointer switch retains the version for the catch-up"
   else
-    fail "rollback restore: incomplete restoration discarded its backup"
+    fail "rollback: a refused pointer switch discarded the only copy of the batch"
   fi
   rm -rf "$st"
 }
@@ -914,6 +1018,11 @@ unit_fresh_vs_refresh
 unit_stop_ordering
 unit_stop_rejects_reused_pid
 unit_failed_start_rolls_back_state
+unit_failed_start_preserves_digests_mid_session
+unit_failed_start_rolls_back_stale_digests
+unit_next_entry_replays_a_pending_version_switch
+unit_refresh_never_switches_the_version_pointer
+unit_failed_rollback_retains_the_version
 unit_concurrent_start_serialized
 unit_lock_initialization_grace
 unit_signal_exits_with_lock_cleanup
@@ -938,7 +1047,7 @@ unit_stop_confirms_daemon_exit
 unit_refresh_validates_record
 unit_clear_failure_aborts_entry
 unit_confirmed_absence_succeeds
-unit_incomplete_restore_retains_backup
+
 unit_flag_write_failure_aborts
 e2e_herdr
 e2e_tmux

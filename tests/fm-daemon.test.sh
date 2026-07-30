@@ -23,6 +23,57 @@ fi
 
 TMP_ROOT=$(fm_test_tmproot fm-daemon-tests)
 
+test_afk_start_refuses_to_clear_an_uncaptured_away_batch() {
+  local dir state out status
+  dir=$(make_supercase afk-start-uncapturable-batch)
+  state="$dir/state"
+  printf 'blocked: crashed away session, never flushed\n' > "$state/.subsuper-escalations"
+  printf '1700000000-abc 0 0 0 0 0 none\n' > "$state/.subsuper-escalations.since"
+  # The version store path is occupied by a regular file, so the entry-boundary
+  # capture cannot publish the predecessor unit as an immutable version.
+  printf 'not a directory\n' > "$state/tg-away-versions"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] \
+    || fail "a direct away start must refuse when the prior batch cannot be captured"
+  assert_not_contains "$out" "starting supervise daemon" \
+    "a direct away start continued into daemon startup without capturing the prior batch"
+  assert_grep 'blocked: crashed away session, never flushed' "$state/.subsuper-escalations" \
+    "a direct away start cleared un-flushed escalation lines with no surviving version"
+  pass "a direct away start refuses to clear a prior away batch it could not capture"
+}
+
+# The clear is an owner transaction, so it can refuse. Under this script's errexit
+# an unguarded call would end the start silently, mid-retirement, with away mode
+# already flagged and no daemon supervising it.
+test_afk_start_refuses_when_the_prior_batch_cannot_be_retired() {
+  local dir state out status
+  dir=$(make_supercase afk-start-unretirable-batch)
+  state="$dir/state"
+  printf 'blocked: crashed away session, never flushed\n' > "$state/.subsuper-escalations"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported bash -c '
+    . "$1"
+    away_ledger_retire_batch() { return 1; }
+    rc=0
+    fm_afk_start_main || rc=$?
+    exit "$rc"
+  ' _ "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] \
+    || fail "a direct away start must refuse when the prior batch cannot be retired"
+  assert_not_contains "$out" "starting supervise daemon" \
+    "a direct away start continued into daemon startup after a refused retirement"
+  assert_contains "$out" "refusing to start the daemon" \
+    "a refused retirement must say so instead of ending the run silently"
+  assert_absent "$state/.afk" \
+    "a refused retirement must roll back the away flag this invocation wrote"
+  pass "a direct away start refuses honestly when the prior batch cannot be retired"
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written() {
   local dir state out status
   dir=$(make_supercase afk-start-flag-unwritable)
@@ -294,6 +345,76 @@ test_housekeeping_paused_resurfaces_and_resets() {
   age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
   [ "$age" -lt 60 ] || fail "pause marker was not reset to now on re-surface (age ${age}s)"
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
+}
+
+# Every escalation producer may drop or reset its suppressor only once the
+# versioned append has provably committed. The stale marker is the suppressor the
+# possible-wedge recheck fires from, so a refused append must leave it aged and
+# the next tick must retry the same wedge.
+test_housekeeping_refused_append_keeps_the_stale_marker() {
+  local dir state fakebin win pane key stamp
+  dir=$(make_supercase stale-refused-append)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  win="sess:fm-wedged-w21"; pane="$dir/pane.txt"
+  printf 'working: still chewing on the migration\n' > "$state/wedged-w21.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "wedged-w21" | tr ':/.' '___')
+  stamp=$(( $(date +%s) - 5000 ))
+  echo "$stamp" > "$state/.subsuper-stale-$key"
+
+  (
+    escalate_add() { return 1; }
+    log() { :; }
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  ) >/dev/null 2>&1
+  [ -e "$state/.subsuper-stale-$key" ] \
+    || fail "a refused append dropped the stale marker the wedge recheck fires from"
+  [ "$(cat "$state/.subsuper-stale-$key")" = "$stamp" ] \
+    || fail "a refused append must leave the stale marker aged, not re-armed"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a refused append must leave nothing buffered"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  grep -q 'possible wedge' "$state/.subsuper-escalations" \
+    || fail "the next tick did not retry the wedge the refused append dropped"
+  [ -e "$state/.subsuper-stale-$key" ] \
+    && fail "a committed append must drop the stale marker"
+  pass "a refused append leaves the possible-wedge recheck retryable on the next tick"
+}
+
+# Same rule on the pause re-surface path: a refused append must not re-arm the
+# pause window, or the forgotten pause rots for another full cadence.
+test_housekeeping_refused_append_keeps_the_pause_marker_aged() {
+  local dir state fakebin win pane key stamp
+  dir=$(make_supercase paused-refused-append)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  win="sess:fm-held-w21"; pane="$dir/pane.txt"
+  printf 'paused: holding for the upstream tool release\n' > "$state/held-w21.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-w21" | tr ':/.' '___')
+  stamp=$(( $(date +%s) - 5000 ))
+  echo "$stamp" > "$state/.subsuper-paused-$key"
+
+  (
+    escalate_add() { return 1; }
+    log() { :; }
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  ) >/dev/null 2>&1
+  [ "$(cat "$state/.subsuper-paused-$key" 2>/dev/null)" = "$stamp" ] \
+    || fail "a refused append re-armed the pause window instead of leaving it aged"
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a refused append must leave nothing buffered"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  grep -F 'awaiting external' "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "the next tick did not retry the pause recheck the refused append dropped"
+  [ "$(cat "$state/.subsuper-paused-$key" 2>/dev/null)" != "$stamp" ] \
+    || fail "a committed append must reset the pause window"
+  pass "a refused append leaves the pause re-surface retryable on the next tick"
 }
 
 # A pause whose pane became busy again (the crew resumed) drops its marker without
@@ -1766,6 +1887,8 @@ test_inject_msg_defers_on_unrecognized_composer_state() {
 }
 
 test_afk_start_refuses_when_flag_cannot_be_written
+test_afk_start_refuses_to_clear_an_uncaptured_away_batch
+test_afk_start_refuses_when_the_prior_batch_cannot_be_retired
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_daemon_state_root_uses_fm_home
@@ -1784,6 +1907,8 @@ test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
+test_housekeeping_refused_append_keeps_the_stale_marker
+test_housekeeping_refused_append_keeps_the_pause_marker_aged
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause
