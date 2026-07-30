@@ -158,8 +158,9 @@ STRIPPED=$(printf '%s' "$TEXT" | tr -d '[:space:]')
 # fmtg_send_stdin keeps every firstmate outbound path on this same client and
 # owns resolving/validating it, so this script only classifies the result: 127 is
 # specifically "no runnable client", everything else is a rejected send.
-if ! printf '%s' "$TEXT" | fmtg_send_stdin; then
-  RC=$?
+printf '%s' "$TEXT" | fmtg_send_stdin
+RC=$?
+if [ "$RC" -ne 0 ]; then
   if [ "$RC" -eq 127 ]; then
     echo "fm-tg-followup: phone-inbox tg client not runnable at $(fmtg_tg_bin)" >&2
   else

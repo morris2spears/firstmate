@@ -64,6 +64,18 @@ fm_afk_clear_stale_artifacts() {  # <state-dir>
   rm -f "$state/.subsuper-escalations" \
         "$state/.subsuper-escalations.since" \
         "$state/.subsuper-inject-wedged" 2>/dev/null
+  fm_afk_clear_tg_away_working_records "$state"
+}
+
+# The private away digest and the outbound spool are working records of ONE away
+# session's Telegram deliveries, so they retire with the buffer they describe. The
+# text-free <id>.status delivery evidence is deliberately left in place.
+fm_afk_clear_tg_away_working_records() {  # <state-dir>
+  local state=$1
+  rm -rf "$state/tg-away-digest" 2>/dev/null
+  rm -f "$state"/tg-away-delivery/.spool.* \
+        "$state"/.subsuper-escalations.since.* 2>/dev/null
+  return 0
 }
 
 daemon_lock_owner() {

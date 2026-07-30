@@ -607,7 +607,7 @@ test_away_delivery_acceptance_does_not_duplicate_alert_in_chat() {
 }
 
 test_away_batch_never_resends_accepted_events() {
-  local home state tg injected sends
+  local home state tg injected sends digest_id digest
   home=$(make_home away-grown-batch)
   state="$home/state"
   tg=$(make_fake_tg "$home")
@@ -643,6 +643,25 @@ test_away_batch_never_resends_accepted_events() {
     "an accepted away alert must not be duplicated into captain chat"
   [ ! -s "$state/.subsuper-escalations" ] || fail "the confirmed receipt must clear the away buffer"
 
+  # The receipt must name a private digest that actually exists and holds exactly
+  # the accepted items, so a one-shot escalation stays actionable after the
+  # buffer is truncated.
+  digest_id=$(sed -n 's/^Telegram accepted away-mode alert \([^ ]*\) .*/\1/p' "$injected")
+  [ -n "$digest_id" ] || fail "the accepted receipt must name its delivery id"
+  digest="$state/tg-away-digest/$digest_id.items"
+  [ -f "$digest" ] && [ ! -L "$digest" ] \
+    || fail "the accepted receipt must name a digest file that exists ($digest)"
+  case "$(ls -l "$digest")" in
+    -rw-------*) ;;
+    *) fail "the away digest must be private (0600)" ;;
+  esac
+  [ "$(cat "$digest")" = 'needs-decision: approve privileged cutover' ] \
+    || fail "the digest must hold exactly the items of its own delivery"
+  grep -Rq 'fm-task-3' "$state/tg-away-digest" \
+    || fail "the earlier accepted event must remain recoverable from a digest"
+  assert_no_grep 'privileged cutover' "$state/tg-away-delivery/$digest_id.status" \
+    "delivery evidence must stay text-free"
+
   # A later failure must not repeat the events Telegram already delivered.
   printf 'blocked: credential needed\n' > "$state/.subsuper-escalations"
   printf '1700000020\n' > "$state/.subsuper-escalations.since"
@@ -662,6 +681,56 @@ test_away_batch_never_resends_accepted_events() {
   assert_no_grep 'credential needed' "$injected" \
     "the fallback must not repeat an event Telegram already delivered"
   pass "an away batch that grows while the receipt is wedged never re-sends accepted events"
+}
+
+test_away_unusable_bookkeeping_never_sends_to_the_phone() {
+  local home state tg injected
+  home=$(make_home away-bad-bookkeeping)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+  printf 'blocked: needs a decision\n' > "$state/.subsuper-escalations"
+  printf 'not-a-batch record here\n' > "$state/.subsuper-escalations.since"
+
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "unreadable bookkeeping must still complete the in-session flush"
+
+  assert_absent "$home/tg-sent.log" \
+    "unreadable away bookkeeping must never risk a duplicate phone alert"
+  assert_grep 'blocked: needs a decision' "$injected" \
+    "the visible in-session fallback must carry every buffered event"
+  assert_grep 'bookkeeping is unreadable' "$injected" \
+    "the fallback must say why the phone was not contacted"
+  pass "unusable away bookkeeping fails closed to the visible in-session fallback"
+}
+
+test_away_lifecycle_retires_tg_working_records() {
+  local home state
+  home=$(make_home away-retirement)
+  state="$home/state"
+  mkdir -p "$state/tg-away-digest" "$state/tg-away-delivery"
+  printf 'stale persisted 300s: fm-task-1\n' > "$state/tg-away-digest/abc.items"
+  printf 'text' > "$state/tg-away-delivery/.spool.zzz"
+  printf 'accepted 1700000000\n' > "$state/tg-away-delivery/abc.status"
+  : > "$state/.subsuper-escalations.since.tmpXYZ"
+
+  FM_HOME="$home" FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1"; fm_afk_clear_stale_artifacts "$2"' _ "$ROOT/bin/fm-afk-start.sh" "$state" \
+    || fail "the away-start clear must succeed"
+
+  assert_absent "$state/tg-away-digest" \
+    "the private away digest must retire with the away session"
+  assert_absent "$state/tg-away-delivery/.spool.zzz" \
+    "a leaked outbound spool must retire with the away session"
+  assert_absent "$state/.subsuper-escalations.since.tmpXYZ" \
+    "a leaked sidecar temp must retire with the away session"
+  [ -f "$state/tg-away-delivery/abc.status" ] \
+    || fail "durable text-free delivery evidence must outlive the away session"
+  pass "the away lifecycle retires the Telegram working records and keeps the evidence"
 }
 
 test_supervision_instructions_carry_tg_cadence() {
@@ -716,6 +785,8 @@ test_away_delivery_is_accepted_once_and_records_no_content
 test_away_delivery_failure_classes_and_safe_chat_fallback
 test_away_delivery_acceptance_does_not_duplicate_alert_in_chat
 test_away_batch_never_resends_accepted_events
+test_away_unusable_bookkeeping_never_sends_to_the_phone
+test_away_lifecycle_retires_tg_working_records
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence
 

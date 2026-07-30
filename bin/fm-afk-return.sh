@@ -125,6 +125,12 @@ clear_delivery_artifacts() {
     "$STATE/.subsuper-escalations" \
     "$STATE/.subsuper-escalations.since" \
     "$STATE/.subsuper-inject-wedged"
+  # The away-mode Telegram working records describe the buffer being retired
+  # here: the private items digest, the outbound spool, and any sidecar temp.
+  # The text-free <id>.status delivery evidence is deliberately kept.
+  rm -rf "$STATE/tg-away-digest" 2>/dev/null || true
+  rm -f "$STATE"/tg-away-delivery/.spool.* \
+        "$STATE"/.subsuper-escalations.since.* 2>/dev/null || true
 }
 
 return_guard() {
