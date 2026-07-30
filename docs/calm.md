@@ -22,6 +22,7 @@ Toggling Calm off restores Pi's ordinary rendering, and the existing tool-expans
 
 Calm presentation activates only in a trusted interactive Pi TUI.
 RPC, JSON, print, and untrusted contexts keep stock presentation even when the home preference is on.
+In those contexts `/calm` declines with a warning and leaves the stored preference unchanged.
 
 ## Pi compatibility
 
