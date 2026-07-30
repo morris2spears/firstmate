@@ -134,6 +134,8 @@ The `project` presentation value groups every crewmate and scout for one project
 The workspace label is `<project-basename> · p:<token>`, using the same visible non-authoritative correlator suffix as per-task projections; the label deliberately lacks the `└ ` child prefix so no per-task grammar can match it.
 Tasks for different projects land in different workspaces, and a secondmate agent itself keeps its ordinary parent placement.
 
+![Two Herdr project workspaces, each holding its project's task tabs next to the captain's own dev-server tab](images/herdr-project-spaces.png)
+
 The container identity lives in a per-home, per-project journal at `state/.herdr-project-spaces/<slug>-<hash>`, keyed by the canonical project path.
 The first spawn for a project creates the workspace with a fresh random 128-bit token, records a version 1 attempt before the create, and binds the exact returned `workspace_id` as version 2 after the create converges.
 Later spawns adopt only when the exact recorded `workspace_id` is live, its label is byte-identical to the recorded token-bearing label, and that token suffix is unique across the named session.
@@ -147,6 +149,7 @@ A version 1 journal marks a crashed create whose possible orphan workspace is wa
 A respawn with existing task metadata must first pass the same duplicate-launch guard as presentation recovery, because a live task pane can sit in a workspace the flat duplicate-label check would never inspect.
 
 Cleanup closes only the exact recorded task pane through the lock-serialized focus-preserving projected path and never calls `workspace close`, so the captain's own tabs and other tasks in the shared space always survive a task's teardown.
+When a project-space task's recorded endpoint identities disagree with each other, teardown warns, closes nothing, and skips the ordinary backend kill as well, because an inexact close in a shared workspace could take the captain's own tab.
 Herdr itself removes the workspace when its overall last tab closes, and the next spawn for that project recreates it; keeping any other tab there, such as a dev server, keeps the workspace alive indefinitely.
 The per-project journal is durable across tasks, is retired by no lifecycle path, and never authorizes send, capture, ownership, worktree return, or recovery.
 Project workspaces are not moved by the presentation ordering path and appear in Herdr's natural creation order.
