@@ -122,7 +122,17 @@
 #          FM_WEDGE_ALARM_TIMEOUT_SECS seconds allowed for each notifier before
 #                                   its watchdog terminates it and continues to the
 #                                   next channel (default 10; invalid/zero uses the
-#                                   default).
+#                                   default). Also bounds the away-mode Telegram
+#                                   escalation send (telegram_away_send_file).
+#          FM_TG_AWAY_RETRY_SECS    seconds a retired proven-local away Telegram
+#                                   attempt waits before the same lines may be
+#                                   offered to the phone again; honored only when
+#                                   positive, else the batch window, else the batch
+#                                   default (telegram_away_retry_secs; never 0).
+#          FM_TG_AWAY_EXEC          away Telegram seam: "discard" sends nothing and
+#                                   reports the batch as off. Unset in production.
+#                                   When SOURCED the daemon defaults this to
+#                                   "discard" so no test reaches the real phone.
 #          FM_INJECT_CONFIRM_RETRIES Enter-retry attempts on a swallowed Enter
 #                                   (default 3); the digest is typed once, only
 #                                   Enter is retried. Composer-empty detection is
@@ -436,8 +446,9 @@ classify_unknown() {  # <reason>
 # Seen:     state/.subsuper-seen-status-<task>  last status line the scan
 #           escalated, so the catch-all does not re-fire the same terminal.
 # Away:     state/tg-away-delivery/<id>.status     text-free delivery evidence.
-#           state/.subsuper-escalations.since      the batch ledger (identity plus
-#           reserved/confirmed/accounted counts) owned by fm-away-ledger-lib.sh.
+#           state/.subsuper-escalations.since      the batch ledger (identity,
+#           reserved/confirmed/accounted counts, attempt ordinal, retry schedule)
+#           owned by fm-away-ledger-lib.sh.
 #           state/tg-away-digest/<id>.items        private 0600 copy of the
 #           accepted items, the working record the receipt points Firstmate at.
 

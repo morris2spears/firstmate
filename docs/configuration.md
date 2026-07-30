@@ -517,6 +517,7 @@ FM_WEDGE_ALARM_CHANNEL=            # override config/wedge-alarm with one active
 FM_WEDGE_ALARM_EXEC=              # notifier seam: route every channel (osascript, herdr, command:) through this command as `<cmd> <channel> <summary>`; "discard" fires nothing; unset in production; the daemon defaults it to "discard" when sourced so no test posts a real notification (docs/wedge-alarm.md)
 FM_WEDGE_ALARM_TIMEOUT_SECS=10    # maximum seconds for each osascript, herdr, override, or command: notifier, and for the away-mode Telegram escalation send, before its watchdog terminates it and continues (a terminated Telegram send falls back to the in-session escalation); invalid or zero values use 10
 FM_TG_AWAY_RETRY_SECS=            # seconds a retired proven-local away Telegram attempt waits before the same lines may be offered to the phone again; honoured only when positive, otherwise one FM_ESCALATE_BATCH_SECS window, and a non-positive or invalid window uses 90 - the delay is never 0, so the retry cannot spin per housekeeping tick
+FM_TG_AWAY_EXEC=                  # away-mode Telegram seam: "discard" sends nothing to the phone and reports the batch as off; unset in production; the daemon defaults it to "discard" when sourced so no test reaches the captain's phone
 FM_INJECT_FAIL_SLEEP=30            # seconds to back off when the supervisor pane is unavailable
 FM_INJECT_CONFIRM_RETRIES=3        # daemon Enter-retry attempts after typing a digest once
 FM_INJECT_CONFIRM_SLEEP=0.5        # seconds between daemon submit checks
