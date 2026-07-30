@@ -178,8 +178,9 @@ test_static_contract() {
   assert_contains "$operational_user_layout" '"\u2063Supervisor escalate ("' "Pi Calm operational-user layout lost the narrow legacy marker"
   assert_contains "$operational_user_layout" 'hidesOperationalInput()' "Pi Calm operational-user row does not use presentation-only hiding"
   assert_not_contains "$operational_user_layout" 'FIRSTMATE_OP: ' "Pi Calm operational-user layout duplicates the canonical marker grammar"
+  assert_not_contains "$text" 'installCalmUserBashLayout' "Pi Calm extension still suppresses the captain's own !bash row"
+  assert_not_contains "$nonconversation_layout" 'BashExecutionComponent' "Pi Calm non-conversation adapter still owns the captain's own !bash row"
   for adapter in \
-    'installCalmPresentationAdapter("user-bash-row", installCalmUserBashLayout)' \
     'installCalmPresentationAdapter("skill-invocation-row", installCalmSkillInvocationLayout)' \
     'installCalmPresentationAdapter("compaction-summary-row", installCalmCompactionSummaryLayout)' \
     'installCalmPresentationAdapter("branch-summary-row", installCalmBranchSummaryLayout)' \
@@ -191,7 +192,6 @@ test_static_contract() {
     assert_contains "$text" "$adapter" "Pi Calm extension does not install a degradable $adapter"
   done
   for exported in \
-    BashExecutionComponent \
     SkillInvocationMessageComponent \
     CompactionSummaryMessageComponent \
     BranchSummaryMessageComponent \
@@ -513,7 +513,6 @@ for (const [name, install, expected] of [
   ["tool-row", tool.installCalmToolLayout, "ToolExecutionComponent"],
   ["tool-error-turn", tool.installCalmToolErrorTurnBoundary, "AssistantMessageComponent"],
   ["operational-user-row", operational.installCalmOperationalUserLayout, "InteractiveMode"],
-  ["user-bash-row", rows.installCalmUserBashLayout, "BashExecutionComponent"],
   ["skill-invocation-row", rows.installCalmSkillInvocationLayout, "SkillInvocationMessageComponent"],
   ["compaction-summary-row", rows.installCalmCompactionSummaryLayout, "CompactionSummaryMessageComponent"],
   ["branch-summary-row", rows.installCalmBranchSummaryLayout, "BranchSummaryMessageComponent"],
@@ -863,7 +862,8 @@ for (const itemClass of visibility.CALM_TRANSCRIPT_CLASSES) {
   const visible = visibility.calmTranscriptClassIsVisible(itemClass);
   const expected =
     itemClass === "genuine-user-prompt" ||
-    itemClass === "genuine-agent-response";
+    itemClass === "genuine-agent-response" ||
+    itemClass === "user-bash";
   if (visible !== expected) {
     throw new Error(`Calm allowlist classified ${itemClass} as visible=${visible}`);
   }
@@ -2355,12 +2355,12 @@ TS
   cat >"$session_file" <<JSON
 {"type":"session","version":3,"id":"22222222-2222-4222-8222-222222222222","timestamp":"$now","cwd":"$project"}
 {"type":"message","id":"b0000001","parentId":null,"timestamp":"$now","message":{"role":"user","content":[{"type":"text","text":"CALM_ROWS_PROMPT"}],"timestamp":1}}
-{"type":"message","id":"b0000002","parentId":"b0000001","timestamp":"$now","message":{"role":"bashExecution","command":"printf CALM_ROWS_BASH_COMMAND","output":"CALM_ROWS_BASH_OUTPUT\n","exitCode":0,"cancelled":false,"truncated":false,"timestamp":2}}
-{"type":"custom_message","id":"b0000003","parentId":"b0000002","timestamp":"$now","customType":"calm-unrelated-message-e2e","content":"CALM_ROWS_CUSTOM_MESSAGE","display":true,"details":{}}
-{"type":"custom","id":"b0000004","parentId":"b0000003","timestamp":"$now","customType":"calm-unrelated-entry-e2e","data":{"text":"CALM_ROWS_CUSTOM_ENTRY"}}
-{"type":"branch_summary","id":"b0000005","parentId":"b0000004","timestamp":"$now","fromId":"b0000001","summary":"CALM_ROWS_BRANCH_SUMMARY"}
-{"type":"compaction","id":"b0000006","parentId":"b0000005","timestamp":"$now","summary":"CALM_ROWS_COMPACTION_SUMMARY","firstKeptEntryId":"b0000001","tokensBefore":1234}
-{"type":"message","id":"b0000007","parentId":"b0000006","timestamp":"$now","message":{"role":"assistant","content":[{"type":"text","text":"CALM_ROWS_REPLY"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":7}}
+{"type":"custom_message","id":"b0000002","parentId":"b0000001","timestamp":"$now","customType":"calm-unrelated-message-e2e","content":"CALM_ROWS_CUSTOM_MESSAGE","display":true,"details":{}}
+{"type":"custom","id":"b0000003","parentId":"b0000002","timestamp":"$now","customType":"calm-unrelated-entry-e2e","data":{"text":"CALM_ROWS_CUSTOM_ENTRY"}}
+{"type":"branch_summary","id":"b0000004","parentId":"b0000003","timestamp":"$now","fromId":"b0000001","summary":"CALM_ROWS_BRANCH_SUMMARY"}
+{"type":"compaction","id":"b0000005","parentId":"b0000004","timestamp":"$now","summary":"CALM_ROWS_COMPACTION_SUMMARY","firstKeptEntryId":"b0000001","tokensBefore":1234}
+{"type":"message","id":"b0000006","parentId":"b0000005","timestamp":"$now","message":{"role":"assistant","content":[{"type":"text","text":"CALM_ROWS_REPLY"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":6}}
+{"type":"message","id":"b0000007","parentId":"b0000006","timestamp":"$now","message":{"role":"bashExecution","command":"printf CALM_ROWS_BASH_COMMAND","output":"CALM_ROWS_BASH_OUTPUT\n","exitCode":0,"cancelled":false,"truncated":false,"timestamp":7}}
 JSON
 
   capture_rows_viewport() {
@@ -2380,12 +2380,13 @@ JSON
 
   tmux -L "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -c "$project" -x 120 -y 90 \
     "env FM_HOME='../rows-home' PI_CODING_AGENT_DIR='../rows-config' PI_OFFLINE=1 pi --approve --no-context-files --no-skills --no-prompt-templates --no-extensions -e ./.pi/extensions/fm-calm.ts -e ./rows-probe.ts --session '../rows-session.jsonl'"
-  wait_for_rows_text "$snapshot" "CALM_ROWS_REPLY" \
+  wait_for_rows_text "$snapshot" "CALM_ROWS_BASH_OUTPUT" \
     || fail "Pi Calm non-conversation row E2E did not restore the session transcript"
   assert_contains "$(cat "$snapshot")" "CALM_ROWS_PROMPT" "Calm hid the genuine captain prompt"
+  assert_contains "$(cat "$snapshot")" "CALM_ROWS_REPLY" "Calm hid the genuine assistant reply"
+  assert_contains "$(cat "$snapshot")" "CALM_ROWS_BASH_COMMAND" "Calm hid the captain's own !bash command"
+  assert_contains "$(cat "$snapshot")" "CALM_ROWS_BASH_OUTPUT" "Calm hid the output of the captain's own !bash command"
   for marker in \
-    CALM_ROWS_BASH_COMMAND \
-    CALM_ROWS_BASH_OUTPUT \
     CALM_ROWS_CUSTOM_MESSAGE \
     CALM_ROWS_CUSTOM_ENTRY \
     "[branch]" \
@@ -2403,10 +2404,9 @@ JSON
 
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" -l '/calm'
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" Enter
-  wait_for_rows_text "$restored_snapshot" "CALM_ROWS_BASH_OUTPUT" \
-    || fail "turning Calm off did not restore the user bash row"
+  wait_for_rows_text "$restored_snapshot" "CALM_ROWS_CUSTOM_ENTRY" \
+    || fail "turning Calm off did not restore the unrelated custom entry row"
   for marker in \
-    CALM_ROWS_BASH_COMMAND \
     CALM_ROWS_CUSTOM_MESSAGE \
     CALM_ROWS_CUSTOM_ENTRY \
     "[branch]" \
@@ -2414,6 +2414,8 @@ JSON
   do
     assert_contains "$(cat "$restored_snapshot")" "$marker" "turning Calm off did not restore the non-conversation row $marker"
   done
+  assert_contains "$(cat "$restored_snapshot")" "CALM_ROWS_BASH_COMMAND" "turning Calm off lost the captain's own !bash command"
+  assert_contains "$(cat "$restored_snapshot")" "CALM_ROWS_BASH_OUTPUT" "turning Calm off lost the output of the captain's own !bash command"
   [ "$(cat "$home/config/calm")" = off ] || fail "/calm did not persist the inactive choice"
 
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" -l '/calm'
@@ -2421,8 +2423,7 @@ JSON
   i=0
   while [ "$i" -lt 120 ]; do
     capture_rows_viewport "$rehidden_snapshot" || true
-    if ! grep -Fq "CALM_ROWS_BASH_OUTPUT" "$rehidden_snapshot" &&
-      ! grep -Fq "CALM_ROWS_CUSTOM_ENTRY" "$rehidden_snapshot" &&
+    if ! grep -Fq "CALM_ROWS_CUSTOM_ENTRY" "$rehidden_snapshot" &&
       ! grep -Fq "/calm" "$rehidden_snapshot"; then
       break
     fi
@@ -2430,8 +2431,6 @@ JSON
     i=$((i + 1))
   done
   for marker in \
-    CALM_ROWS_BASH_COMMAND \
-    CALM_ROWS_BASH_OUTPUT \
     CALM_ROWS_CUSTOM_MESSAGE \
     CALM_ROWS_CUSTOM_ENTRY \
     "[branch]" \
@@ -2441,12 +2440,14 @@ JSON
   done
   assert_contains "$(cat "$rehidden_snapshot")" "CALM_ROWS_PROMPT" "re-enabling Calm removed the genuine captain prompt"
   assert_contains "$(cat "$rehidden_snapshot")" "CALM_ROWS_REPLY" "re-enabling Calm removed the genuine assistant reply"
+  assert_contains "$(cat "$rehidden_snapshot")" "CALM_ROWS_BASH_COMMAND" "re-enabling Calm removed the captain's own !bash command"
+  assert_contains "$(cat "$rehidden_snapshot")" "CALM_ROWS_BASH_OUTPUT" "re-enabling Calm removed the output of the captain's own !bash command"
   [ "$(cat "$home/config/calm")" = on ] || fail "the second /calm did not persist the active choice"
 
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" -l '/quit'
   tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" Enter
   retire_pi_session "Pi Calm non-conversation row E2E"
-  pass "Pi Calm renders user bash, unrelated custom message and entry, and compaction and branch summary rows at zero height, restores them Calm-off, and redraws loaded rows on each toggle"
+  pass "Pi Calm renders unrelated custom message and entry and compaction and branch summary rows at zero height, keeps the captain's own !bash command and output visible, restores hidden rows Calm-off, and redraws loaded rows on each toggle"
 }
 
 test_interactive_terminal_e2e() {

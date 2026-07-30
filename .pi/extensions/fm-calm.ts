@@ -45,7 +45,6 @@ import {
   installCalmCustomMessageLayout,
   installCalmLeadingSpacerLayout,
   installCalmSkillInvocationLayout,
-  installCalmUserBashLayout,
 } from "./lib/fm-calm-nonconversation-layout.ts";
 import { installCalmOperationalUserLayout } from "./lib/fm-calm-operational-user-layout.ts";
 import {
@@ -113,7 +112,6 @@ export default function (pi: ExtensionAPI) {
   installCalmPresentationAdapter("tool-row", installCalmToolLayout);
   installCalmPresentationAdapter("tool-error-turn", installCalmToolErrorTurnBoundary);
   installCalmPresentationAdapter("operational-user-row", installCalmOperationalUserLayout);
-  installCalmPresentationAdapter("user-bash-row", installCalmUserBashLayout);
   installCalmPresentationAdapter("skill-invocation-row", installCalmSkillInvocationLayout);
   installCalmPresentationAdapter("compaction-summary-row", installCalmCompactionSummaryLayout);
   installCalmPresentationAdapter("branch-summary-row", installCalmBranchSummaryLayout);

@@ -28,9 +28,12 @@ export const CALM_TRANSCRIPT_CLASSES = [
 
 export type CalmTranscriptClass = (typeof CALM_TRANSCRIPT_CLASSES)[number];
 
+// A `!bash` row is the captain's own typed command and the output they asked for, so Calm
+// keeps it: Calm hides the agent's machinery, not a direct captain action.
 const CALM_VISIBLE_CLASSES = new Set<CalmTranscriptClass>([
   "genuine-user-prompt",
   "genuine-agent-response",
+  "user-bash",
 ]);
 
 // Legacy session entries from Calm versions before 2026-07-23 retain this

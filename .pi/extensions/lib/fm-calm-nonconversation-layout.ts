@@ -1,4 +1,4 @@
-// Verified against Pi 0.82.1, which exports BashExecutionComponent,
+// Verified against Pi 0.82.1, which exports
 // SkillInvocationMessageComponent, CompactionSummaryMessageComponent,
 // BranchSummaryMessageComponent, and CustomMessageComponent, and which builds every
 // remaining non-conversation transcript row through InteractiveMode.addMessageToChat,
@@ -7,9 +7,10 @@
 // is missing; fm-calm.ts catches that and skips only that adapter with a diagnostic instead
 // of blocking Calm or Pi.
 //
-// These rows are policy-hidden in fm-calm-visibility.ts (user-bash, skill-invocation,
+// These rows are policy-hidden in fm-calm-visibility.ts (skill-invocation,
 // compaction-summary, branch-summary, custom-message, custom-entry, cache-notice) because
-// they are neither a genuine captain prompt nor a normal assistant reply. The adapters read
+// they are neither a genuine captain prompt nor a normal assistant reply. A `!bash` row stays
+// visible: the captain typed that command, so it is conversation. The adapters read
 // that policy at render time, so a loaded transcript redraws immediately on /calm, stock
 // export and share rendering keeps every row, and Calm off restores Pi's own output.
 //
@@ -149,14 +150,6 @@ function installCalmRowRender(
   calmHiddenRowClasses().classes.set(exportName, { rowClass, hides });
 }
 
-export function installCalmUserBashLayout(): void {
-  installCalmRowRender(
-    "BashExecutionComponent",
-    "user-bash",
-    Symbol.for("firstmate:calm-user-bash-layout:pi-0.82.1"),
-  );
-}
-
 export function installCalmSkillInvocationLayout(): void {
   installCalmRowRender(
     "SkillInvocationMessageComponent",
@@ -192,7 +185,7 @@ export function installCalmCustomMessageLayout(): void {
 // Pi adds a standalone Spacer beside a compaction summary, a branch summary, and a skill
 // invocation, so hiding the row alone would leave a stray blank line. That spacer is replaced
 // with a Calm-aware one that follows the row it belongs to. Rows that own their spacer, such
-// as user bash and custom messages, need no adjustment.
+// as custom messages, need no adjustment.
 export function installCalmLeadingSpacerLayout(): void {
   const registry = calmRegistry<{ installed: true }>(CALM_LEADING_SPACER_PATCH);
   if (registry.get()) return;

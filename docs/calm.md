@@ -4,10 +4,11 @@ Calm is Firstmate's Pi-only conversation presentation toggle.
 The last `/calm` choice persists for the effective Firstmate home across Pi startup, reload, new-session, resume, and fork flows.
 An absent or unrecognized preference remains off, while a home with `config/calm` set to `on` opens directly in Calm presentation.
 
-While Calm is active, Pi's transcript shows genuine captain prompts and normal assistant replies.
+While Calm is active, Pi's transcript shows genuine captain prompts, normal assistant replies, and the captain's own `!bash` commands with their output.
 It removes thinking blocks, tool call and result rows, tool images and shells, Pi's working row, canonically classified Firstmate operational user rows, and legacy Calm operational presentation entries.
 The hidden operational kinds are session start, watcher, turn-end guard, away supervisor, from-firstmate routing, and launch briefs.
-It also removes the remaining non-conversation transcript rows: `!bash` execution blocks, skill-invocation blocks, compaction and branch summaries, prompt-cache miss notices, and custom messages and entries from unrelated extensions.
+It also removes the remaining non-conversation transcript rows: skill-invocation blocks, compaction and branch summaries, prompt-cache miss notices, and custom messages and entries from unrelated extensions.
+A `!bash` execution block is the captain's own typed command and the output they asked for, so Calm keeps it visible; Calm hides the agent's machinery, not a direct captain action.
 A skill invocation keeps the captain's own message that accompanied it; only the expanded skill block is removed.
 Calm adds no enable banner, footer chip, replacement status, or other presentation row.
 Interactive dialogs and explicit Pi errors remain visible so the captain can respond.

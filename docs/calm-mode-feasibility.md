@@ -47,7 +47,7 @@ No input event is intercepted, no message role is rewritten, and no provider con
 | Legacy Calm operational entries | Registered custom-entry renderer | Retained in session data and rendered at zero height. |
 | Interactive dialogs | Extension and built-in focused UI | Visible. |
 | Explicit errors and warnings | Pi status, assistant error rendering, and tool rows of an interrupted turn | Visible. Pi routes an aborted or provider-failed turn's text through its tool rows whenever that turn has a tool call, so Calm surfaces that text as plain lines instead of hiding it. Routine per-tool failures need no captain response and stay hidden. |
-| `user-bash` | `BashExecutionComponent` | Zero height, including the command header, borders, and streamed output. |
+| `user-bash` | `BashExecutionComponent` | Visible, including the command header, borders, and streamed output, because the captain typed that command. |
 | `skill-invocation` | `SkillInvocationMessageComponent` | Zero height collapsed or expanded, with its host spacer. The captain's own trailing message renders separately as `genuine-user-prompt` and stays visible. |
 | `compaction-summary`, `branch-summary` | `CompactionSummaryMessageComponent`, `BranchSummaryMessageComponent` | Zero height with their host spacers. |
 | `custom-message`, `custom-entry` | `CustomMessageComponent` and the host custom-entry component | Zero height for unrelated extensions, retained in session data. |
@@ -71,7 +71,7 @@ Watcher, turn-end, session-start, away-supervisor, and from-firstmate producers 
 ## Regression coverage
 
 `tests/fm-calm-pi-extension.test.sh` covers the centralized visibility policy, all seven built-ins, custom tool rows, image output, thinking in both Pi display states, working suppression, operational provenance, near misses, persistence, reload and restart redraws, trusted-interactive scoping, Calm-off restoration, exports, shares, and exact captain and assistant conversation preservation.
-It also covers the non-conversation rows end to end: a hidden skill-invocation block whose captain message stays visible, and user bash, unrelated custom message and entry, compaction summary, and branch summary rows hidden with Calm on, restored with Calm off, and redrawn at zero height when Calm is re-enabled on an already loaded transcript.
+It also covers the non-conversation rows end to end: a hidden skill-invocation block whose captain message stays visible, and unrelated custom message and entry, compaction summary, and branch summary rows hidden with Calm on, restored with Calm off, and redrawn at zero height when Calm is re-enabled on an already loaded transcript, while the captain's own `!bash` command and its output stay visible through every toggle.
 The cache-notice adapter is covered by the static seam contract and the independent-degradation fixture, because a real prompt-cache miss notice needs a credentialed provider.
 `tests/fm-pi-primary-types.test.sh` performs strict no-emit checking against the installed Pi declarations when TypeScript is available.
 `tests/fm-pi-primary-live-e2e.test.sh` keeps the credentialed provider and watcher integration path opt-in.
@@ -95,7 +95,7 @@ ok - reloading the Calm adapters keeps actionable tool errors scoped to one assi
 ok - Pi calm centralizes transcript visibility, preserves execution/export data, hides working activity, and persists its choice across session starts
 ok - Pi operational follow-up E2E processes exact user-role notifications once while Calm hides current and adjacent rows, Calm off and absent render them, and restart preserves semantics
 ok - Pi Calm native /skill:ahoy geometry keeps every thinking, tool, and skill-invocation block at zero height while preserving the captain's own message, history, restart, and Calm-off rendering
-ok - Pi Calm renders user bash, unrelated custom message and entry, and compaction and branch summary rows at zero height, restores them Calm-off, and redraws loaded rows on each toggle
+ok - Pi Calm renders unrelated custom message and entry and compaction and branch summary rows at zero height, keeps the captain's own !bash command and output visible, restores hidden rows Calm-off, and redraws loaded rows on each toggle
 ok - Pi calm native E2E hides working activity, keeps captain turns visible, hides exact operational user rows without changing persistence, restores them Calm-off, survives restart, and preserves export plus Ctrl+O behavior
 
 $ npm exec --yes --package=typescript -- bash -c 'tests/fm-pi-primary-types.test.sh'
