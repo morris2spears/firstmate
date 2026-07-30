@@ -651,22 +651,31 @@ escalate_add() {  # <state> <distilled-item>
 # (batch, first-unreserved-line) pair and a batch that grew while the in-session
 # receipt was wedged sends only its NEW lines.
 #
-# Every argument is required and the ledger must already describe this exact batch
-# with `offset == reserved == confirmed` and `total > offset`; anything else
-# refuses to send, so no caller can reach the phone without exactly-once
-# accounting and no delivery id is minted outside the ledger owner.
+# Every argument is required and individually validated before any sender or ledger
+# mutation, and the ledger must already describe this exact batch with
+# `offset == reserved == confirmed` and `total > offset`; anything else refuses to
+# send, so no caller can reach the phone without exactly-once accounting and no
+# delivery id is minted outside the ledger owner.
 #
 # Ordering, all of it before the network call: the ledger reserves every line
 # about to be sent, then an attempting evidence record is written. Either write
 # failing aborts the send outright, so an unrecordable delivery can never become a
 # duplicate phone alert. Only an accepted evidence record transitions the ledger's
-# confirmed count, over a contiguous prefix only. A reservation is released ONLY
-# when the send provably never left the box - no spool, no watchdog, no client.
-# Any outcome that could have reached Telegram (watchdog timeout, or a client that
-# ran and exited non-zero, which the real client cannot distinguish from a lost
-# response to an accepted send) keeps the reservation and reports `uncertain`, so
-# those lines are never offered to the phone again and the batch falls back
-# visibly in session instead.
+# confirmed count, over a contiguous prefix only.
+#
+# The transport outcome is classified into exactly two non-accepted proof classes,
+# never inferred from a bare non-zero status:
+#   proven-local   nothing reached the network - no ledger write, no spool, no
+#                  watchdog (125), no runnable client (127). The attempt is
+#                  retired through the ledger: its claim comes back AND the batch's
+#                  attempt ordinal advances, so the same lines retry under a fresh
+#                  delivery id while this attempt's evidence stays auditable.
+#   ambiguous      the request may have reached Telegram - a watchdog timeout, or a
+#                  client that ran and exited non-zero, which the real client cannot
+#                  distinguish from a lost response to a send Telegram accepted.
+#                  The claim is KEPT, the ordinal does not move, so those lines are
+#                  never offered to the phone again and the batch falls back
+#                  visibly in session instead.
 #
 # The send itself runs under the same bounded watchdog every other external
 # notifier in this file uses (FM_WEDGE_ALARM_TIMEOUT_SECS), so a hung phone client
@@ -677,24 +686,26 @@ telegram_away_send_file() {  # <spool-file>
 
 telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <batch-id>
   local state=$1 body=$2 offset=${3:-} total=${4:-} accounted=${5:-} batch_id=${6:-}
-  local buf rec led_id led_reserved led_confirmed led_accounted led_did
+  local buf rec led_id led_reserved led_confirmed led_accounted led_attempt led_did
   local delivery_id dir base record status now rc alert spool
   if [ "${FM_TG_AWAY_EXEC:-live}" = discard ] || ! afk_active "$state" || ! fmtg_enabled "$FM_HOME"; then
     printf 'off|none\n'
     return 0
   fi
   buf="$state/.subsuper-escalations"
-  case "$offset$total$accounted" in ''|*[!0-9]*) printf 'unavailable|none\n'; return 0 ;; esac
+  away_ledger_is_count "$offset" "$total" "$accounted" \
+    || { printf 'unavailable|none\n'; return 0; }
   rec=$(away_ledger_read "$buf")
   [ "$rec" != unknown ] || { printf 'unavailable|none\n'; return 0; }
-  IFS=' ' read -r led_id led_reserved led_confirmed led_accounted led_did <<< "$rec"
+  IFS=' ' read -r led_id led_reserved led_confirmed led_accounted led_attempt led_did <<< "$rec"
   if [ "$batch_id" != "$led_id" ] \
     || [ "$offset" -ne "$led_reserved" ] || [ "$offset" -ne "$led_confirmed" ] \
     || [ "$accounted" -ne "$led_accounted" ] || [ "$total" -le "$offset" ]; then
     printf 'unavailable|none\n'
     return 0
   fi
-  delivery_id=$(away_ledger_delivery_id "$batch_id" "$offset" "$body")
+  delivery_id=$(away_ledger_delivery_id "$batch_id" "$led_attempt" "$offset" "$body") \
+    || { printf 'unavailable|none\n'; return 0; }
   dir="$state/tg-away-delivery"
   base="$delivery_id.status"
   if fmx_private_artifact_file_valid "$dir" "$base" 600; then
@@ -760,29 +771,35 @@ telegram_away_deliver() {  # <state> <batch-body> <offset> <total> <accounted> <
   fi
   rm -f -- "$spool"
   now=$(_now)
-  if [ "$rc" -eq 0 ]; then
-    printf 'accepted %s\n' "$now" \
-      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    telegram_away_settle_accepted "$state" "$buf" "$delivery_id" "$offset" "$total" "$accounted"
-  elif [ "$rc" -eq 124 ]; then
-    printf 'failed %s sender_timeout\n' "$now" \
-      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    printf 'uncertain|%s\n' "$delivery_id"
-  elif [ "$rc" -eq 125 ]; then
-    away_ledger_release "$buf" "$offset" "$delivery_id"
-    printf 'failed %s sender_watchdog_unavailable\n' "$now" \
-      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    printf 'failed|%s\n' "$delivery_id"
-  elif [ "$rc" -eq 127 ]; then
-    away_ledger_release "$buf" "$offset" "$delivery_id"
-    printf 'unavailable %s sender_missing\n' "$now" \
-      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    printf 'unavailable|%s\n' "$delivery_id"
-  else
-    printf 'failed %s sender_uncertain_response\n' "$now" \
-      | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
-    printf 'uncertain|%s\n' "$delivery_id"
-  fi
+  case "$rc" in
+    0)
+      printf 'accepted %s\n' "$now" \
+        | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+      telegram_away_settle_accepted "$state" "$buf" "$delivery_id" "$offset" "$total" "$accounted"
+      ;;
+    125)  # proven local: the watchdog never started the client
+      away_ledger_release "$buf" "$offset" "$delivery_id"
+      printf 'failed %s sender_watchdog_unavailable\n' "$now" \
+        | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+      printf 'failed|%s\n' "$delivery_id"
+      ;;
+    127)  # proven local: there is no runnable client to send with
+      away_ledger_release "$buf" "$offset" "$delivery_id"
+      printf 'unavailable %s sender_missing\n' "$now" \
+        | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+      printf 'unavailable|%s\n' "$delivery_id"
+      ;;
+    124)  # ambiguous: the request was in flight when the watchdog fired
+      printf 'failed %s sender_timeout\n' "$now" \
+        | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+      printf 'uncertain|%s\n' "$delivery_id"
+      ;;
+    *)    # ambiguous: the client ran and returned non-zero, which proves nothing
+      printf 'failed %s sender_uncertain_response\n' "$now" \
+        | fmx_private_artifact_publish_stdin "$dir" "$base" 600 2>/dev/null || true
+      printf 'uncertain|%s\n' "$delivery_id"
+      ;;
+  esac
   return 0
 }
 
@@ -867,17 +884,17 @@ telegram_away_recover() {  # <state> <buf> <reserved> <confirmed> <delivery-id>
 # in-session submit is confirmed.
 escalate_flush() {  # <state>
   local state=$1 buf n body msg rec recovery tg_result tg_status tg_id
-  local batch_id reserved confirmed accounted did pending_body chat_body chat_pending
+  local batch_id reserved confirmed accounted attempt did pending_body chat_body chat_pending
   local prior_note pointer
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
   n=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
   body=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
-  batch_id=none; reserved=0; confirmed=0; accounted=0; did=none
+  batch_id=none; reserved=0; confirmed=0; accounted=0; attempt=0; did=none
   tg_status=''; tg_id=none
   rec=$(away_ledger_read "$buf")
   if [ "$rec" != unknown ]; then
-    IFS=' ' read -r batch_id reserved confirmed accounted did <<< "$rec"
+    IFS=' ' read -r batch_id reserved confirmed accounted attempt did <<< "$rec"
     # A batch only ever grows, so a reservation past its line total means the
     # ledger does not describe this buffer.
     [ "$reserved" -le "$n" ] || rec=unknown
@@ -887,11 +904,11 @@ escalate_flush() {  # <state>
     if [ "$recovery" != settled ]; then
       rec=$(away_ledger_read "$buf")
       [ "$rec" = unknown ] \
-        || IFS=' ' read -r batch_id reserved confirmed accounted did <<< "$rec"
+        || IFS=' ' read -r batch_id reserved confirmed accounted attempt did <<< "$rec"
     fi
   fi
   if [ "$rec" = unknown ]; then
-    tg_status=unknown; batch_id=none; reserved=0; confirmed=0; accounted=0; did=none
+    tg_status=unknown; batch_id=none; reserved=0; confirmed=0; accounted=0; attempt=0; did=none
   elif [ "$n" -gt "$reserved" ] && [ "$confirmed" -eq "$reserved" ]; then
     pending_body=$(tail -n "+$((reserved + 1))" "$buf" 2>/dev/null \
       | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
@@ -900,7 +917,7 @@ escalate_flush() {  # <state>
     tg_id=${tg_result#*|}
     rec=$(away_ledger_read "$buf")
     [ "$rec" = unknown ] \
-      || IFS=' ' read -r batch_id reserved confirmed accounted did <<< "$rec"
+      || IFS=' ' read -r batch_id reserved confirmed accounted attempt did <<< "$rec"
   elif [ "$confirmed" -ge "$n" ]; then
     tg_id=$did
     tg_status=accepted
