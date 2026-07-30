@@ -11,9 +11,13 @@
 #                  inherit a retired batch's counts.
 #   reserved       leading buffer lines that must NEVER be sent to the phone
 #                  again. Claimed BEFORE the network call, so a crash mid-send
-#                  cannot become a duplicate captain alert.
-#   confirmed      leading lines Telegram provably accepted, proven by the
-#                  durable delivery evidence - never inferred from a reservation.
+#                  cannot become a duplicate captain alert. A reservation is given
+#                  back ONLY when the send provably never left the box.
+#   confirmed      leading lines Telegram provably accepted, proven by the durable
+#                  delivery evidence - never inferred from a reservation, and only
+#                  ever advanced over a CONTIGUOUS prefix (away_ledger_confirm
+#                  refuses to jump an unconfirmed gap), so an accepted suffix can
+#                  never imply acceptance of an earlier uncertain line.
 #   accounted      leading lines whose text is captured in a private away digest.
 #                  Anything past this count still has to reach captain chat.
 #   delivery-id    the most recent delivery this batch attempted.
@@ -151,22 +155,41 @@ away_ledger_release() {  # <buf> <reserved> <delivery-id>
   away_ledger_transition "$1" reserved "$2" "$3"
 }
 
-# Record evidence-proven Telegram acceptance.
-away_ledger_confirm() {  # <buf> <confirmed> <delivery-id>
-  away_ledger_transition "$1" confirmed "$2" "$3"
+# Record evidence-proven Telegram acceptance for the range (<from>, <to>].
+# Refuses unless <from> is exactly the current confirmed count, so confirmation can
+# only ever extend a contiguous proven prefix. `reserved > confirmed` therefore
+# means an unresolved send, and the caller must not offer this batch to the phone
+# again until that reservation is resolved.
+away_ledger_confirm() {  # <buf> <from> <to> <delivery-id>
+  local buf=$1 from=$2 to=$3 did=$4 rec id reserved confirmed accounted current
+  case "$from$to" in ''|*[!0-9]*) return 1 ;; esac
+  rec=$(away_ledger_read "$buf")
+  [ "$rec" != unknown ] || return 1
+  IFS=' ' read -r id reserved confirmed accounted current <<< "$rec"
+  [ "$from" -eq "$confirmed" ] || return 1
+  [ "$to" -ge "$confirmed" ] || return 1
+  away_ledger_transition "$buf" confirmed "$to" "$did"
 }
 
-# Capture lines past <from> into this delivery's private digest and account for
-# them. Writing from the ACCOUNTED position rather than the send offset means a
-# delivery whose digest failed earlier is picked up by the next digest that
-# succeeds, so no accepted line is ever left out of both records.
-away_ledger_digest_record() {  # <state> <buf> <delivery-id> <from>
-  local state=$1 buf=$2 did=$3 from=$4 to
-  case "$from" in ''|*[!0-9]*) return 1 ;; esac
+# The delivery identity of one send: batch, first line sent, and the exact body.
+# Built here so no caller mints an away-delivery id of its own.
+away_ledger_delivery_id() {  # <batch-id> <offset> <body>
+  printf '%s-%s-%s\n' "$1" "$2" "$(away_ledger_hash "$3")"
+}
+
+# Capture the batch lines in (<from>, <to>] into this delivery's private digest
+# and account for them. <from> is the ACCOUNTED position rather than the send
+# offset, so a delivery whose digest failed earlier is picked up by the next digest
+# that succeeds; <to> is the CONFIRMED count, so an unproven line is never recorded
+# as delivered.
+away_ledger_digest_record() {  # <state> <buf> <delivery-id> <from> <to>
+  local state=$1 buf=$2 did=$3 from=$4 to=$5 lines
+  case "$from$to" in ''|*[!0-9]*) return 1 ;; esac
   [ -s "$buf" ] || return 0
-  to=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
+  lines=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
+  [ "$to" -le "$lines" ] || return 1
   [ "$to" -gt "$from" ] || return 0
-  tail -n "+$((from + 1))" "$buf" 2>/dev/null \
+  sed -n "$((from + 1)),${to}p" "$buf" 2>/dev/null \
     | fmx_private_artifact_publish_stdin "$(away_ledger_digest_dir "$state")" "$did.items" 600 \
       2>/dev/null || return 1
   away_ledger_transition "$buf" accounted "$to" "$did"

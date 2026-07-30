@@ -499,6 +499,33 @@ test_supervision_needed_by_tg_shim() {
   pass "fm_supervision_status counts the Telegram poll as supervision-needed"
 }
 
+# ledger_field <state> <field-index> <expected> <message>: assert one ledger count.
+ledger_field() {
+  local state=$1 idx=$2 want=$3 msg=$4 got
+  got=$(away_ledger_read "$state/.subsuper-escalations" | cut -d' ' -f"$idx")
+  [ "$got" = "$want" ] || fail "$msg (ledger field $idx = $got, want $want)"
+}
+
+# away_deliver <home> <state> [tg-bin] [fake-tg-exit]: drive telegram_away_deliver
+# exactly the way escalate_flush does - read the ledger, hand it the pending body
+# plus the current reserved/total/accounted counts and the batch id. Nothing may
+# reach the phone without those, so tests go through the same door.
+away_deliver() {
+  local home=$1 state=$2 tg_bin=${3:-} fake_exit=${4:-0}
+  local buf rec id reserved confirmed accounted did n pending
+  buf="$state/.subsuper-escalations"
+  rec=$(away_ledger_read "$buf")
+  IFS=' ' read -r id reserved confirmed accounted did <<< "$rec"
+  n=$(( $(wc -l < "$buf" 2>/dev/null || echo 0) ))
+  pending=$(tail -n "+$((reserved + 1))" "$buf" 2>/dev/null \
+    | awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}')
+  (
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    export FMTG_TG_BIN="$tg_bin" FAKE_TG_EXIT="$fake_exit"
+    telegram_away_deliver "$state" "$pending" "$reserved" "$n" "$accounted" "$id"
+  )
+}
+
 test_away_delivery_is_inert_outside_away_mode() {
   local home state tg out
   home=$(make_home away-inactive)
@@ -520,15 +547,19 @@ test_away_delivery_is_accepted_once_and_records_no_content() {
   state="$home/state"
   tg=$(make_fake_tg "$home")
   : > "$state/.afk"
-  printf '1700000000\n' > "$state/.subsuper-escalations.since"
+  escalate_add "$state" 'needs-decision: approve privileged cutover'
 
-  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
-    FMTG_TG_BIN="$tg" telegram_away_deliver "$state" 'needs-decision: approve privileged cutover')
+  out=$(away_deliver "$home" "$state" "$tg")
   first_id=${out#*|}
   [ "${out%%|*}" = accepted ] || fail "away delivery must report accepted (got: $out)"
 
-  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
-    FMTG_TG_BIN="$tg" telegram_away_deliver "$state" 'needs-decision: approve privileged cutover')
+  # A repeat of the very same (batch, offset, body) delivery must re-derive the
+  # same id, settle from the existing accepted evidence, and never produce a
+  # second phone alert.
+  away_ledger_write "$state/.subsuper-escalations" \
+    "$(printf '%s' "$first_id" | cut -d- -f1-2)" 0 0 0 none \
+    || fail "could not rewind the ledger for the repeat-delivery case"
+  out=$(away_deliver "$home" "$state" "$tg")
   second_id=${out#*|}
   [ "${out%%|*}" = accepted ] || fail "accepted away delivery must remain accepted (got: $out)"
   [ "$first_id" = "$second_id" ] || fail "the same away batch must keep one delivery id"
@@ -547,24 +578,32 @@ test_away_delivery_failure_classes_and_safe_chat_fallback() {
   state="$home/state"
   tg=$(make_fake_tg "$home")
   : > "$state/.afk"
-  printf '1700000001\n' > "$state/.subsuper-escalations.since"
 
-  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
-    FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 telegram_away_deliver "$state" 'blocked: credential needed')
-  [ "${out%%|*}" = failed ] || fail "a rejected Telegram send must report failed (got: $out)"
-  grep -Eq '^failed [0-9]+ sender_rejected$' "$state/tg-away-delivery/${out#*|}.status" \
-    || fail "failed delivery must have non-secret durable evidence"
+  # A client that RAN and exited non-zero cannot be distinguished from a lost
+  # response to an accepted send, so it is uncertain, not failed, and its
+  # reservation is kept.
+  escalate_add "$state" 'blocked: credential needed'
+  out=$(away_deliver "$home" "$state" "$tg" 1)
+  [ "${out%%|*}" = uncertain ] \
+    || fail "a client that ran and rejected must report uncertain (got: $out)"
+  grep -Eq '^failed [0-9]+ sender_uncertain_response$' "$state/tg-away-delivery/${out#*|}.status" \
+    || fail "an uncertain delivery must have non-secret durable evidence"
+  ledger_field "$state" 2 1 "an uncertain send must keep its phone reservation"
+  ledger_field "$state" 3 0 "an uncertain send must not be confirmed"
 
-  printf '1700000002\n' > "$state/.subsuper-escalations.since"
-  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
-    FMTG_TG_BIN="$home/missing-tg" telegram_away_deliver "$state" 'blocked: second credential needed')
+  # A missing client provably never left the box: unavailable, reservation released.
+  : > "$state/.subsuper-escalations"
+  away_ledger_retire "$state/.subsuper-escalations"
+  escalate_add "$state" 'blocked: second credential needed'
+  out=$(away_deliver "$home" "$state" "$home/missing-tg")
   [ "${out%%|*}" = unavailable ] || fail "a missing Telegram client must report unavailable (got: $out)"
   grep -Eq '^unavailable [0-9]+ sender_missing$' "$state/tg-away-delivery/${out#*|}.status" \
     || fail "unavailable delivery must have non-secret durable evidence"
+  ledger_field "$state" 2 0 "a send that never left the box must release its reservation"
 
   : > "$state/.subsuper-escalations"
-  printf 'blocked: safe fallback required\n' > "$state/.subsuper-escalations"
-  printf '1700000003\n' > "$state/.subsuper-escalations.since"
+  away_ledger_retire "$state/.subsuper-escalations"
+  escalate_add "$state" 'blocked: safe fallback required'
   injected="$home/injected.log"
   (
     inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
@@ -744,6 +783,24 @@ test_away_reserved_lines_resolve_from_evidence_not_from_the_claim() {
   assert_grep 'blocked: mid-send crash' "$injected" \
     "the uncertain event must still reach the visible in-session fallback"
 
+  # (a2) reserved with durable `accepted` evidence: the crash landed between the
+  # send and the ledger commit, so recovery confirms it from the evidence and never
+  # sends again.
+  printf 'blocked: crashed after acceptance\n' > "$state/.subsuper-escalations"
+  did='1700000035-abcdef0123456789-0-fedcba9876543210'
+  printf 'accepted 1700000035\n' > "$state/tg-away-delivery/$did.status"
+  chmod 0600 "$state/tg-away-delivery/$did.status"
+  printf '1700000035-abcdef0123456789 1 0 0 %s\n' "$did" > "$state/.subsuper-escalations.since"
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "a recoverable acceptance must complete the away flush"
+  assert_absent "$home/tg-sent.log" \
+    "a line with durable accepted evidence must never be sent again"
+  assert_grep 'Telegram accepted away-mode alert' "$injected" \
+    "durable accepted evidence must be reported as accepted"
+
   # (b) reserved with no evidence at all: the claim is released and the line is
   # offered to the phone.
   printf 'blocked: crashed before the send\n' > "$state/.subsuper-escalations"
@@ -819,6 +876,87 @@ test_away_lifecycle_retires_tg_working_records() {
   pass "the away lifecycle retires the Telegram working records and keeps the evidence"
 }
 
+# An uncertain outcome poisons the batch for the phone: confirmation can only ever
+# extend a contiguous proven prefix, so a later line is never sent (which would
+# risk a duplicate of the uncertain one) and never presented as delivered.
+test_away_uncertain_send_stops_the_batch_from_reaching_the_phone() {
+  local home state tg injected
+  home=$(make_home away-uncertain-gap)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  injected="$home/injected.log"
+
+  escalate_add "$state" 'blocked: first event, response lost'
+  (
+    inject_msg() { return 1; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" FAKE_TG_EXIT=1 escalate_flush "$state"
+  ) && fail "a wedged receipt must leave escalate_flush unconfirmed"
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "the first event must have been attempted exactly once"
+  ledger_field "$state" 3 0 "an uncertain send must not confirm anything"
+
+  escalate_add "$state" 'blocked: second event after the uncertainty'
+  (
+    inject_msg() { printf '%s\n' "$1" > "$injected"; return 0; }
+    FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live \
+      FMTG_TG_BIN="$tg" escalate_flush "$state"
+  ) || fail "an uncertain batch must still complete the in-session flush"
+
+  [ "$(grep -c '^---$' "$home/tg-sent.log")" -eq 1 ] \
+    || fail "no event may reach the phone after an uncertain send in the same batch"
+  assert_grep 'Telegram delivery uncertain' "$injected" \
+    "an uncertain batch must never be reported as accepted"
+  assert_grep 'first event, response lost' "$injected" \
+    "the uncertain event must reach the visible in-session fallback"
+  assert_grep 'second event after the uncertainty' "$injected" \
+    "the later event must reach the visible in-session fallback"
+  assert_no_grep 'accepted away-mode alert' "$injected" \
+    "an unproven line must never be presented as delivered"
+  pass "an uncertain send keeps its reservation and stops the batch reaching the phone"
+}
+
+# Every send must come through the ledger: no default arguments, no id minted
+# outside the owner, no bypass of the exactly-once accounting.
+test_away_delivery_refuses_untracked_sends() {
+  local home state tg out
+  home=$(make_home away-untracked)
+  state="$home/state"
+  tg=$(make_fake_tg "$home")
+  : > "$state/.afk"
+  escalate_add "$state" 'blocked: needs the ledger'
+
+  out=$(
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    export FMTG_TG_BIN="$tg"
+    telegram_away_deliver "$state" 'blocked: needs the ledger'
+  )
+  [ "$out" = 'unavailable|none' ] \
+    || fail "a send without ledger arguments must refuse (got: $out)"
+
+  out=$(
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    export FMTG_TG_BIN="$tg"
+    telegram_away_deliver "$state" 'blocked: needs the ledger' 0 1 0 not-this-batch
+  )
+  [ "$out" = 'unavailable|none' ] \
+    || fail "a send naming another batch must refuse (got: $out)"
+
+  rm -f "$state/.subsuper-escalations.since"
+  out=$(
+    export FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" FM_TG_AWAY_EXEC=live
+    export FMTG_TG_BIN="$tg"
+    telegram_away_deliver "$state" 'blocked: needs the ledger' 0 1 0 1700000000-abcdef0123456789
+  )
+  [ "$out" = 'unavailable|none' ] \
+    || fail "a send with no readable ledger must refuse (got: $out)"
+
+  assert_absent "$home/tg-sent.log" "an untracked send must never reach the phone"
+  assert_absent "$state/tg-away-delivery" "an untracked send must not mint delivery evidence"
+  pass "away delivery refuses every send that does not come through the ledger"
+}
+
 test_supervision_instructions_carry_tg_cadence() {
   local home out
   home="$TMP_ROOT/sup-instructions"; mkdir -p "$home/config"
@@ -875,6 +1013,8 @@ test_away_unusable_bookkeeping_never_sends_to_the_phone
 test_away_reserved_lines_resolve_from_evidence_not_from_the_claim
 test_away_off_mid_batch_never_repeats_delivered_events
 test_away_lifecycle_retires_tg_working_records
+test_away_uncertain_send_stops_the_batch_from_reaching_the_phone
+test_away_delivery_refuses_untracked_sends
 test_supervision_needed_by_tg_shim
 test_supervision_instructions_carry_tg_cadence
 
