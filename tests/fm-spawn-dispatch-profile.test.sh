@@ -88,7 +88,9 @@ run_spawn() {
   # explicitly (empty by default) instead of leaking the invoking shell's value,
   # which would make launch assertions depend on the developer's environment.
   # A test opts in to the set case via FM_TEST_CLAUDE_CONFIG_DIR.
-  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+  # FM_ROOT_OVERRIDE is empty by default so spawn resolves the real tracked code root;
+  # a test opts into a stand-in code root via FM_TEST_ROOT_OVERRIDE.
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
@@ -154,6 +156,8 @@ test_relative_home_overrides_launch_with_absolute_cross_process_paths() {
     "relative FM_STATE_OVERRIDE leaked into Pi's cross-process extension path"
   assert_contains "$launch" "-e '$ROOT/.pi/extensions/fm-calm.ts'" \
     "ordinary Pi launch did not resolve Calm from the tracked code root"
+  assert_contains "$launch" "FM_HOME='$home_real' FM_CONFIG_OVERRIDE='$home_real/config'" \
+    "relative home overrides leaked into the Calm preference pins on the crewmate launch"
   assert_contains "$launch" "< '$home_real/data/$id/brief.md'" \
     "relative FM_DATA_OVERRIDE leaked into the cross-process brief path"
   pass "relative home overrides ignore CDPATH and become absolute before spawn launch construction"
@@ -500,6 +504,8 @@ test_pi_threads_model_and_max_effort() {
     "pi launch did not thread the requested model and max thinking level"
   assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' -e '$ROOT/.pi/extensions/fm-calm.ts'" \
     "ordinary Pi launch did not load the task turn-end and tracked Calm extensions together"
+  assert_contains "$launch" "FM_HOME='$HOME_DIR' FM_CONFIG_OVERRIDE='$HOME_DIR/config' FM_PI_HARNESS=pi " \
+    "ordinary Pi launch did not pin the effective Firstmate home the injected Calm reads config/calm from"
   assert_not_contains "$launch" "FM_FIRSTMATE_PI_LAUNCH_BRIEF=" \
     "pi launch still exports the removed Calm input-reroute binding"
   assert_contains "$launch" "fm-operational-input.sh' encode launch-brief" \
@@ -524,6 +530,8 @@ test_pi_signed_threads_shared_pi_profile_and_preserves_identity() {
     "pi-signed launch did not share Pi's model, thinking, and extension semantics"
   assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' -e '$ROOT/.pi/extensions/fm-calm.ts'" \
     "ordinary pi-signed launch did not load the task turn-end and tracked Calm extensions together"
+  assert_contains "$launch" "FM_HOME='$HOME_DIR' FM_CONFIG_OVERRIDE='$HOME_DIR/config' FM_PI_HARNESS=pi-signed " \
+    "ordinary pi-signed launch did not pin the effective Firstmate home the injected Calm reads config/calm from"
   assert_contains "$launch" "fm-operational-input.sh' encode launch-brief" \
     "pi-signed launch lost the canonical typed launch-brief envelope"
   assert_present "$HOME_DIR/state/$id.pi-ext.ts" "pi-signed launch did not install Pi's turn-end extension"
@@ -557,15 +565,9 @@ test_pi_omits_calm_when_the_tracked_source_is_absent() {
   stub_root="$CASE_DIR/stub-root"
   mkdir -p "$stub_root"
   ln -s "$ROOT/bin" "$stub_root/bin"
-  : > "$LAUNCH_LOG"
 
-  out=$(FM_ROOT_OVERRIDE="$stub_root" FM_HOME="$HOME_DIR" \
-    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
-    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
-    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$WT_DIR" TMUX="fake,1,0" \
-    CLAUDE_CONFIG_DIR='' FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
-    GROK_HOME="$HOME_DIR/grok-home" PATH="$FAKEBIN_DIR:$PATH" \
-    "$SPAWN" "$id" "$PROJ_DIR" 2>&1)
+  out=$(FM_TEST_ROOT_OVERRIDE="$stub_root" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
   status=$?
   expect_code 0 "$status" "pi spawn from a code root without the tracked Calm extension should succeed"
   launch=$(cat "$LAUNCH_LOG")
@@ -573,7 +575,34 @@ test_pi_omits_calm_when_the_tracked_source_is_absent() {
     "a nonexistent Calm -e target would make Pi exit before the session starts"
   assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' \"\$(" \
     "omitting Calm dropped or reshaped the per-task turn-end extension"
+  assert_not_contains "$launch" "FM_CONFIG_OVERRIDE=" \
+    "a launch without injected Calm should not carry the Calm preference home pins"
   pass "an incomplete code root omits Calm instead of pointing Pi at a missing extension path"
+}
+
+test_pi_omits_calm_when_a_helper_import_is_missing() {
+  local rec id out status launch stub_root helper
+  id=profile-pi-calm-partial-z8f
+  rec=$(make_spawn_case profile-pi-calm-partial pi "$id")
+  read_case_record "$rec"
+  stub_root="$CASE_DIR/stub-root"
+  mkdir -p "$stub_root/.pi/extensions/lib"
+  ln -s "$ROOT/bin" "$stub_root/bin"
+  cp "$ROOT/.pi/extensions/fm-calm.ts" "$stub_root/.pi/extensions/fm-calm.ts"
+  for helper in "$ROOT"/.pi/extensions/lib/fm-calm-*.ts; do
+    cp "$helper" "$stub_root/.pi/extensions/lib/"
+  done
+
+  out=$(FM_TEST_ROOT_OVERRIDE="$stub_root" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "pi spawn from a code root missing a Calm helper import should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "fm-calm.ts" \
+    "Calm's entrypoint alone cannot load, so its -e would abort the Pi pane at startup"
+  assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' \"\$(" \
+    "omitting Calm dropped or reshaped the per-task turn-end extension"
+  pass "a code root carrying Calm without every helper it imports omits the injected -e"
 }
 
 test_pi_signed_missing_binary_refuses_before_endpoint_or_metadata() {
@@ -732,6 +761,7 @@ test_pi_threads_model_and_max_effort
 test_pi_signed_threads_shared_pi_profile_and_preserves_identity
 test_pi_omits_calm_when_the_worktree_carries_its_own_copy
 test_pi_omits_calm_when_the_tracked_source_is_absent
+test_pi_omits_calm_when_a_helper_import_is_missing
 test_pi_signed_missing_binary_refuses_before_endpoint_or_metadata
 test_pi_signed_persistent_secondmate_uses_pi_extensions_and_identity
 test_batch_forwards_shared_profile_flags

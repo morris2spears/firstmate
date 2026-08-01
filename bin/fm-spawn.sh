@@ -108,9 +108,10 @@
 #     __PIEXT__    absolute path to state/<task-id>.pi-ext.ts (pi turn-end extension,
 #                  written by this script; outside the worktree to avoid pi's trust gate)
 #     __PICALMFLAG__ "-e <this code root's .pi/extensions/fm-calm.ts> " when that tracked
-#                  extension exists and the task worktree does not already carry its own
-#                  copy; empty otherwise (a missing -e target and a duplicate copy of the
-#                  same extension are both fatal to pi at startup)
+#                  extension and every helper it imports exist and the task worktree does
+#                  not already carry its own copy; empty otherwise (an unresolvable -e
+#                  target and a duplicate copy of the same extension are both fatal to pi
+#                  at startup)
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
 #     __OPINPUT__   absolute path to the canonical operational-input encoder
@@ -160,6 +161,21 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# The config directory is pinned onto cross-process crewmate launch commands, which run
+# from the task worktree, so a relative override has to become absolute here while
+# firstmate's own working directory is still the reference point. Resolution is lenient
+# unlike state and data: a config directory that does not exist yet is ordinary and must
+# not refuse the spawn.
+case "$CONFIG" in
+  /*) CONFIG_ABS=$CONFIG ;;
+  *)
+    if [ -d "$CONFIG" ]; then
+      CONFIG_ABS=$(resolve_directory_input FM_CONFIG_OVERRIDE "$CONFIG") || exit 1
+    else
+      CONFIG_ABS="$PWD/$CONFIG"
+    fi
+    ;;
+esac
 SUB_HOME_MARKER=".fm-secondmate-home"
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
@@ -1559,9 +1575,33 @@ sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 # its own .pi/extensions/fm-calm.ts (pi dedups extensions by resolved absolute path, so
 # the second copy aborts the session with tool-name conflicts). A worktree copy is the
 # same extension and loads on its own once that project is trusted.
+# The entrypoint alone is not enough: it imports its layout and visibility helpers by
+# relative path, so a partial code root carrying only fm-calm.ts still aborts the pane.
+# Every tracked file the extension reaches, including the helpers' own imports, must be
+# present before the flag is injected.
+# /calm is a captain-only presentation preference shared by every pane through the
+# effective home's config/calm. A crewmate never invokes it on its own initiative; it
+# toggles only when the captain has firstmate relay /calm into the pane he is watching.
 PICALMFLAG=
-if [ -f "$FM_ROOT/.pi/extensions/fm-calm.ts" ] && [ ! -e "$WT/.pi/extensions/fm-calm.ts" ]; then
-  PICALMFLAG="-e $(shell_quote "$FM_ROOT/.pi/extensions/fm-calm.ts") "
+PICALM_SOURCE="$FM_ROOT/.pi/extensions/fm-calm.ts"
+if [ ! -e "$WT/.pi/extensions/fm-calm.ts" ]; then
+  PICALM_COMPLETE=1
+  for picalm_file in \
+    "$PICALM_SOURCE" \
+    "$FM_ROOT/.pi/extensions/lib/fm-calm-assistant-layout.ts" \
+    "$FM_ROOT/.pi/extensions/lib/fm-calm-nonconversation-layout.ts" \
+    "$FM_ROOT/.pi/extensions/lib/fm-calm-operational-user-layout.ts" \
+    "$FM_ROOT/.pi/extensions/lib/fm-calm-tool-layout.ts" \
+    "$FM_ROOT/.pi/extensions/lib/fm-calm-visibility.ts" \
+    "$FM_ROOT/.pi/extensions/lib/fm-operational-input.ts"; do
+    if [ ! -f "$picalm_file" ]; then
+      PICALM_COMPLETE=0
+      break
+    fi
+  done
+  if [ "$PICALM_COMPLETE" -eq 1 ]; then
+    PICALMFLAG="-e $(shell_quote "$PICALM_SOURCE") "
+  fi
 fi
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
@@ -1586,6 +1626,19 @@ LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
 # an unset value is the single-store default and needs no prefix.
 if [ "$HARNESS" = claude ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
   LAUNCH="CLAUDE_CONFIG_DIR=$(shell_quote "$CLAUDE_CONFIG_DIR") $LAUNCH"
+fi
+# The injected Calm extension resolves its preference file from FM_HOME/FM_CONFIG_OVERRIDE
+# and otherwise falls back to the code root it was loaded from. Crewmate panes come from a
+# long-lived tmux/herdr daemon that carries neither firstmate's current environment nor a
+# guaranteed-clean one, so pin both on the launch itself: the pane then reads the same
+# effective home's config/calm firstmate resolved, not the code root or a stale inherited
+# value. Only for the ordinary Pi/pi-signed panes that actually receive the flag.
+if [ -n "$PICALMFLAG" ] && [ "$KIND" != secondmate ]; then
+  case "$HARNESS" in
+    pi|pi-signed)
+      LAUNCH="FM_HOME=$(shell_quote "$FM_HOME") FM_CONFIG_OVERRIDE=$(shell_quote "$CONFIG_ABS") $LAUNCH"
+      ;;
+  esac
 fi
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")

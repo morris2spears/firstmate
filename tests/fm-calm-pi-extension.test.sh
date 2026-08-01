@@ -392,6 +392,49 @@ TS
   pass "Pi loads tracked Calm and its helpers by absolute -e path outside Firstmate without changing that project's trust decision"
 }
 
+# Firstmate omits the injected -e whenever the worktree carries its own copy of the
+# extension (bin/fm-spawn.sh), so a Firstmate-on-Firstmate pane gets /calm only through
+# Pi's ordinary project-local discovery. That fallback needs its own coverage: the -e
+# fixtures above cannot exercise it, and a duplicate copy alongside -e is the exact
+# fatal case the omission exists to avoid.
+test_project_local_extension_auto_discovery() {
+  local project home config out status helper
+  if ! command -v pi >/dev/null 2>&1; then
+    echo "skip: pi not found for project-local Calm discovery test"
+    return 0
+  fi
+
+  project="$TMP_ROOT/discovery-project"
+  home="$TMP_ROOT/discovery-home"
+  config="$TMP_ROOT/discovery-pi-config"
+  mkdir -p "$project/.pi/extensions/lib" "$home/config" "$config"
+  cp "$EXT" "$project/.pi/extensions/fm-calm.ts"
+  for helper in "$ASSISTANT_LAYOUT" "$OPERATIONAL_USER_LAYOUT" "$TOOL_LAYOUT" \
+    "$NONCONVERSATION_LAYOUT" "$VISIBILITY" "$PI_OPERATIONAL_INPUT"; do
+    cp "$helper" "$project/.pi/extensions/lib/"
+  done
+  fm_git_init_commit "$project"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --no-approve 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not start in an untrusted project carrying its own Calm copy: $out"
+  assert_not_contains "$out" '"name":"calm"' \
+    "an untrusted project's own Calm extension loaded before its trust decision"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --approve 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not start in a trusted project carrying its own Calm copy: $out"
+  assert_contains "$out" '"name":"calm"' \
+    "a trusted project's own .pi/extensions/fm-calm.ts did not auto-load without an injected -e"
+  pass "a worktree's own Calm copy auto-loads from project-local discovery once that project is trusted"
+}
+
 test_pi_compat_no_upper_bound() {
   local version
   for version in 0.83.0 0.90.0 1.0.0 2.3.4 0.82.1 10.20.30; do
@@ -3117,6 +3160,7 @@ JS
 test_static_contract
 test_home_resolution
 test_external_cli_extension_loading_and_project_trust
+test_project_local_extension_auto_discovery
 test_pi_compat_no_upper_bound
 test_pi_compat_degraded_adapter
 test_pi_compat_missing_adapter_exports

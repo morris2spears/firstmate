@@ -24,15 +24,21 @@ Toggling Calm off restores Pi's ordinary rendering, and the existing tool-expans
 Firstmate injects the tracked Calm extension by absolute `-e` path into ordinary Pi and pi-signed ship and scout panes, so `/calm` is available when those panes run in another project's isolated copy.
 The extension's relative helper imports resolve from the extension file in Firstmate rather than from that project's working directory.
 The persisted choice still follows [`configuration.md`](configuration.md#pi-calm-preference-configcalm), so the injected extension reads the effective Firstmate home's `config/calm` rather than a file under the project.
+Firstmate pins that home onto the ordinary Pi and pi-signed launch command itself, because a crewmate pane is created by a long-lived daemon that does not inherit Firstmate's environment.
 This injection does not apply to non-Pi panes or add to the existing secondmate Pi extension set.
 Firstmate omits the injected `-e` when the task worktree already carries its own `.pi/extensions/fm-calm.ts`, which is the Firstmate-on-Firstmate case, because Pi treats a second copy of the same extension as a fatal tool-name conflict; that worktree's own copy loads normally once the project is trusted.
-Firstmate also omits it when the tracked extension is missing from the running code root, since a nonexistent `-e` target aborts Pi before the session starts.
+Firstmate also omits it when the tracked extension or any helper it imports is missing from the running code root, since an unresolvable `-e` target aborts Pi before the session starts.
 
 Calm presentation activates only in a trusted interactive Pi TUI.
 RPC, JSON, print, and untrusted contexts keep stock presentation even when the home preference is on.
 Loading Calm through `-e` does not trust the current project or bypass Pi's normal first-run trust decision for that working directory.
-After that project is trusted, the ensuing trusted interactive session start applies the saved Calm choice and `/calm` controls only that pane.
+After that project is trusted, the ensuing trusted interactive session start applies the saved Calm choice, and toggling `/calm` changes presentation only in the pane it ran in.
 In other contexts `/calm` declines with a warning and leaves the stored preference unchanged.
+
+There is one shared preference file, and every pane reads and writes it.
+A `/calm` toggle in a crewmate pane therefore rewrites the same `config/calm` the captain's own Pi sessions open with, so it is the captain's setting, not a per-pane one.
+Calm is discretionary and captain-controlled: a crewmate must never invoke `/calm` on its own initiative.
+A crewmate toggles it only when the captain explicitly has Firstmate relay `/calm` into the particular pane he is watching.
 
 ## Pi compatibility
 
