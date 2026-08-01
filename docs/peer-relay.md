@@ -51,10 +51,11 @@ It atomically publishes a private mode-`0700` request directory under `state/pee
 The directory contains mode-`0600` `meta`, `message`, and `status` files with the request id, raw message, origin, exact reply pane identity, client and receive timestamps, and current delivery state.
 
 The receiver then makes the authenticated poll due on the next ordinary watcher tick.
-`bin/fm-peer-relay-poll.sh` emits only `peer-relay-request <id> [<id>...]`, and the watcher writes that output through the existing durable `check:` wake queue path before notifying Firstmate.
+`bin/fm-peer-relay-poll.sh` emits only ids, as `peer-relay-request <id> [<id>...]`, or the ids-free diagnostic below, and the watcher writes that output through the existing durable `check:` wake queue path before notifying Firstmate.
 Neither the request body nor the reply appears in watcher output, a wake payload, or an artifact filename.
 An ids-only offer marker suppresses duplicates and re-offers an unanswered pending request after `FMPEER_REOFFER_SECS`, whose default is 1800 seconds.
 If an offer marker is not a valid private artifact, or an offer cannot be recorded, the poll never emits around it silently: it surfaces one deduplicated `peer-relay-error <message>` line instead, so a stranded request is visible rather than stuck in pending forever.
+That wake routes to the `fmpeer-respond` skill, which clears the blocker and answers the stranded pending requests, exactly as `tg-mode-error` routes to `fmtg-respond`.
 
 ## Retention
 

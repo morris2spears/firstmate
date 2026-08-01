@@ -473,6 +473,7 @@ FMTG_TG_BIN=            # phone-inbox outbound client used for Telegram follow-u
 FMTG_FOLLOWUP_MAX_AGE_SECS=604800   # local window for sending Telegram-mode completion follow-ups (7 days)
 FMTG_FOLLOWUP_MAX_COUNT=3   # local cap on Telegram-mode completion follow-ups per linked note
 FMPEER_REOFFER_SECS=1800    # seconds before an unanswered carbon peer request is offered again
+FMPEER_RETENTION_SECS=604800   # local window before a resolved or delivery-uncertain carbon peer request record is pruned (7 days)
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=300      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=800   # milliseconds the --claude turn-end guard waits for the Stop auto-arm's claim, health, or fresh rewake epoch before re-blocking

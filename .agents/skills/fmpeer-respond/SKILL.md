@@ -3,6 +3,7 @@ name: fmpeer-respond
 description: >-
   Agent-only playbook for handling trusted carbon peer-relay requests.
   Use on a "peer-relay-request <id> ..." check wake to read each durable request, act on it with the same authority as direct captain input, reply into the exact recorded carbon tmux pane, and resolve the request only after confirmed delivery.
+  Also use on a "peer-relay-error ..." check wake to clear the offer blocker that is stranding a pending request instead of answering an id.
 user-invocable: false
 metadata:
   internal: true
@@ -13,6 +14,8 @@ metadata:
 The carbon peer relay carries the captain's own instruction from one of his Claude Code orchestrator sessions into this live primary Firstmate session.
 The sender captured its exact tmux pane id, stable window id, session name, hostname, and timestamp before SSH delivery.
 The pending-request poll surfaces ids only as `peer-relay-request <id> [<id>...]`; message bodies remain in private durable records.
+A `check:` wake can also carry `peer-relay-error <message>` instead of ids - that is an offer-recording problem, not a request to answer.
+It means at least one pending request cannot be offered and is stranded, and the poll deduplicates that line, so handle it on the wake that carries it rather than waiting for a repeat.
 
 ## Authority
 
@@ -50,4 +53,6 @@ Process each id independently in listed order.
 - A send failure becomes `delivery-uncertain` because text or Enter may already have landed.
   Never blind-retry it.
 - The pending poll re-offers an unanswered request after its bounded offer window, so a process loss between poll and handling does not strand the captain's message.
+- On a `peer-relay-error ...` wake, do not answer an id: inspect every pending record under `state/peer-relay/requests/` with `bin/fm-peer-relay-reply.sh inspect <id>`, answer each valid pending request through the normal procedure above, and remove only an offer marker under `state/peer-relay/offered/` that the poll rejected as unusable.
+  Report the blocker to the captain as a peer-relay configuration or tampering problem, and never improvise around a record that fails validation.
 - Request bodies and replies stay private under `state/peer-relay/`; never place either in a wake payload or diagnostic.
