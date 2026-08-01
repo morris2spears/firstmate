@@ -70,7 +70,7 @@ It inspects each pending id, treats the message exactly like direct captain inpu
 This relay does not inherit Telegram or X mode's reduced authority because the request arrived through the captain's trusted peer SSH path.
 
 The skill sends the answer with `bin/fm-peer-relay-reply.sh`.
-That helper records the reply and `sending` state before network I/O, then invokes `/Users/morris/.local/bin/fm-peer-relay-tell.sh` over `ssh carbon` with the recorded pane id and reply body on stdin.
+That helper records the reply and `sending` state before network I/O, then invokes `~/.local/bin/fm-peer-relay-tell.sh`, expanded by the remote login shell, over `ssh carbon` with the recorded pane id and reply body on stdin.
 The carbon helper verifies the exact pane id, runs one literal `tmux send-keys -l` for the text, and runs a separate `tmux send-keys ... Enter` to submit it.
 A confirmed SSH success changes the durable state to `resolved`.
 Any nonzero delivery changes it to `delivery-uncertain`, because the text or Enter may already have arrived, and a blind retry is forbidden.

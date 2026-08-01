@@ -239,7 +239,7 @@ test_reply_targets_exact_carbon_pane_and_resolves() {
     FMPEER_NOW_OVERRIDE=1785600100 \
     "$ROOT/bin/fm-peer-relay-reply.sh" send "$id" --text-file "$reply" >/dev/null \
     || fail "reply helper failed"
-  [ "$(cat "$home/ssh.args")" = $'--\ncarbon\n/Users/morris/.local/bin/fm-peer-relay-tell.sh\n--deliver\n%88' ] \
+  [ "$(cat "$home/ssh.args")" = $'--\ncarbon\n~/.local/bin/fm-peer-relay-tell.sh\n--deliver\n%88' ] \
     || fail "reply SSH command did not target the exact recorded carbon pane"
   [ "$(cat "$home/ssh.stdin")" = 'Captain, the answer is 42.' ] \
     || fail "reply body did not travel on SSH stdin"

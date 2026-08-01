@@ -87,7 +87,10 @@ case "$COMMAND" in
 
     SSH_BIN=${FMPEER_SSH_BIN:-ssh}
     REMOTE_CLIENT=${FMPEER_REMOTE_CLIENT:-}
-    [ -n "$REMOTE_CLIENT" ] || REMOTE_CLIENT='/Users/morris/.local/bin/fm-peer-relay-tell.sh'
+    # Default is expanded by the remote login shell, so it stays portable
+    # across peer accounts instead of pinning one operator's home path.
+    # shellcheck disable=SC2088 # The remote login shell expands this tilde, not us.
+    [ -n "$REMOTE_CLIENT" ] || REMOTE_CLIENT='~/.local/bin/fm-peer-relay-tell.sh'
     "$SSH_BIN" -- "$ORIGIN" "$REMOTE_CLIENT" --deliver "$PANE" < "$REQUEST_DIR/reply"
     rc=$?
     FINISHED=${FMPEER_NOW_OVERRIDE:-$(date +%s)}
