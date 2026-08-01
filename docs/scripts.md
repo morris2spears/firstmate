@@ -98,3 +98,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-tg-poll.sh`          | One local phone-inbox sweep: offer each pending note id once and emit its wake       |
 | `fm-tg-link.sh`          | Link a spawned task to its originating Telegram note in task meta                    |
 | `fm-tg-followup.sh`      | Detect, send, and cap completion follow-ups for a Telegram-linked task               |
+| `fm-peer-relay-lib.sh`   | Shared carbon peer-relay validation, record, and generated-check helpers             |
+| `fm-peer-relay-receive.sh` | Receive one SSH request and atomically publish its private pending record           |
+| `fm-peer-relay-poll.sh`  | Offer pending peer request ids to the authenticated watcher check                    |
+| `fm-peer-relay-reply.sh` | Inspect or answer a peer request and resolve only after confirmed pane delivery      |
+| `fm-peer-relay-tell.sh`  | Capture carbon's exact originating pane or deliver a reply to that pane              |

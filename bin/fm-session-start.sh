@@ -18,7 +18,7 @@
 # standalone with unchanged default behavior - other flows (fm-bootstrap.sh
 # install <tools> after consent, /updatefirstmate, the afk daemon, existing
 # tests) still call them directly. The one seam this script needed -
-# bootstrap running its detect-only diagnostics without its five mutating
+# bootstrap running its detect-only diagnostics without its seven mutating
 # sweeps - is an opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag on fm-bootstrap.sh
 # itself (default unset/0 = unchanged behavior), not a fork.
 #
@@ -29,10 +29,11 @@
 #                       mutating step runs.
 #   2. bootstrap      - home-local stale Herdr projection cleanup runs only
 #                       when this session actually holds the lock. Detect-only
-#                       diagnostics always run. Bootstrap's six MUTATING sweeps
+#                       diagnostics always run. Bootstrap's seven MUTATING sweeps
 #                       (legacy PR-check migration, secondmate fast-forward,
 #                       secondmate liveness, X-mode artifact writes,
-#                       Telegram-mode artifact writes, fleet sync)
+#                       Telegram-mode artifact writes, peer-relay artifact writes,
+#                       fleet sync)
 #                       also run only when locked.
 #   3. wake-drain     - mutates the durable wake queue, so it also only runs
 #                       when locked.
@@ -418,6 +419,13 @@ elif [ -f "$CONFIG/x-mode.env" ] || [ -f "$CONFIG/tg-mode.env" ]; then
   cat <<EOF
 Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
 A 30s-cadence mode (X or Telegram) is active, so the emitted block's cadence instruction applies.
+This script never starts supervision itself.
+
+EOF
+elif [ -f "$STATE/peer-relay-watch.check.sh" ]; then
+  cat <<EOF
+Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
+The carbon peer relay is active, so keep one supervision cycle live even with no project work under way.
 This script never starts supervision itself.
 
 EOF
