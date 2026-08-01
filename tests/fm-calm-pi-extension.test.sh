@@ -240,6 +240,7 @@ test_static_contract() {
 # next crewmate launch.
 test_spawn_injection_guard_covers_every_reachable_import() {
   local guard_list reachable pending current dir target resolved
+  # shellcheck disable=SC2016 # single quotes are deliberate: $PICALM_SOURCE and $FM_ROOT are literal text in the guard lines being rewritten, not variables to expand here.
   guard_list=$(sed -n '/CALM-COMPLETENESS-GUARD-BEGIN/,/CALM-COMPLETENESS-GUARD-END/p' "$ROOT/bin/fm-spawn.sh" |
     grep -o '\$\(FM_ROOT\|PICALM_SOURCE\)[A-Za-z0-9._/-]*' |
     sed 's|^\$PICALM_SOURCE$|$FM_ROOT/.pi/extensions/fm-calm.ts|; s|^\$FM_ROOT/||' |
