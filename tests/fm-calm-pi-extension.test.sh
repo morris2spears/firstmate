@@ -231,6 +231,55 @@ test_static_contract() {
   pass "Pi calm extension is presentation-only with one persisted visibility choice, no Calm status row, hidden working activity, supported redraw controls, and complete tool-row presentation"
 }
 
+# bin/fm-spawn.sh injects Calm by absolute -e only after checking that every tracked file
+# the extension reaches is present, because an unresolvable import aborts the crew pane at
+# startup. That list is hand-written, so it is derived here from the real import graph
+# instead: adding an import without extending the guard fails this test rather than the
+# next crewmate launch.
+test_spawn_injection_guard_covers_every_reachable_import() {
+  local guard_list reachable pending current dir target resolved
+  guard_list=$(grep -o '\$FM_ROOT/\.pi/extensions/[A-Za-z0-9._/-]*\.ts' "$ROOT/bin/fm-spawn.sh" |
+    sed 's|^\$FM_ROOT/||' | sort -u)
+  [ -n "$guard_list" ] \
+    || fail "bin/fm-spawn.sh no longer names the tracked Calm files its injection guard requires"
+
+  reachable=""
+  pending=".pi/extensions/fm-calm.ts"
+  while [ -n "$pending" ]; do
+    current=${pending%%$'\n'*}
+    if [ "$pending" = "$current" ]; then
+      pending=""
+    else
+      pending=${pending#*$'\n'}
+    fi
+    case $'\n'"$reachable"$'\n' in
+      *$'\n'"$current"$'\n'*) continue ;;
+    esac
+    assert_present "$ROOT/$current" "Calm's import graph reaches a missing tracked file: $current"
+    reachable="${reachable:+$reachable$'\n'}$current"
+    dir=$(dirname "$current")
+    while IFS= read -r target; do
+      [ -n "$target" ] || continue
+      case "$target" in
+        *..*) fail "Calm now imports across directories ($target in $current); teach this parity check and the fm-spawn guard how to resolve it" ;;
+      esac
+      resolved="$dir/${target#./}"
+      pending="${pending:+$pending$'\n'}$resolved"
+    done <<EOF
+$(grep -o 'from "\./[^"]*"' "$ROOT/$current" | sed 's|^from "||; s|"$||')
+EOF
+  done
+
+  reachable=$(printf '%s\n' "$reachable" | sort -u)
+  [ "$reachable" = "$guard_list" ] \
+    || fail "fm-spawn's Calm completeness guard is out of sync with the extension's reachable imports
+guard:
+$guard_list
+reachable:
+$reachable"
+  pass "fm-spawn's Calm injection guard requires exactly the tracked files the extension's imports reach"
+}
+
 test_home_resolution() {
   local fixture out status version
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
@@ -3158,6 +3207,7 @@ JS
 }
 
 test_static_contract
+test_spawn_injection_guard_covers_every_reachable_import
 test_home_resolution
 test_external_cli_extension_loading_and_project_trust
 test_project_local_extension_auto_discovery

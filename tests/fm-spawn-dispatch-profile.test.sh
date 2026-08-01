@@ -156,8 +156,8 @@ test_relative_home_overrides_launch_with_absolute_cross_process_paths() {
     "relative FM_STATE_OVERRIDE leaked into Pi's cross-process extension path"
   assert_contains "$launch" "-e '$ROOT/.pi/extensions/fm-calm.ts'" \
     "ordinary Pi launch did not resolve Calm from the tracked code root"
-  assert_contains "$launch" "FM_HOME='$home_real' FM_CONFIG_OVERRIDE='$home_real/config'" \
-    "relative home overrides leaked into the Calm preference pins on the crewmate launch"
+  assert_contains "$launch" "FM_CONFIG_OVERRIDE='$home_real/config'" \
+    "relative home overrides leaked into the Calm preference pin on the crewmate launch"
   assert_contains "$launch" "< '$home_real/data/$id/brief.md'" \
     "relative FM_DATA_OVERRIDE leaked into the cross-process brief path"
   pass "relative home overrides ignore CDPATH and become absolute before spawn launch construction"
@@ -504,8 +504,10 @@ test_pi_threads_model_and_max_effort() {
     "pi launch did not thread the requested model and max thinking level"
   assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' -e '$ROOT/.pi/extensions/fm-calm.ts'" \
     "ordinary Pi launch did not load the task turn-end and tracked Calm extensions together"
-  assert_contains "$launch" "FM_HOME='$HOME_DIR' FM_CONFIG_OVERRIDE='$HOME_DIR/config' FM_PI_HARNESS=pi " \
-    "ordinary Pi launch did not pin the effective Firstmate home the injected Calm reads config/calm from"
+  assert_contains "$launch" "FM_CONFIG_OVERRIDE='$HOME_DIR/config' FM_PI_HARNESS=pi " \
+    "ordinary Pi launch did not pin the config directory Calm reads its shared preference from"
+  assert_not_contains "$launch" "FM_HOME=" \
+    "ordinary Pi launch exported a broader Firstmate home than the Calm preference pin needs"
   assert_not_contains "$launch" "FM_FIRSTMATE_PI_LAUNCH_BRIEF=" \
     "pi launch still exports the removed Calm input-reroute binding"
   assert_contains "$launch" "fm-operational-input.sh' encode launch-brief" \
@@ -530,8 +532,10 @@ test_pi_signed_threads_shared_pi_profile_and_preserves_identity() {
     "pi-signed launch did not share Pi's model, thinking, and extension semantics"
   assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' -e '$ROOT/.pi/extensions/fm-calm.ts'" \
     "ordinary pi-signed launch did not load the task turn-end and tracked Calm extensions together"
-  assert_contains "$launch" "FM_HOME='$HOME_DIR' FM_CONFIG_OVERRIDE='$HOME_DIR/config' FM_PI_HARNESS=pi-signed " \
-    "ordinary pi-signed launch did not pin the effective Firstmate home the injected Calm reads config/calm from"
+  assert_contains "$launch" "FM_CONFIG_OVERRIDE='$HOME_DIR/config' FM_PI_HARNESS=pi-signed " \
+    "ordinary pi-signed launch did not pin the config directory Calm reads its shared preference from"
+  assert_not_contains "$launch" "FM_HOME=" \
+    "ordinary pi-signed launch exported a broader Firstmate home than the Calm preference pin needs"
   assert_contains "$launch" "fm-operational-input.sh' encode launch-brief" \
     "pi-signed launch lost the canonical typed launch-brief envelope"
   assert_present "$HOME_DIR/state/$id.pi-ext.ts" "pi-signed launch did not install Pi's turn-end extension"
@@ -554,6 +558,8 @@ test_pi_omits_calm_when_the_worktree_carries_its_own_copy() {
     "injected Calm would collide with the worktree's own copy and abort the Pi pane"
   assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' \"\$(" \
     "omitting Calm dropped or reshaped the per-task turn-end extension"
+  assert_contains "$launch" "FM_CONFIG_OVERRIDE='$HOME_DIR/config' FM_PI_HARNESS=pi " \
+    "the worktree's own auto-loading Calm copy lost the shared captain-controlled preference pin"
   pass "a worktree that already provides fm-calm.ts does not receive the duplicate Calm -e"
 }
 
@@ -575,8 +581,6 @@ test_pi_omits_calm_when_the_tracked_source_is_absent() {
     "a nonexistent Calm -e target would make Pi exit before the session starts"
   assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' \"\$(" \
     "omitting Calm dropped or reshaped the per-task turn-end extension"
-  assert_not_contains "$launch" "FM_CONFIG_OVERRIDE=" \
-    "a launch without injected Calm should not carry the Calm preference home pins"
   pass "an incomplete code root omits Calm instead of pointing Pi at a missing extension path"
 }
 
@@ -649,6 +653,8 @@ test_pi_signed_persistent_secondmate_uses_pi_extensions_and_identity() {
     "pi-signed secondmate did not share Pi's primary extension launch shape"
   assert_not_contains "$launch" "fm-calm.ts" \
     "secondmate Pi launch unexpectedly received the ordinary-crewmate Calm extension"
+  assert_not_contains "$launch" "FM_CONFIG_OVERRIDE='" \
+    "secondmate Pi launch lost its cleared config override to the ordinary-crewmate Calm pin"
   pass "pi-signed is a distinct persistent secondmate runtime with shared Pi supervision semantics"
 }
 
@@ -719,6 +725,8 @@ test_non_claude_harness_ignores_config_dir() {
     "non-claude harness launch must not receive the claude-specific config-dir prefix"
   assert_not_contains "$launch" "fm-calm.ts" \
     "non-Pi harness launch unexpectedly received the Pi-only Calm extension"
+  assert_not_contains "$launch" "FM_CONFIG_OVERRIDE=" \
+    "non-Pi harness launch unexpectedly received the Pi-only Calm preference pin"
   pass "non-claude harnesses do not receive the claude CLAUDE_CONFIG_DIR prefix or Pi Calm extension"
 }
 

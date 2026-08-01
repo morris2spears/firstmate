@@ -1627,16 +1627,19 @@ LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
 if [ "$HARNESS" = claude ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
   LAUNCH="CLAUDE_CONFIG_DIR=$(shell_quote "$CLAUDE_CONFIG_DIR") $LAUNCH"
 fi
-# The injected Calm extension resolves its preference file from FM_HOME/FM_CONFIG_OVERRIDE
-# and otherwise falls back to the code root it was loaded from. Crewmate panes come from a
-# long-lived tmux/herdr daemon that carries neither firstmate's current environment nor a
-# guaranteed-clean one, so pin both on the launch itself: the pane then reads the same
-# effective home's config/calm firstmate resolved, not the code root or a stale inherited
-# value. Only for the ordinary Pi/pi-signed panes that actually receive the flag.
-if [ -n "$PICALMFLAG" ] && [ "$KIND" != secondmate ]; then
+# Calm's preference directory is FM_CONFIG_OVERRIDE, falling back to the config directory
+# of the home the extension infers, which for a crewmate pane is whatever code root it was
+# loaded from. Crewmate panes come from a long-lived tmux/herdr daemon that carries neither
+# firstmate's current environment nor a guaranteed-clean one, so pin the resolved config
+# directory on the launch itself. This covers every ordinary Pi/pi-signed pane, including
+# the ones where the injected -e is omitted because the worktree's own copy auto-loads:
+# that copy is the same shared captain-controlled preference and must not fall back to a
+# throwaway file under the worktree. FM_CONFIG_OVERRIDE alone decides the preference path,
+# so nothing broader is exported into the pane's child processes.
+if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     pi|pi-signed)
-      LAUNCH="FM_HOME=$(shell_quote "$FM_HOME") FM_CONFIG_OVERRIDE=$(shell_quote "$CONFIG_ABS") $LAUNCH"
+      LAUNCH="FM_CONFIG_OVERRIDE=$(shell_quote "$CONFIG_ABS") $LAUNCH"
       ;;
   esac
 fi
