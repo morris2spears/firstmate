@@ -107,7 +107,7 @@ state/               volatile runtime signals; gitignored
   tg-watch.check.sh  generated Telegram-mode inbox poll shim; present only when opted in (section 15)
   tg-offered/        generated Telegram-mode durable offered markers, one per pending note id; pruned when the note leaves pending (section 15)
   tg-poll/           generated Telegram-mode diagnostic dedupe markers: error (inbox) and claim-error (offer claim)
-  peer-relay/        private carbon peer requests, ids-only offer markers, reply records, and delivery state; see docs/peer-relay.md
+  peer-relay/        private carbon peer requests, ids-only offer markers, reply records, delivery state, and poll/ diagnostic dedupe markers; see docs/peer-relay.md
   peer-relay-watch.check.sh / .check-trust  bootstrap-generated authenticated pending-request poll
   tg-away-delivery/  away-mode Telegram escalation delivery evidence, one text-free <delivery-id>.status per attempt; never holds alert text, chat id, token, or sender output
   tg-away-digest/    away-mode private 0600 working copies of the escalation lines an accepted Telegram notice carried; read these when a delivery receipt points at them, folded into return catch-up, and retired with the away session (bin/fm-away-ledger-lib.sh)
