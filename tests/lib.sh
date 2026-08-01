@@ -34,6 +34,13 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# fm-spawn pins FM_CALM_CONFIG_OVERRIDE onto every ordinary Pi/pi-signed crew pane
+# (docs/configuration.md "Pi Calm preference"), including a crewmate working on firstmate
+# itself, and Calm reads it ahead of every other home resolution. A suite inheriting the
+# captain's pinned directory would toggle his live config/calm instead of its fixture, so
+# the suite starts from an unpinned environment; a test that needs it sets it deliberately.
+unset FM_CALM_CONFIG_OVERRIDE
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034

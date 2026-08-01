@@ -659,7 +659,9 @@ test_pi_signed_persistent_secondmate_uses_pi_extensions_and_identity() {
     "pi-signed secondmate did not share Pi's primary extension launch shape"
   assert_not_contains "$launch" "fm-calm.ts" \
     "secondmate Pi launch unexpectedly received the ordinary-crewmate Calm extension"
-  assert_not_contains "$launch" "FM_CALM_CONFIG_OVERRIDE=" \
+  assert_contains "$launch" "FM_CONFIG_OVERRIDE= FM_CALM_CONFIG_OVERRIDE= FM_HOME='$sm'" \
+    "secondmate Pi launch did not clear an inherited Calm preference pin alongside the other overrides"
+  assert_not_contains "$launch" "FM_CALM_CONFIG_OVERRIDE='" \
     "secondmate Pi launch unexpectedly received the ordinary-crewmate Calm preference pin"
   pass "pi-signed is a distinct persistent secondmate runtime with shared Pi supervision semantics"
 }
