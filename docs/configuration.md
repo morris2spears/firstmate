@@ -26,6 +26,8 @@ Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, whil
 ## Pi Calm preference (config/calm)
 
 The Pi Calm extension stores the captain's home-local presentation choice in gitignored `config/calm` under the effective Firstmate home, resolved from `FM_HOME`, then `FM_ROOT_OVERRIDE`, then the tracked code root derived from the extension path, or under `FM_CONFIG_OVERRIDE` when that test and specialized-setup override is present.
+`FM_CALM_CONFIG_OVERRIDE` names the Calm configuration directory directly and wins ahead of that whole chain.
+It exists so a crewmate pane can be pinned to the captain's shared preference without receiving `FM_HOME` or `FM_CONFIG_OVERRIDE`, which every `bin/fm-*.sh` resolves its entire home and config from; only the Calm extension reads it, so a crewmate's own Firstmate script and test runs keep their own fixtures.
 The only values it writes are `on` and `off`, each followed by one newline; an absent, unreadable, or unrecognized value defaults to off.
 The `/calm` command replaces the file atomically before changing live presentation, so a failed write leaves the current choice unchanged rather than claiming persistence.
 The extension reloads this preference on every Pi `session_start` of a trusted interactive TUI, including startup, new, resume, fork, and reload reasons; other Pi modes keep stock presentation without consulting it, and [`calm.md`](calm.md) owns that scoping.

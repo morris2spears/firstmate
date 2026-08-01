@@ -1586,6 +1586,8 @@ PICALMFLAG=
 PICALM_SOURCE="$FM_ROOT/.pi/extensions/fm-calm.ts"
 if [ ! -e "$WT/.pi/extensions/fm-calm.ts" ]; then
   PICALM_COMPLETE=1
+  # CALM-COMPLETENESS-GUARD-BEGIN (tests/fm-calm-pi-extension.test.sh derives Calm's
+  # reachable import graph and requires it to match exactly these paths)
   for picalm_file in \
     "$PICALM_SOURCE" \
     "$FM_ROOT/.pi/extensions/lib/fm-calm-assistant-layout.ts" \
@@ -1594,6 +1596,7 @@ if [ ! -e "$WT/.pi/extensions/fm-calm.ts" ]; then
     "$FM_ROOT/.pi/extensions/lib/fm-calm-tool-layout.ts" \
     "$FM_ROOT/.pi/extensions/lib/fm-calm-visibility.ts" \
     "$FM_ROOT/.pi/extensions/lib/fm-operational-input.ts"; do
+    # CALM-COMPLETENESS-GUARD-END
     if [ ! -f "$picalm_file" ]; then
       PICALM_COMPLETE=0
       break
@@ -1627,19 +1630,20 @@ LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
 if [ "$HARNESS" = claude ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
   LAUNCH="CLAUDE_CONFIG_DIR=$(shell_quote "$CLAUDE_CONFIG_DIR") $LAUNCH"
 fi
-# Calm's preference directory is FM_CONFIG_OVERRIDE, falling back to the config directory
-# of the home the extension infers, which for a crewmate pane is whatever code root it was
-# loaded from. Crewmate panes come from a long-lived tmux/herdr daemon that carries neither
-# firstmate's current environment nor a guaranteed-clean one, so pin the resolved config
-# directory on the launch itself. This covers every ordinary Pi/pi-signed pane, including
-# the ones where the injected -e is omitted because the worktree's own copy auto-loads:
-# that copy is the same shared captain-controlled preference and must not fall back to a
-# throwaway file under the worktree. FM_CONFIG_OVERRIDE alone decides the preference path,
-# so nothing broader is exported into the pane's child processes.
+# Without a pin, Calm infers its preference directory from the home it can see, which for
+# a crewmate pane is whatever code root the extension was loaded from: crewmate panes come
+# from a long-lived tmux/herdr daemon that carries neither firstmate's current environment
+# nor a guaranteed-clean one. Pin the resolved config directory on the launch itself so
+# every ordinary Pi/pi-signed pane reads the one shared captain-controlled preference,
+# including the panes where the injected -e is omitted because the worktree's own copy
+# auto-loads. FM_CALM_CONFIG_OVERRIDE is read only by the Calm extension, unlike FM_HOME
+# and FM_CONFIG_OVERRIDE, which every bin/fm-*.sh resolves its whole home and config from:
+# pinning either of those on a firstmate-on-firstmate pane would point the crewmate's own
+# script and test runs at the captain's live config directory instead of their fixtures.
 if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     pi|pi-signed)
-      LAUNCH="FM_CONFIG_OVERRIDE=$(shell_quote "$CONFIG_ABS") $LAUNCH"
+      LAUNCH="FM_CALM_CONFIG_OVERRIDE=$(shell_quote "$CONFIG_ABS") $LAUNCH"
       ;;
   esac
 fi

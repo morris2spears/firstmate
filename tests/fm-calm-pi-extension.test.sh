@@ -136,6 +136,8 @@ test_static_contract() {
   assert_contains "$text" 'pi.registerCommand("calm"' "Pi calm extension does not register /calm"
   assert_contains "$text" 'pi.on("session_start"' "Pi calm extension does not restore presentation on every session start"
   assert_contains "$text" 'loadCalmPreference()' "Pi calm extension does not restore the home-persistent toggle choice"
+  assert_contains "$text" 'process.env.FM_CALM_CONFIG_OVERRIDE ||' "Pi Calm extension does not read its own narrow config override ahead of the general home chain"
+  assert_contains "$(cat "$ROOT/bin/fm-spawn.sh")" 'LAUNCH="FM_CALM_CONFIG_OVERRIDE=' "fm-spawn pins a crewmate's Calm preference with a variable other than the Calm-only override"
   assert_contains "$text" 'persistCalmPreference(active)' "Pi calm extension does not persist the captain's toggle choice"
   assert_not_contains "$text" 'setCalmPresentation(false)' "Pi calm extension still resets the toggle on session start"
   assert_contains "$text" 'ctx.ui.setToolsExpanded(!expanded)' "Pi calm extension does not redraw existing custom entries"
@@ -238,10 +240,12 @@ test_static_contract() {
 # next crewmate launch.
 test_spawn_injection_guard_covers_every_reachable_import() {
   local guard_list reachable pending current dir target resolved
-  guard_list=$(grep -o '\$FM_ROOT/\.pi/extensions/[A-Za-z0-9._/-]*\.ts' "$ROOT/bin/fm-spawn.sh" |
-    sed 's|^\$FM_ROOT/||' | sort -u)
+  guard_list=$(sed -n '/CALM-COMPLETENESS-GUARD-BEGIN/,/CALM-COMPLETENESS-GUARD-END/p' "$ROOT/bin/fm-spawn.sh" |
+    grep -o '\$\(FM_ROOT\|PICALM_SOURCE\)[A-Za-z0-9._/-]*' |
+    sed 's|^\$PICALM_SOURCE$|$FM_ROOT/.pi/extensions/fm-calm.ts|; s|^\$FM_ROOT/||' |
+    grep '\.ts$' | sort -u)
   [ -n "$guard_list" ] \
-    || fail "bin/fm-spawn.sh no longer names the tracked Calm files its injection guard requires"
+    || fail "bin/fm-spawn.sh no longer marks the tracked Calm files its injection guard requires"
 
   reachable=""
   pending=".pi/extensions/fm-calm.ts"
@@ -315,6 +319,7 @@ test_home_resolution() {
     EXT="$fixture/project/.pi/extensions/fm-calm.ts" \
     OVERRIDE_HOME="$fixture/override" \
     EXTENSION_HOME="$fixture/project" \
+    CALM_CONFIG="$fixture/calm-config" \
     node --input-type=module 2>&1 <<'JS'
 import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -365,10 +370,24 @@ const context = {
   },
 };
 
+process.env.FM_HOME = process.env.EXTENSION_HOME;
+process.env.FM_CONFIG_OVERRIDE = `${process.env.EXTENSION_HOME}/config`;
+process.env.FM_CALM_CONFIG_OVERRIDE = `${process.env.CALM_CONFIG}`;
+let calm = registerCalm();
+calm.sessionStart({ reason: "startup" }, context);
+await calm.calmCommand.handler("", context);
+if (readFileSync(`${process.env.CALM_CONFIG}/calm`, "utf8") !== "on\n") {
+  throw new Error("Calm did not prefer its own narrow config override over FM_CONFIG_OVERRIDE and FM_HOME");
+}
+if (existsSync(`${process.env.EXTENSION_HOME}/config/calm`)) {
+  throw new Error("Calm still wrote through the general config override while its own override was set");
+}
+
+delete process.env.FM_CALM_CONFIG_OVERRIDE;
 delete process.env.FM_HOME;
 delete process.env.FM_CONFIG_OVERRIDE;
 process.env.FM_ROOT_OVERRIDE = process.env.OVERRIDE_HOME;
-let calm = registerCalm();
+calm = registerCalm();
 calm.sessionStart({ reason: "startup" }, context);
 await calm.calmCommand.handler("", context);
 if (readFileSync(`${process.env.OVERRIDE_HOME}/config/calm`, "utf8") !== "on\n") {

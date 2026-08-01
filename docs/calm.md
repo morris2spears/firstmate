@@ -24,8 +24,9 @@ Toggling Calm off restores Pi's ordinary rendering, and the existing tool-expans
 Firstmate injects the tracked Calm extension by absolute `-e` path into ordinary Pi and pi-signed ship and scout panes, so `/calm` is available when those panes run in another project's isolated copy.
 The extension's relative helper imports resolve from the extension file in Firstmate rather than from that project's working directory.
 The persisted choice still follows [`configuration.md`](configuration.md#pi-calm-preference-configcalm), so the injected extension reads the effective Firstmate home's `config/calm` rather than a file under the project.
-Firstmate pins that home's config directory onto every ordinary Pi and pi-signed launch command itself, because a crewmate pane is created by a long-lived daemon that does not inherit Firstmate's environment.
+Firstmate pins that config directory onto every ordinary Pi and pi-signed launch command itself with the Calm-only `FM_CALM_CONFIG_OVERRIDE`, because a crewmate pane is created by a long-lived daemon that does not inherit Firstmate's environment.
 The pin covers the panes that receive the injected `-e` and the panes where it is omitted because a project-local copy auto-loads, so both read the same shared preference rather than a throwaway file under the worktree.
+A crewmate never receives `FM_HOME` or `FM_CONFIG_OVERRIDE` for this, so pinning Calm's preference cannot redirect the crewmate's own Firstmate script and test runs at the captain's live home.
 This injection does not apply to non-Pi panes or add to the existing secondmate Pi extension set.
 Firstmate omits the injected `-e` when the task worktree already carries its own `.pi/extensions/fm-calm.ts`, which is the Firstmate-on-Firstmate case, because Pi treats a second copy of the same extension as a fatal tool-name conflict; that worktree's own copy loads normally once the project is trusted.
 Firstmate also omits it when the tracked extension or any helper it imports is missing from the running code root, since an unresolvable `-e` target aborts Pi before the session starts.
