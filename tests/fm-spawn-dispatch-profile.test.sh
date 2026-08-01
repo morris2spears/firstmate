@@ -530,6 +530,52 @@ test_pi_signed_threads_shared_pi_profile_and_preserves_identity() {
   pass "pi-signed shares Pi launch semantics while preserving its configured and recorded identity"
 }
 
+test_pi_omits_calm_when_the_worktree_carries_its_own_copy() {
+  local rec id out status launch
+  id=profile-pi-calm-local-z8d
+  rec=$(make_spawn_case profile-pi-calm-local pi "$id")
+  read_case_record "$rec"
+  mkdir -p "$WT_DIR/.pi/extensions"
+  cp "$ROOT/.pi/extensions/fm-calm.ts" "$WT_DIR/.pi/extensions/fm-calm.ts"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+  status=$?
+  expect_code 0 "$status" "pi spawn into a worktree carrying its own Calm extension should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "fm-calm.ts" \
+    "injected Calm would collide with the worktree's own copy and abort the Pi pane"
+  assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' \"\$(" \
+    "omitting Calm dropped or reshaped the per-task turn-end extension"
+  pass "a worktree that already provides fm-calm.ts does not receive the duplicate Calm -e"
+}
+
+test_pi_omits_calm_when_the_tracked_source_is_absent() {
+  local rec id out status launch stub_root
+  id=profile-pi-calm-missing-z8e
+  rec=$(make_spawn_case profile-pi-calm-missing pi "$id")
+  read_case_record "$rec"
+  stub_root="$CASE_DIR/stub-root"
+  mkdir -p "$stub_root"
+  ln -s "$ROOT/bin" "$stub_root/bin"
+  : > "$LAUNCH_LOG"
+
+  out=$(FM_ROOT_OVERRIDE="$stub_root" FM_HOME="$HOME_DIR" \
+    FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
+    FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$WT_DIR" TMUX="fake,1,0" \
+    CLAUDE_CONFIG_DIR='' FM_FAKE_LAUNCH_LOG="$LAUNCH_LOG" \
+    GROK_HOME="$HOME_DIR/grok-home" PATH="$FAKEBIN_DIR:$PATH" \
+    "$SPAWN" "$id" "$PROJ_DIR" 2>&1)
+  status=$?
+  expect_code 0 "$status" "pi spawn from a code root without the tracked Calm extension should succeed"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "fm-calm.ts" \
+    "a nonexistent Calm -e target would make Pi exit before the session starts"
+  assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' \"\$(" \
+    "omitting Calm dropped or reshaped the per-task turn-end extension"
+  pass "an incomplete code root omits Calm instead of pointing Pi at a missing extension path"
+}
+
 test_pi_signed_missing_binary_refuses_before_endpoint_or_metadata() {
   local rec id out status
   id=profile-pi-signed-missing-z8c
@@ -684,6 +730,8 @@ test_grok_omits_invalid_xhigh_reasoning_effort
 test_opencode_threads_model_and_ignores_effort_axis
 test_pi_threads_model_and_max_effort
 test_pi_signed_threads_shared_pi_profile_and_preserves_identity
+test_pi_omits_calm_when_the_worktree_carries_its_own_copy
+test_pi_omits_calm_when_the_tracked_source_is_absent
 test_pi_signed_missing_binary_refuses_before_endpoint_or_metadata
 test_pi_signed_persistent_secondmate_uses_pi_extensions_and_identity
 test_batch_forwards_shared_profile_flags

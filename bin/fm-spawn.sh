@@ -107,7 +107,10 @@
 #                  turn-end signal rides the launch command, e.g. codex -c notify=[...])
 #     __PIEXT__    absolute path to state/<task-id>.pi-ext.ts (pi turn-end extension,
 #                  written by this script; outside the worktree to avoid pi's trust gate)
-#     __PICALM__   absolute path to this code root's .pi/extensions/fm-calm.ts
+#     __PICALMFLAG__ "-e <this code root's .pi/extensions/fm-calm.ts> " when that tracked
+#                  extension exists and the task worktree does not already carry its own
+#                  copy; empty otherwise (a missing -e target and a duplicate copy of the
+#                  same extension are both fatal to pi at startup)
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
 #     __OPINPUT__   absolute path to the canonical operational-input encoder
@@ -468,7 +471,7 @@ launch_template() {
       if [ "$kind" = secondmate ]; then
         printf '%s%s' "$harness" ' __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
-        printf '%s%s' "$harness" ' __MODELFLAG____EFFORTFLAG__-e __PIEXT__ -e __PICALM__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s%s' "$harness" ' __MODELFLAG____EFFORTFLAG__-e __PIEXT__ __PICALMFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
     # grok (Grok Build TUI): a positional prompt starts the supervised interactive
@@ -1549,7 +1552,17 @@ META_WINDOW=$T
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
-sq_picalm=$(shell_quote "$FM_ROOT/.pi/extensions/fm-calm.ts")
+# Calm rides ordinary Pi/pi-signed panes as an extra absolute -e so /calm exists in
+# another project's isolated worktree. Both failure modes are fatal to pi at startup,
+# not warnings, so the flag is omitted rather than pointed at a bad target: a missing
+# tracked source ("Extension path does not exist"), and a worktree that already carries
+# its own .pi/extensions/fm-calm.ts (pi dedups extensions by resolved absolute path, so
+# the second copy aborts the session with tool-name conflicts). A worktree copy is the
+# same extension and loads on its own once that project is trusted.
+PICALMFLAG=
+if [ -f "$FM_ROOT/.pi/extensions/fm-calm.ts" ] && [ ! -e "$WT/.pi/extensions/fm-calm.ts" ]; then
+  PICALMFLAG="-e $(shell_quote "$FM_ROOT/.pi/extensions/fm-calm.ts") "
+fi
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
@@ -1560,7 +1573,7 @@ LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
-LAUNCH=${LAUNCH//__PICALM__/$sq_picalm}
+LAUNCH=${LAUNCH//__PICALMFLAG__/$PICALMFLAG}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
 LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}

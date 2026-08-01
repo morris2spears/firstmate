@@ -25,6 +25,8 @@ Firstmate injects the tracked Calm extension by absolute `-e` path into ordinary
 The extension's relative helper imports resolve from the extension file in Firstmate rather than from that project's working directory.
 The persisted choice still follows [`configuration.md`](configuration.md#pi-calm-preference-configcalm), so the injected extension reads the effective Firstmate home's `config/calm` rather than a file under the project.
 This injection does not apply to non-Pi panes or add to the existing secondmate Pi extension set.
+Firstmate omits the injected `-e` when the task worktree already carries its own `.pi/extensions/fm-calm.ts`, which is the Firstmate-on-Firstmate case, because Pi treats a second copy of the same extension as a fatal tool-name conflict; that worktree's own copy loads normally once the project is trusted.
+Firstmate also omits it when the tracked extension is missing from the running code root, since a nonexistent `-e` target aborts Pi before the session starts.
 
 Calm presentation activates only in a trusted interactive Pi TUI.
 RPC, JSON, print, and untrusted contexts keep stock presentation even when the home preference is on.
