@@ -21,9 +21,16 @@ Tool execution, operational input delivery, ordering, model context, session sto
 Every hidden Firstmate input remains available to the model and in serialized session data and exported artifacts.
 Toggling Calm off restores Pi's ordinary rendering, and the existing tool-expansion choice is preserved.
 
+Firstmate injects the tracked Calm extension by absolute `-e` path into ordinary Pi and pi-signed ship and scout panes, so `/calm` is available when those panes run in another project's isolated copy.
+The extension's relative helper imports resolve from the extension file in Firstmate rather than from that project's working directory.
+The persisted choice still follows [`configuration.md`](configuration.md#pi-calm-preference-configcalm), so the injected extension reads the effective Firstmate home's `config/calm` rather than a file under the project.
+This injection does not apply to non-Pi panes or add to the existing secondmate Pi extension set.
+
 Calm presentation activates only in a trusted interactive Pi TUI.
 RPC, JSON, print, and untrusted contexts keep stock presentation even when the home preference is on.
-In those contexts `/calm` declines with a warning and leaves the stored preference unchanged.
+Loading Calm through `-e` does not trust the current project or bypass Pi's normal first-run trust decision for that working directory.
+After that project is trusted, the ensuing trusted interactive session start applies the saved Calm choice and `/calm` controls only that pane.
+In other contexts `/calm` declines with a warning and leaves the stored preference unchanged.
 
 ## Pi compatibility
 

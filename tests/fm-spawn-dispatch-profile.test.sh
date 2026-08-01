@@ -152,6 +152,8 @@ test_relative_home_overrides_launch_with_absolute_cross_process_paths() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "-e '$home_real/state/$id.pi-ext.ts'" \
     "relative FM_STATE_OVERRIDE leaked into Pi's cross-process extension path"
+  assert_contains "$launch" "-e '$ROOT/.pi/extensions/fm-calm.ts'" \
+    "ordinary Pi launch did not resolve Calm from the tracked code root"
   assert_contains "$launch" "< '$home_real/data/$id/brief.md'" \
     "relative FM_DATA_OVERRIDE leaked into the cross-process brief path"
   pass "relative home overrides ignore CDPATH and become absolute before spawn launch construction"
@@ -496,6 +498,8 @@ test_pi_threads_model_and_max_effort() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "FM_PI_HARNESS=pi pi --model 'openai-codex/gpt-5.6-sol' --thinking 'max' -e" \
     "pi launch did not thread the requested model and max thinking level"
+  assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' -e '$ROOT/.pi/extensions/fm-calm.ts'" \
+    "ordinary Pi launch did not load the task turn-end and tracked Calm extensions together"
   assert_not_contains "$launch" "FM_FIRSTMATE_PI_LAUNCH_BRIEF=" \
     "pi launch still exports the removed Calm input-reroute binding"
   assert_contains "$launch" "fm-operational-input.sh' encode launch-brief" \
@@ -518,6 +522,8 @@ test_pi_signed_threads_shared_pi_profile_and_preserves_identity() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "FM_PI_HARNESS=pi-signed pi-signed --model 'openai-codex/gpt-5.6-sol' --thinking 'max' -e" \
     "pi-signed launch did not share Pi's model, thinking, and extension semantics"
+  assert_contains "$launch" "-e '$HOME_DIR/state/$id.pi-ext.ts' -e '$ROOT/.pi/extensions/fm-calm.ts'" \
+    "ordinary pi-signed launch did not load the task turn-end and tracked Calm extensions together"
   assert_contains "$launch" "fm-operational-input.sh' encode launch-brief" \
     "pi-signed launch lost the canonical typed launch-brief envelope"
   assert_present "$HOME_DIR/state/$id.pi-ext.ts" "pi-signed launch did not install Pi's turn-end extension"
@@ -566,6 +572,8 @@ test_pi_signed_persistent_secondmate_uses_pi_extensions_and_identity() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "FM_PI_HARNESS=pi-signed pi-signed -e '$sm/.pi/extensions/fm-primary-turnend-guard.ts' -e '$sm/.pi/extensions/fm-primary-pi-watch.ts'" \
     "pi-signed secondmate did not share Pi's primary extension launch shape"
+  assert_not_contains "$launch" "fm-calm.ts" \
+    "secondmate Pi launch unexpectedly received the ordinary-crewmate Calm extension"
   pass "pi-signed is a distinct persistent secondmate runtime with shared Pi supervision semantics"
 }
 
@@ -634,7 +642,9 @@ test_non_claude_harness_ignores_config_dir() {
   launch=$(cat "$LAUNCH_LOG")
   assert_not_contains "$launch" "CLAUDE_CONFIG_DIR=" \
     "non-claude harness launch must not receive the claude-specific config-dir prefix"
-  pass "non-claude harnesses do not receive the claude CLAUDE_CONFIG_DIR prefix"
+  assert_not_contains "$launch" "fm-calm.ts" \
+    "non-Pi harness launch unexpectedly received the Pi-only Calm extension"
+  pass "non-claude harnesses do not receive the claude CLAUDE_CONFIG_DIR prefix or Pi Calm extension"
 }
 
 test_active_dispatch_profile_does_not_block_secondmate_launch() {

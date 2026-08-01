@@ -344,6 +344,54 @@ JS
   pass "Pi calm resolves its persistent home independently of Pi's launch directory"
 }
 
+test_external_cli_extension_loading_and_project_trust() {
+  local project home config out status
+  if ! command -v pi >/dev/null 2>&1; then
+    echo "skip: pi not found for external Calm extension loading test"
+    return 0
+  fi
+
+  project="$TMP_ROOT/external-extension-project"
+  home="$TMP_ROOT/external-extension-home"
+  config="$TMP_ROOT/external-extension-pi-config"
+  mkdir -p "$project/.pi/extensions" "$home/config" "$config"
+  printf '%s\n' on >"$home/config/calm"
+  cat >"$project/.pi/extensions/project-trust-probe.ts" <<'TS'
+export default function (pi): void {
+  pi.registerCommand("calm-project-trust-probe", {
+    description: "Prove whether Pi loaded this project-local extension.",
+    handler: async () => {},
+  });
+}
+TS
+  fm_git_init_commit "$project"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --no-approve -e "$EXT" 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not load Calm by absolute -e path from an untrusted external project: $out"
+  assert_contains "$out" '"name":"calm"' \
+    "Pi did not load the tracked Calm extension and its relative helper imports from outside Firstmate"
+  assert_not_contains "$out" '"name":"calm-project-trust-probe"' \
+    "the external Calm -e path bypassed trust for a project-local extension"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --approve -e "$EXT" 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not load Calm by absolute -e path from a trusted external project: $out"
+  assert_contains "$out" '"name":"calm"' \
+    "trusted external project lost the tracked Calm command"
+  assert_contains "$out" '"name":"calm-project-trust-probe"' \
+    "explicit project trust did not load the project-local control extension"
+  [ "$(cat "$home/config/calm")" = on ] \
+    || fail "external Calm loading changed the Firstmate home's persisted preference"
+  pass "Pi loads tracked Calm and its helpers by absolute -e path outside Firstmate without changing that project's trust decision"
+}
+
 test_pi_compat_no_upper_bound() {
   local version
   for version in 0.83.0 0.90.0 1.0.0 2.3.4 0.82.1 10.20.30; do
@@ -2603,11 +2651,6 @@ test_interactive_terminal_e2e() {
   mkdir -p "$project/.pi/extensions/lib" "$project/bin" "$project/state" "$config" "$home/config"
   fm_git_init_commit "$project"
   : > "$project/AGENTS.md"
-  cp "$EXT" "$project/.pi/extensions/fm-calm.ts"
-  cp "$ASSISTANT_LAYOUT" "$project/.pi/extensions/lib/fm-calm-assistant-layout.ts"
-  cp "$OPERATIONAL_USER_LAYOUT" "$project/.pi/extensions/lib/fm-calm-operational-user-layout.ts"
-  cp "$TOOL_LAYOUT" "$project/.pi/extensions/lib/fm-calm-tool-layout.ts"
-  cp "$NONCONVERSATION_LAYOUT" "$project/.pi/extensions/lib/fm-calm-nonconversation-layout.ts"
   cp "$VISIBILITY" "$project/.pi/extensions/lib/fm-calm-visibility.ts"
   cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$project/.pi/extensions/lib/fm-operational-input.ts"
   cp "$WATCH_EXT" "$project/.pi/extensions/fm-primary-pi-watch.ts"
@@ -2765,14 +2808,14 @@ TS
 JSON
 
   tmux -L "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -c "$project" -x 180 -y 44 \
-    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files --session '../calm-session.jsonl'"
+    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files -e '$EXT' --session '../calm-session.jsonl'"
   wait_for_text "$default_snapshot" "The deterministic tool example is complete." \
     || fail "Pi calm E2E did not reach the restored session transcript"
   assert_contains "$(cat "$default_snapshot")" "CALM_E2E_OUTPUT" "calm mode was not off by default"
   assert_contains "$(cat "$default_snapshot")" "fm_watch_arm_pi" "Calm-off transcript did not show the Firstmate watcher tool"
   assert_contains "$(cat "$default_snapshot")" "FIRSTMATE WATCHER WAKE: signal: /tmp/probe.status" "Calm-off transcript did not show the synthetic Firstmate presentation row"
   assert_contains "$(cat "$default_snapshot")" "Thinking..." "reasoning fixture did not render Pi's collapsed thinking label"
-  assert_contains "$(cat "$default_snapshot")" "fm-calm.ts" "project-local Pi calm extension did not auto-load"
+  assert_contains "$(cat "$default_snapshot")" "fm-calm.ts" "tracked Pi Calm extension did not load by absolute path outside Firstmate"
   # shellcheck disable=SC2016 # Backticks are literal prompt markup.
   assert_not_contains "$(cat "$default_snapshot")" 'Run `bin/fm-session-start.sh` now' \
     "native session-start context unexpectedly rendered while Calm was off"
@@ -3040,7 +3083,7 @@ JS
   retire_pi_session "Pi calm interactive E2E"
 
   tmux -L "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -c "$project" -x 180 -y 44 \
-    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files --session '../calm-session.jsonl'"
+    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files -e '$EXT' --session '../calm-session.jsonl'"
   wait_for_text "$restarted_snapshot" "CALM_WORKING_E2E_RESPONSE" \
     || fail "Pi did not restore the persisted session after restart"
   assert_not_contains "$(cat "$restarted_snapshot")" "CALM_E2E_OUTPUT" "restart/resume reset Calm and restored a tool row"
@@ -3073,6 +3116,7 @@ JS
 
 test_static_contract
 test_home_resolution
+test_external_cli_extension_loading_and_project_trust
 test_pi_compat_no_upper_bound
 test_pi_compat_degraded_adapter
 test_pi_compat_missing_adapter_exports
