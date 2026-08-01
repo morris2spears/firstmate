@@ -136,6 +136,8 @@ test_static_contract() {
   assert_contains "$text" 'pi.registerCommand("calm"' "Pi calm extension does not register /calm"
   assert_contains "$text" 'pi.on("session_start"' "Pi calm extension does not restore presentation on every session start"
   assert_contains "$text" 'loadCalmPreference()' "Pi calm extension does not restore the home-persistent toggle choice"
+  assert_contains "$text" 'process.env.FM_CALM_CONFIG_OVERRIDE ||' "Pi Calm extension does not read its own narrow config override ahead of the general home chain"
+  assert_contains "$(cat "$ROOT/bin/fm-spawn.sh")" 'LAUNCH="FM_CALM_CONFIG_OVERRIDE=' "fm-spawn pins a crewmate's Calm preference with a variable other than the Calm-only override"
   assert_contains "$text" 'persistCalmPreference(active)' "Pi calm extension does not persist the captain's toggle choice"
   assert_not_contains "$text" 'setCalmPresentation(false)' "Pi calm extension still resets the toggle on session start"
   assert_contains "$text" 'ctx.ui.setToolsExpanded(!expanded)' "Pi calm extension does not redraw existing custom entries"
@@ -231,6 +233,58 @@ test_static_contract() {
   pass "Pi calm extension is presentation-only with one persisted visibility choice, no Calm status row, hidden working activity, supported redraw controls, and complete tool-row presentation"
 }
 
+# bin/fm-spawn.sh injects Calm by absolute -e only after checking that every tracked file
+# the extension reaches is present, because an unresolvable import aborts the crew pane at
+# startup. That list is hand-written, so it is derived here from the real import graph
+# instead: adding an import without extending the guard fails this test rather than the
+# next crewmate launch.
+test_spawn_injection_guard_covers_every_reachable_import() {
+  local guard_list reachable pending current dir target resolved
+  # shellcheck disable=SC2016 # single quotes are deliberate: $PICALM_SOURCE and $FM_ROOT are literal text in the guard lines being rewritten, not variables to expand here.
+  guard_list=$(sed -n '/CALM-COMPLETENESS-GUARD-BEGIN/,/CALM-COMPLETENESS-GUARD-END/p' "$ROOT/bin/fm-spawn.sh" |
+    grep -o '\$\(FM_ROOT\|PICALM_SOURCE\)[A-Za-z0-9._/-]*' |
+    sed 's|^\$PICALM_SOURCE$|$FM_ROOT/.pi/extensions/fm-calm.ts|; s|^\$FM_ROOT/||' |
+    grep '\.ts$' | sort -u)
+  [ -n "$guard_list" ] \
+    || fail "bin/fm-spawn.sh no longer marks the tracked Calm files its injection guard requires"
+
+  reachable=""
+  pending=".pi/extensions/fm-calm.ts"
+  while [ -n "$pending" ]; do
+    current=${pending%%$'\n'*}
+    if [ "$pending" = "$current" ]; then
+      pending=""
+    else
+      pending=${pending#*$'\n'}
+    fi
+    case $'\n'"$reachable"$'\n' in
+      *$'\n'"$current"$'\n'*) continue ;;
+    esac
+    assert_present "$ROOT/$current" "Calm's import graph reaches a missing tracked file: $current"
+    reachable="${reachable:+$reachable$'\n'}$current"
+    dir=$(dirname "$current")
+    while IFS= read -r target; do
+      [ -n "$target" ] || continue
+      case "$target" in
+        *..*) fail "Calm now imports across directories ($target in $current); teach this parity check and the fm-spawn guard how to resolve it" ;;
+      esac
+      resolved="$dir/${target#./}"
+      pending="${pending:+$pending$'\n'}$resolved"
+    done <<EOF
+$(grep -o 'from "\./[^"]*"' "$ROOT/$current" | sed 's|^from "||; s|"$||')
+EOF
+  done
+
+  reachable=$(printf '%s\n' "$reachable" | sort -u)
+  [ "$reachable" = "$guard_list" ] \
+    || fail "fm-spawn's Calm completeness guard is out of sync with the extension's reachable imports
+guard:
+$guard_list
+reachable:
+$reachable"
+  pass "fm-spawn's Calm injection guard requires exactly the tracked files the extension's imports reach"
+}
+
 test_home_resolution() {
   local fixture out status version
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
@@ -266,6 +320,7 @@ test_home_resolution() {
     EXT="$fixture/project/.pi/extensions/fm-calm.ts" \
     OVERRIDE_HOME="$fixture/override" \
     EXTENSION_HOME="$fixture/project" \
+    CALM_CONFIG="$fixture/calm-config" \
     node --input-type=module 2>&1 <<'JS'
 import { existsSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -316,10 +371,24 @@ const context = {
   },
 };
 
+process.env.FM_HOME = process.env.EXTENSION_HOME;
+process.env.FM_CONFIG_OVERRIDE = `${process.env.EXTENSION_HOME}/config`;
+process.env.FM_CALM_CONFIG_OVERRIDE = `${process.env.CALM_CONFIG}`;
+let calm = registerCalm();
+calm.sessionStart({ reason: "startup" }, context);
+await calm.calmCommand.handler("", context);
+if (readFileSync(`${process.env.CALM_CONFIG}/calm`, "utf8") !== "on\n") {
+  throw new Error("Calm did not prefer its own narrow config override over FM_CONFIG_OVERRIDE and FM_HOME");
+}
+if (existsSync(`${process.env.EXTENSION_HOME}/config/calm`)) {
+  throw new Error("Calm still wrote through the general config override while its own override was set");
+}
+
+delete process.env.FM_CALM_CONFIG_OVERRIDE;
 delete process.env.FM_HOME;
 delete process.env.FM_CONFIG_OVERRIDE;
 process.env.FM_ROOT_OVERRIDE = process.env.OVERRIDE_HOME;
-let calm = registerCalm();
+calm = registerCalm();
 calm.sessionStart({ reason: "startup" }, context);
 await calm.calmCommand.handler("", context);
 if (readFileSync(`${process.env.OVERRIDE_HOME}/config/calm`, "utf8") !== "on\n") {
@@ -342,6 +411,97 @@ JS
   [ "$status" -eq 0 ] || fail "Pi calm home resolution failed: $out"
   [ -z "$out" ] || fail "Pi calm home-resolution test printed output: $out"
   pass "Pi calm resolves its persistent home independently of Pi's launch directory"
+}
+
+test_external_cli_extension_loading_and_project_trust() {
+  local project home config out status
+  if ! command -v pi >/dev/null 2>&1; then
+    echo "skip: pi not found for external Calm extension loading test"
+    return 0
+  fi
+
+  project="$TMP_ROOT/external-extension-project"
+  home="$TMP_ROOT/external-extension-home"
+  config="$TMP_ROOT/external-extension-pi-config"
+  mkdir -p "$project/.pi/extensions" "$home/config" "$config"
+  printf '%s\n' on >"$home/config/calm"
+  cat >"$project/.pi/extensions/project-trust-probe.ts" <<'TS'
+export default function (pi): void {
+  pi.registerCommand("calm-project-trust-probe", {
+    description: "Prove whether Pi loaded this project-local extension.",
+    handler: async () => {},
+  });
+}
+TS
+  fm_git_init_commit "$project"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --no-approve -e "$EXT" 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not load Calm by absolute -e path from an untrusted external project: $out"
+  assert_contains "$out" '"name":"calm"' \
+    "Pi did not load the tracked Calm extension and its relative helper imports from outside Firstmate"
+  assert_not_contains "$out" '"name":"calm-project-trust-probe"' \
+    "the external Calm -e path bypassed trust for a project-local extension"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --approve -e "$EXT" 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not load Calm by absolute -e path from a trusted external project: $out"
+  assert_contains "$out" '"name":"calm"' \
+    "trusted external project lost the tracked Calm command"
+  assert_contains "$out" '"name":"calm-project-trust-probe"' \
+    "explicit project trust did not load the project-local control extension"
+  [ "$(cat "$home/config/calm")" = on ] \
+    || fail "external Calm loading changed the Firstmate home's persisted preference"
+  pass "Pi loads tracked Calm and its helpers by absolute -e path outside Firstmate without changing that project's trust decision"
+}
+
+# Firstmate omits the injected -e whenever the worktree carries its own copy of the
+# extension (bin/fm-spawn.sh), so a Firstmate-on-Firstmate pane gets /calm only through
+# Pi's ordinary project-local discovery. That fallback needs its own coverage: the -e
+# fixtures above cannot exercise it, and a duplicate copy alongside -e is the exact
+# fatal case the omission exists to avoid.
+test_project_local_extension_auto_discovery() {
+  local project home config out status helper
+  if ! command -v pi >/dev/null 2>&1; then
+    echo "skip: pi not found for project-local Calm discovery test"
+    return 0
+  fi
+
+  project="$TMP_ROOT/discovery-project"
+  home="$TMP_ROOT/discovery-home"
+  config="$TMP_ROOT/discovery-pi-config"
+  mkdir -p "$project/.pi/extensions/lib" "$home/config" "$config"
+  cp "$EXT" "$project/.pi/extensions/fm-calm.ts"
+  for helper in "$ASSISTANT_LAYOUT" "$OPERATIONAL_USER_LAYOUT" "$TOOL_LAYOUT" \
+    "$NONCONVERSATION_LAYOUT" "$VISIBILITY" "$PI_OPERATIONAL_INPUT"; do
+    cp "$helper" "$project/.pi/extensions/lib/"
+  done
+  fm_git_init_commit "$project"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --no-approve 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not start in an untrusted project carrying its own Calm copy: $out"
+  assert_not_contains "$out" '"name":"calm"' \
+    "an untrusted project's own Calm extension loaded before its trust decision"
+
+  out=$(cd "$project" && printf '%s\n' '{"id":"commands","type":"get_commands"}' |
+    FM_HOME="$home" PI_CODING_AGENT_DIR="$config" PI_OFFLINE=1 \
+      pi --mode rpc --no-session --no-skills --no-prompt-templates --no-context-files \
+        --approve 2>&1)
+  status=$?
+  [ "$status" -eq 0 ] || fail "Pi could not start in a trusted project carrying its own Calm copy: $out"
+  assert_contains "$out" '"name":"calm"' \
+    "a trusted project's own .pi/extensions/fm-calm.ts did not auto-load without an injected -e"
+  pass "a worktree's own Calm copy auto-loads from project-local discovery once that project is trusted"
 }
 
 test_pi_compat_no_upper_bound() {
@@ -2603,11 +2763,6 @@ test_interactive_terminal_e2e() {
   mkdir -p "$project/.pi/extensions/lib" "$project/bin" "$project/state" "$config" "$home/config"
   fm_git_init_commit "$project"
   : > "$project/AGENTS.md"
-  cp "$EXT" "$project/.pi/extensions/fm-calm.ts"
-  cp "$ASSISTANT_LAYOUT" "$project/.pi/extensions/lib/fm-calm-assistant-layout.ts"
-  cp "$OPERATIONAL_USER_LAYOUT" "$project/.pi/extensions/lib/fm-calm-operational-user-layout.ts"
-  cp "$TOOL_LAYOUT" "$project/.pi/extensions/lib/fm-calm-tool-layout.ts"
-  cp "$NONCONVERSATION_LAYOUT" "$project/.pi/extensions/lib/fm-calm-nonconversation-layout.ts"
   cp "$VISIBILITY" "$project/.pi/extensions/lib/fm-calm-visibility.ts"
   cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$project/.pi/extensions/lib/fm-operational-input.ts"
   cp "$WATCH_EXT" "$project/.pi/extensions/fm-primary-pi-watch.ts"
@@ -2765,14 +2920,14 @@ TS
 JSON
 
   tmux -L "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -c "$project" -x 180 -y 44 \
-    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files --session '../calm-session.jsonl'"
+    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files -e '$EXT' --session '../calm-session.jsonl'"
   wait_for_text "$default_snapshot" "The deterministic tool example is complete." \
     || fail "Pi calm E2E did not reach the restored session transcript"
   assert_contains "$(cat "$default_snapshot")" "CALM_E2E_OUTPUT" "calm mode was not off by default"
   assert_contains "$(cat "$default_snapshot")" "fm_watch_arm_pi" "Calm-off transcript did not show the Firstmate watcher tool"
   assert_contains "$(cat "$default_snapshot")" "FIRSTMATE WATCHER WAKE: signal: /tmp/probe.status" "Calm-off transcript did not show the synthetic Firstmate presentation row"
   assert_contains "$(cat "$default_snapshot")" "Thinking..." "reasoning fixture did not render Pi's collapsed thinking label"
-  assert_contains "$(cat "$default_snapshot")" "fm-calm.ts" "project-local Pi calm extension did not auto-load"
+  assert_contains "$(cat "$default_snapshot")" "fm-calm.ts" "tracked Pi Calm extension did not load by absolute path outside Firstmate"
   # shellcheck disable=SC2016 # Backticks are literal prompt markup.
   assert_not_contains "$(cat "$default_snapshot")" 'Run `bin/fm-session-start.sh` now' \
     "native session-start context unexpectedly rendered while Calm was off"
@@ -3040,7 +3195,7 @@ JS
   retire_pi_session "Pi calm interactive E2E"
 
   tmux -L "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -c "$project" -x 180 -y 44 \
-    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files --session '../calm-session.jsonl'"
+    "env FM_HOME='../e2e-home' PI_CODING_AGENT_DIR='../e2e-config' FM_OPERATIONAL_INPUT_SCRIPT='../fm-operational-input.sh' PI_OFFLINE=1 pi --approve --no-skills --no-prompt-templates --no-context-files -e '$EXT' --session '../calm-session.jsonl'"
   wait_for_text "$restarted_snapshot" "CALM_WORKING_E2E_RESPONSE" \
     || fail "Pi did not restore the persisted session after restart"
   assert_not_contains "$(cat "$restarted_snapshot")" "CALM_E2E_OUTPUT" "restart/resume reset Calm and restored a tool row"
@@ -3072,7 +3227,10 @@ JS
 }
 
 test_static_contract
+test_spawn_injection_guard_covers_every_reachable_import
 test_home_resolution
+test_external_cli_extension_loading_and_project_trust
+test_project_local_extension_auto_discovery
 test_pi_compat_no_upper_bound
 test_pi_compat_degraded_adapter
 test_pi_compat_missing_adapter_exports

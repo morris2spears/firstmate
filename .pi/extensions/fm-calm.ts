@@ -124,7 +124,10 @@ export default function (pi: ExtensionAPI) {
   let removeTerminalInputHandler: (() => void) | undefined;
 
   const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
-  const configDirectory = process.env.FM_CONFIG_OVERRIDE || resolve(fmHome, "config");
+  const configDirectory =
+    process.env.FM_CALM_CONFIG_OVERRIDE ||
+    process.env.FM_CONFIG_OVERRIDE ||
+    resolve(fmHome, "config");
   const calmPreferencePath = resolve(configDirectory, "calm");
   const loadCalmPreference = (): boolean => {
     try {
