@@ -75,6 +75,7 @@ config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCA
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 config/telegram-mode  Telegram-mode opt-in flag file (no secret); LOCAL, gitignored; presence-gates section 15
 config/tg-mode.env   generated Telegram-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
+config/peer-relay-carbon  trusted carbon peer-relay opt-in flag (no secret); LOCAL, gitignored; see docs/peer-relay.md
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
   captain.md         this home's domain-local captain preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
@@ -106,6 +107,8 @@ state/               volatile runtime signals; gitignored
   tg-watch.check.sh  generated Telegram-mode inbox poll shim; present only when opted in (section 15)
   tg-offered/        generated Telegram-mode durable offered markers, one per pending note id; pruned when the note leaves pending (section 15)
   tg-poll/           generated Telegram-mode diagnostic dedupe markers: error (inbox) and claim-error (offer claim)
+  peer-relay/        private carbon peer requests, ids-only offer markers, reply records, delivery state, and poll/ diagnostic dedupe markers; see docs/peer-relay.md
+  peer-relay-watch.check.sh / .check-trust  bootstrap-generated authenticated pending-request poll
   tg-away-delivery/  away-mode Telegram escalation delivery evidence, one text-free <delivery-id>.status per attempt; never holds alert text, chat id, token, or sender output
   tg-away-digest/    away-mode private 0600 working copies of the escalation lines an accepted Telegram notice carried; read these when a delivery receipt points at them, folded into return catch-up, and retired with the away session (bin/fm-away-ledger-lib.sh)
   tg-away-versions/  away-mode immutable batch versions, one complete v.<id>/ copy of the escalation buffer, ledger sidecar, wedge marker, and digests per ledger transition, plus the single active/active.applied pointer and the .owner.lock every transition holds; the live artifacts are that pointer's projection, and retained versions fold into return catch-up and retire whole once it is acknowledged (bin/fm-away-ledger-lib.sh)
@@ -146,7 +149,7 @@ A lock-refused session must not spawn, steer, merge, drain the wake queue, repai
 1. **Lock** - acquires the per-home session lock first, before anything mutates shared state.
 2. **Bootstrap** - detect-only checks (tool/version problems, GitHub auth, the worktree-tangle check, harness override, dispatch-profile validation, backlog-backend status) always run, but routine confirmations stay silent by default.
    When the lock could not be acquired, the worktree-tangle check uses read-only advisory wording without a checkout repair command.
-   Home-local stale Herdr projection cleanup and the six bootstrap MUTATING sweeps - non-executing legacy PR-check migration, fleet sync, the local secondmate fast-forward sweep, the secondmate liveness sweep, and the X-mode and Telegram-mode artifact writes - run only when this session actually holds the lock from step 1.
+   Home-local stale Herdr projection cleanup and the seven bootstrap MUTATING sweeps - non-executing legacy PR-check migration, fleet sync, the local secondmate fast-forward sweep, the secondmate liveness sweep, and the X-mode, Telegram-mode, and peer-relay artifact writes - run only when this session actually holds the lock from step 1.
    The secondmate liveness sweep deterministically accounts for every registered secondmate: it relaunches only from the recovery-grade `dead` or `missing` states, preserves ambiguous or unreadable targets, and reports skipped or failed guarantees as `SECONDMATE_LIVENESS:` lines (`bin/fm-bootstrap.sh`; `bin/fm-backend.sh`'s `fm_backend_agent_state`).
 3. **Wake queue** - when locked, drains the durable wake queue and prints the raw records prominently as this turn's first work queue; a bounded, clearly labeled historical status-event annotation may follow a valid `signal` record but never replaces it or current-state reconciliation, and a lapsed watcher chain still surfaces here via the same guard alarm.
    When the lock could not be acquired and verified, the queue is left untouched because no session mutation is authorized, and the guard's tangle/watcher-liveness alarms still print in read-only advisory mode without drain, supervision repair, or checkout repair commands.
@@ -344,7 +347,7 @@ The promoted worker must inventory scratch state, return to a clean default-bran
 Fleet supervision is an always-loaded operational contract; `docs/architecture.md`, `docs/turnend-guard.md`, the emitted session-start block, and script help own mechanisms and harness-specific recipes.
 
 Whenever work is under way, keep exactly one live supervision cycle using the emitted protocol for this primary harness.
-X mode may require that same live cycle with no fleet work.
+X mode or the carbon peer relay may require that same live cycle with no fleet work.
 Do not substitute another harness's wait shape, use shell `&`, or create a second cycle when a healthy one already exists.
 For every actionable wake, follow the ordinary-wake continuation in the emitted protocol; use its repair action only when the live cycle is missing or failed.
 No turn ends blind while work is under way, including turns described as holding or waiting.
@@ -358,7 +361,7 @@ Handle actionable wakes as follows:
 
 1. For `signal:`, read the listed event lines first, then reconcile current state only where action depends on it.
 2. For `stale:`, inspect the recorded endpoint and load `stuck-crewmate-recovery` for a stopped, looping, confused, or unresponsive worker; a deep-inspection reason also requires current-state and validation-log inspection.
-3. For `check:`, act on the named poll result, including merges, declined pull requests, X-mode events, and Telegram notes.
+3. For `check:`, act on the named poll result, including merges, declined pull requests, X-mode events, Telegram notes, and carbon peer requests.
 4. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.
@@ -482,7 +485,7 @@ It performs guarded fast-forward updates of firstmate and registered secondmate 
 
 These skills are not captain-invocable; load them only at their precise triggers.
 
-- `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `PR_CHECK_MIGRATION:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `NUDGE_SECONDMATES:`, `FMX:`, or `FMTG:`); silence and `BOOTSTRAP_INFO:` need no load.
+- `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `PR_CHECK_MIGRATION:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `NUDGE_SECONDMATES:`, `FMX:`, `FMTG:`, or `FMPEER:`); silence and `BOOTSTRAP_INFO:` need no load.
 - `diagnostic-reasoning` - load before scoping a reported bug and before acting on a diagnostic report.
 - `ask-user-authority` - load before deciding any ask-user finding, regardless of the project's `yolo` posture.
 - `quota-array-dispatch` - load before choosing among a matched crew-dispatch profile array from current quota-axi output.
@@ -495,6 +498,7 @@ These skills are not captain-invocable; load them only at their precise triggers
 - `pr-decline-feedback` - load on a `check:` wake whose poll result is `declined <number> <comment-id>`, before relaying a captain comment left on a pull request he closed without merging.
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the X-mode configuration blocker, and on any milestone or terminal wake for an X-mode-linked task before posting its completion follow-up; relevant only when X mode is on.
 - `fmtg-respond` - load on a `tg-message <id> ...` `check:` wake to claim and answer the captain's pending phone notes, on a `tg-mode-error ...` `check:` wake to report the Telegram-mode configuration blocker, and on any milestone or terminal wake for a Telegram-linked task before sending its completion follow-up; relevant only when Telegram mode is on.
+- `fmpeer-respond` - load on a `peer-relay-request <id> ...` `check:` wake to act on each trusted carbon request with normal direct-captain authority and return the answer to its recorded pane, and on a `peer-relay-error ...` `check:` wake to clear the stranded-offer blocker so the pending request reaches the captain.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 

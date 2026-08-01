@@ -11,7 +11,7 @@ The shared orchestrator behavior lives in [`AGENTS.md`](../AGENTS.md) - edit it 
 This section is the single owner of the top-level operational-home layout; producer script headers and their help own exact child-file fields and mutation contracts.
 The tracked code root contains the shared instruction, skill, documentation, workflow, and `bin/` surfaces, while each effective `FM_HOME` contains private operational directories.
 `data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, and scout reports.
-`state/` holds volatile runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, away-mode state, generated X-mode and Telegram-mode artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
+`state/` holds volatile runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, away-mode state, generated X-mode, Telegram-mode, and carbon peer-relay artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the guarded exceptions in `AGENTS.md`.
 
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
@@ -367,6 +367,10 @@ In dry-run, `fm-x-dismiss.sh` records `{request_id, endpoint:"dismiss"}` to the 
 The live answer and follow-up bodies intentionally stay the same shape, including optional `image`; the relay distinguishes them by endpoint, and dismiss stays `{request_id}`.
 These paths need `jq` to build the JSON payload, but they run before token and network checks, so they need neither `FMX_PAIRING_TOKEN` nor `curl`.
 
+## Carbon peer relay (config/peer-relay-carbon)
+
+[`peer-relay.md`](peer-relay.md) is the single owner of the carbon peer relay's activation, SSH trust boundary, request envelope, durable lifecycle, ids-only wake shape, exact-pane reply mechanics, failure states, and current single-peer scope.
+
 ## Telegram mode (config/telegram-mode)
 
 Telegram mode lets the main firstmate answer the captain's phone messages: the separate phone-inbox project captures each Telegram message from the captain's single claimed chat as a pending note file, and firstmate claims, acts on, and replies to those notes through phone-inbox's durable bridge commands.
@@ -468,6 +472,8 @@ FMTG_REOFFER_SECS=1800  # seconds before a still-unclaimed Telegram note is offe
 FMTG_TG_BIN=            # phone-inbox outbound client used for Telegram follow-ups; unset means ~/dev/phone-inbox/tg
 FMTG_FOLLOWUP_MAX_AGE_SECS=604800   # local window for sending Telegram-mode completion follow-ups (7 days)
 FMTG_FOLLOWUP_MAX_COUNT=3   # local cap on Telegram-mode completion follow-ups per linked note
+FMPEER_REOFFER_SECS=1800    # seconds before an unanswered carbon peer request is offered again
+FMPEER_RETENTION_SECS=604800   # local window before a resolved or delivery-uncertain carbon peer request record is pruned (7 days)
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=300      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=800   # milliseconds the --claude turn-end guard waits for the Stop auto-arm's claim, health, or fresh rewake epoch before re-blocking

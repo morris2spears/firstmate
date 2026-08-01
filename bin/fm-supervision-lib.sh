@@ -4,7 +4,8 @@
 #
 # Reports whether a firstmate home needs supervision because it has in-flight
 # work (a state/<id>.meta exists), an X-mode relay poll (state/x-watch.check.sh),
-# or a Telegram-mode inbox poll (state/tg-watch.check.sh), and whether its
+# a Telegram-mode inbox poll (state/tg-watch.check.sh), or the carbon peer-relay
+# poll (state/peer-relay-watch.check.sh), and whether its
 # watcher has a fresh liveness beacon
 # (state/.last-watcher-beat, touched every poll cycle, within the grace window).
 # bin/fm-guard.sh keeps its task-specific grace-based warning predicate;
@@ -24,7 +25,7 @@ fm_sup_stat_mtime() {
 # fm_supervision_status <state-dir> [grace-seconds]
 # Populates, for the state dir at $1:
 #   FM_SUP_IN_FLIGHT      count of state/*.meta (in-flight tasks)
-#   FM_SUP_NEEDED         true/false - in-flight work or an X/Telegram-mode poll
+#   FM_SUP_NEEDED         true/false - in-flight work or an external-channel poll
 #   FM_SUP_WATCHER_FRESH  true/false - a watcher beacon within the grace window
 #   FM_SUP_BEACON_DESC    human-readable beacon age, for banners ("never" if absent)
 #   FM_SUP_QUEUE_PENDING  true/false - state/.wake-queue has unread records
@@ -43,7 +44,7 @@ fm_supervision_status() {
     FM_SUP_IN_FLIGHT=$((FM_SUP_IN_FLIGHT + 1))
   done
   if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || [ -f "$state/x-watch.check.sh" ] \
-    || [ -f "$state/tg-watch.check.sh" ]; then
+    || [ -f "$state/tg-watch.check.sh" ] || [ -f "$state/peer-relay-watch.check.sh" ]; then
     FM_SUP_NEEDED=true
   fi
 
@@ -66,8 +67,8 @@ fm_supervision_status() {
 }
 
 # fm_supervision_needed <state-dir> [grace-seconds]
-# Exit 0 (true) exactly when in-flight work or an X-mode or Telegram-mode poll
-# needs a watcher. Exit 1 (false) for an idle home.
+# Exit 0 (true) exactly when in-flight work or an external-channel poll needs a
+# watcher. Exit 1 (false) for an idle home.
 fm_supervision_needed() {
   fm_supervision_status "$@"
   [ "$FM_SUP_NEEDED" = true ]

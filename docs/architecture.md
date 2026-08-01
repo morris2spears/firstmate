@@ -54,6 +54,7 @@ A bounded direct-report terminal tail can help diagnose a mismatch by showing th
 The snapshot strips control sequences, retains only capture metadata and literal event-corroboration flags, and never lets terminal evidence override a valid structured classification.
 The default path remains local-only; live GitHub enrichment exists only behind the bearings `--include-prs` opt-in.
 Optional X mode and Telegram mode integrate with the watcher only after explicit opt-in; their generated-artifact and dispatch mechanics are owned by [configuration.md](configuration.md#x-mode-env) and [configuration.md](configuration.md#telegram-mode-configtelegram-mode) respectively.
+The optional carbon peer relay layers on the same watcher-check mechanism after its own opt-in flag; [peer-relay.md](peer-relay.md) owns its trust boundary, durable lifecycle, and reply mechanics.
 
 At session start, `bin/fm-session-start.sh` emits exactly one primary-harness supervision block rendered by `bin/fm-supervision-instructions.sh` from `docs/supervision-protocols/`.
 That block owns the live wait shape for the running primary harness: Claude's Stop `asyncRewake` hook owns tokenless re-arm cycles, Grok uses background-notify cycles, Codex uses bounded foreground checkpoints, Pi and pi-signed use the same two tracked primary extensions, and OpenCode uses its TUI plugin.

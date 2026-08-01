@@ -144,6 +144,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/fmpeer-respond/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/fmtg-respond/SKILL.md",
       "audience": "agent-runtime"
     },
@@ -265,6 +269,10 @@
     },
     {
       "path": "docs/orca-backend.md",
+      "audience": "operator-current"
+    },
+    {
+      "path": "docs/peer-relay.md",
       "audience": "operator-current"
     },
     {
