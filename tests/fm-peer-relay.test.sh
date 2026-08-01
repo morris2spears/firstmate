@@ -131,6 +131,70 @@ test_poll_offers_once_and_reoffers_unanswered() {
   pass "peer poll offers ids once and re-offers an unanswered request after timeout"
 }
 
+test_poll_surfaces_unrecordable_offer_once() {
+  local home id out
+  home=$(make_home claim-error)
+  id=$(receive "$home" %52 'stranded body must stay private') || fail "receive fixture failed"
+  mkdir -p "$home/state/peer-relay/offered"
+  chmod 0700 "$home/state/peer-relay/offered"
+  printf 'tampered\n' > "$home/state/peer-relay/offered/$id"
+  chmod 0644 "$home/state/peer-relay/offered/$id"
+  out=$(FM_HOME="$home" FMPEER_NOW_OVERRIDE=1785600100 "$ROOT/bin/fm-peer-relay-poll.sh")
+  assert_contains "$out" 'peer-relay-error cannot record peer relay offer' \
+    "an unusable offer marker must be surfaced, not silently stranded"
+  assert_not_contains "$out" "peer-relay-request $id" \
+    "poll must not emit around an unusable offer marker"
+  assert_not_contains "$out" 'stranded body must stay private' "request body leaked from poll error"
+  out=$(FM_HOME="$home" FMPEER_NOW_OVERRIDE=1785600200 "$ROOT/bin/fm-peer-relay-poll.sh")
+  [ -z "$out" ] || fail "repeated peer poll error must be deduplicated"
+  rm "$home/state/peer-relay/offered/$id"
+  out=$(FM_HOME="$home" FMPEER_NOW_OVERRIDE=1785600300 "$ROOT/bin/fm-peer-relay-poll.sh")
+  [ "$out" = "peer-relay-request $id" ] || fail "recovered poll must offer the request"
+  assert_absent "$home/state/peer-relay/poll/claim-error" "recovery must clear the error record"
+  pass "peer poll surfaces an unrecordable offer once instead of stranding the request"
+}
+
+test_poll_prunes_terminal_records_and_orphan_markers() {
+  local home resolved pending
+  home=$(make_home retention)
+  resolved=$(receive "$home" %53 'old resolved body') || fail "receive fixture failed"
+  pending=$(receive "$home" %54 'still waiting') || fail "receive fixture failed"
+  FM_HOME="$home" FMPEER_NOW_OVERRIDE=1785600100 "$ROOT/bin/fm-peer-relay-poll.sh" >/dev/null
+  printf 'state=resolved\nupdated_epoch=1785600100\n' \
+    > "$home/state/peer-relay/requests/$resolved/status"
+  touch -t 202001010000 "$home/state/peer-relay/requests/$resolved/status"
+  printf '1\n' > "$home/state/peer-relay/offered/orphan-id"
+  chmod 0600 "$home/state/peer-relay/offered/orphan-id"
+  FM_HOME="$home" FMPEER_NOW_OVERRIDE=2000000000 "$ROOT/bin/fm-peer-relay-poll.sh" >/dev/null
+  assert_absent "$home/state/peer-relay/requests/$resolved" \
+    "a terminal record past the retention window must be pruned"
+  assert_absent "$home/state/peer-relay/offered/$resolved" \
+    "a pruned record must not leave its offer marker behind"
+  assert_absent "$home/state/peer-relay/offered/orphan-id" \
+    "an orphan offer marker must be pruned"
+  assert_present "$home/state/peer-relay/requests/$pending/message" \
+    "a pending request must never be pruned"
+  pass "peer poll bounds retention of terminal records and orphan offer markers"
+}
+
+test_receive_bounds_oversized_ingest() {
+  local home rc size
+  home=$(make_home oversize)
+  {
+    printf '%s\n' fm-peer-relay-v1 origin_host=carbon 'pane_id=%42' \
+      session_name=orchestrator window_id=@7 client_epoch=1785600000 ''
+    perl -e 'print "x" x (1024*1024)'
+  } | FM_HOME="$home" SSH_CONNECTION='x' FMPEER_NOW_OVERRIDE=1785600001 \
+    "$ROOT/bin/fm-peer-relay-receive.sh" >/dev/null 2>&1
+  rc=$?
+  expect_code 2 "$rc" "oversized peer message"
+  size=$(find "$home/state/peer-relay" -type f -exec wc -c {} + 2>/dev/null | awk '{ if ($1 > m) m = $1 } END { print m + 0 }')
+  [ "$size" -le 65537 ] || fail "oversized stream was written to disk before rejection"
+  [ -z "$(find "$home/state/peer-relay/requests" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] \
+    || fail "oversized envelope must not publish a request"
+  pass "receive bounds ingest at the documented cap before rejecting"
+}
+
 test_watcher_queues_ids_only_check_wake() {
   local home id out rc drain
   home=$(make_home wake)
@@ -289,6 +353,9 @@ test_bootstrap_activation_and_optout
 test_receive_publishes_private_pending_record
 test_receive_rejects_nonssh_and_bad_identity
 test_poll_offers_once_and_reoffers_unanswered
+test_poll_surfaces_unrecordable_offer_once
+test_poll_prunes_terminal_records_and_orphan_markers
+test_receive_bounds_oversized_ingest
 test_watcher_queues_ids_only_check_wake
 test_reply_targets_exact_carbon_pane_and_resolves
 test_reply_failure_is_uncertain_and_not_retryable

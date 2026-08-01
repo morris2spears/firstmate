@@ -96,12 +96,64 @@ fmpeer_status_write() {  # <request-dir> <state> <epoch>
     | fmx_private_artifact_publish_stdin "$dir" status 600
 }
 
+fmpeer_status_terminal() {  # <state>
+  case "${1-}" in
+    resolved|delivery-uncertain) return 0 ;;
+  esac
+  return 1
+}
+
 fmpeer_stat_mtime() {  # <path>
   if [ "$(uname)" = Darwin ]; then
     stat -f %m "$1" 2>/dev/null
   else
     stat -c %Y "$1" 2>/dev/null
   fi
+}
+
+# Retention: a peer request record holds private captain text, so a record that
+# reached a terminal delivery state is kept only long enough to stay inspectable
+# after the fact, then removed with its offer marker. Nothing prunes a pending
+# request; only the captain's own reply moves a record out of pending.
+FMPEER_RETENTION_DEFAULT_SECS=604800
+
+fmpeer_retention_secs() {
+  local secs=${FMPEER_RETENTION_SECS:-$FMPEER_RETENTION_DEFAULT_SECS}
+  case "$secs" in
+    ''|*[!0-9]*) secs=$FMPEER_RETENTION_DEFAULT_SECS ;;
+  esac
+  [ "${#secs}" -le 18 ] || secs=$FMPEER_RETENTION_DEFAULT_SECS
+  printf '%s\n' "$secs"
+}
+
+fmpeer_retention_prune() {  # <state> <now>
+  local state=$1 now=$2 store offered max_age entry id status mtime age
+  fmpeer_epoch_valid "$now" || return 0
+  store=$(fmpeer_store_dir "$state")
+  offered=$(fmpeer_offered_dir "$state")
+  max_age=$(fmpeer_retention_secs)
+  if [ -d "$store" ] && [ ! -L "$store" ]; then
+    for entry in "$store"/*; do
+      [ -d "$entry" ] && [ ! -L "$entry" ] || continue
+      id=${entry##*/}
+      fmpeer_request_id_valid "$id" || continue
+      fmpeer_request_dir_valid "$state" "$id" || continue
+      status=$(fmpeer_status_get "$entry")
+      fmpeer_status_terminal "$status" || continue
+      mtime=$(fmpeer_stat_mtime "$entry/status") || continue
+      age=$((now - mtime))
+      [ "$age" -ge "$max_age" ] || continue
+      rm -rf -- "$entry" 2>/dev/null || true
+    done
+  fi
+  fmx_private_artifact_dir_device "$offered" >/dev/null 2>&1 || return 0
+  for entry in "$offered"/*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    id=${entry##*/}
+    if ! fmpeer_request_id_valid "$id" || [ ! -d "$store/$id" ] || [ -L "$store/$id" ]; then
+      rm -f -- "$entry" 2>/dev/null || true
+    fi
+  done
 }
 
 fmpeer_poll_check_content() {  # <home> <root>

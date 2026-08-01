@@ -122,7 +122,9 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 chmod 0700 "$STAGE" || exit 1
-cat > "$STAGE/message" || exit 1
+# Bounded ingest: read one byte past the documented cap so an oversized or
+# runaway stream is rejected below without ever landing in full on this home.
+head -c 65537 > "$STAGE/message" || exit 1
 chmod 0600 "$STAGE/message" || exit 1
 SIZE=$(wc -c < "$STAGE/message" | tr -d ' ')
 case "$SIZE" in

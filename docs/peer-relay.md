@@ -54,6 +54,13 @@ The receiver then makes the authenticated poll due on the next ordinary watcher 
 `bin/fm-peer-relay-poll.sh` emits only `peer-relay-request <id> [<id>...]`, and the watcher writes that output through the existing durable `check:` wake queue path before notifying Firstmate.
 Neither the request body nor the reply appears in watcher output, a wake payload, or an artifact filename.
 An ids-only offer marker suppresses duplicates and re-offers an unanswered pending request after `FMPEER_REOFFER_SECS`, whose default is 1800 seconds.
+If an offer marker is not a valid private artifact, or an offer cannot be recorded, the poll never emits around it silently: it surfaces one deduplicated `peer-relay-error <message>` line instead, so a stranded request is visible rather than stuck in pending forever.
+
+## Retention
+
+The poll prunes each request record that reached a terminal delivery state, `resolved` or `delivery-uncertain`, once its status is older than `FMPEER_RETENTION_SECS`, whose default is 604800 seconds.
+Pruning removes the whole record, including the stored request and reply text, and orphaned offer markers go with it.
+A pending request is never pruned: only the captain's own reply moves a record out of pending.
 
 ## Acting and replying
 
