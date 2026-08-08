@@ -26,6 +26,8 @@ Ordinary dead-direct-report recovery is owned by `stuck-crewmate-recovery`, whil
 ## Pi Calm preference (config/calm)
 
 The Pi Calm extension stores the captain's home-local presentation choice in gitignored `config/calm` under the effective Firstmate home, resolved from `FM_HOME`, then `FM_ROOT_OVERRIDE`, then the tracked code root derived from the extension path, or under `FM_CONFIG_OVERRIDE` when that test and specialized-setup override is present.
+`FM_CALM_CONFIG_OVERRIDE` names the Calm configuration directory directly and wins ahead of that whole chain.
+It exists so a crewmate pane can be pinned to the captain's shared preference without receiving `FM_HOME` or `FM_CONFIG_OVERRIDE`, which every `bin/fm-*.sh` resolves its entire home and config from; only the Calm extension reads it, so a crewmate's own Firstmate script and test runs keep their own fixtures.
 The only values it writes are `on` and `off`, each followed by one newline; an absent, unreadable, or unrecognized value defaults to off.
 The `/calm` command replaces the file atomically before changing live presentation, so a failed write leaves the current choice unchanged rather than claiming persistence.
 The extension reloads this preference on every Pi `session_start` of a trusted interactive TUI, including startup, new, resume, fork, and reload reasons; other Pi modes keep stock presentation without consulting it, and [`calm.md`](calm.md) owns that scoping.
@@ -210,6 +212,7 @@ Kimi continues to use the captain's normal Kimi home, including the existing con
 The Kimi installer requires an existing regular non-symlink `~/.kimi-code/config.toml`, `python3` with `tomllib`, and `jq`; it validates but never serializes the captain's TOML and refuses before writing when the config is missing, malformed, or surprising or when either tool requirement is unavailable.
 Its `remove` action excises only the marker-delimited Firstmate region and removes Firstmate's hook files.
 For Pi and pi-signed secondmate launches, `fm-spawn.sh` starts the selected executable with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
+Ordinary Pi and pi-signed ship and scout launches instead carry the per-task turn-end extension plus an injected absolute `-e` for Firstmate's own tracked Calm extension and a pinned `FM_CALM_CONFIG_OVERRIDE`; [`calm.md`](calm.md) owns when that injection is omitted and how the shared preference and project trust behave.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
@@ -426,6 +429,7 @@ FM_STATE_OVERRIDE=       # alternate state dir, mainly for tests
 FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
 FM_PROJECTS_OVERRIDE=    # alternate projects dir, mainly for tests
 FM_CONFIG_OVERRIDE=      # alternate config dir, mainly for tests
+FM_CALM_CONFIG_OVERRIDE= # Calm-only config dir, ahead of every other Calm home resolution; pinned by fm-spawn onto ordinary Pi/pi-signed crew launches, cleared for secondmates
 FM_PROC_ROOT_OVERRIDE=   # alternate /proc root for the Linux process-identity read in fm-wake-lib.sh, mainly for tests
 FM_BACKEND=             # optional runtime backend override for new spawns; tmux/herdr/zellij/orca/cmux support ship/scout spawns, codex-app is not accepted
 HERDR_SESSION=default  # herdr-only: named session for normal backend ops; not enough for destructive cleanup (docs/herdr-backend.md)
