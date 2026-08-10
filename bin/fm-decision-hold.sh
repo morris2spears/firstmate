@@ -7,8 +7,9 @@
 # The invoking agent inventories unresolved decisions, assigns stable keys, and
 # routes dependent work. This script supplies deterministic identities, creates
 # and verifies structured tasks-axi captain holds, records completion attestation
-# in the originating task's metadata, and closes a hold only after a durable
-# decision record has been linked to existing dependent work.
+# in the originating task's metadata, and closes a hold only after either a
+# durable decision record has been linked to existing dependent work or an
+# explicit terminal disposition has been recorded with durable evidence.
 #
 # A hold identity is <origin-id>-decision-<decision-key>. Origin ids and decision
 # keys must already be privacy-safe slugs. Repeating `hold` with the same identity
@@ -24,6 +25,9 @@
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
 #     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
+#   fm-decision-hold.sh terminal <origin-id> <decision-key> \
+#     --disposition <implemented|superseded|declined|answered-without-new-work> \
+#     --decision-file <path>
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # `--none` is an explicit semantic attestation that the just-reviewed surface has
@@ -37,6 +41,11 @@
 # It writes the captain decision and routed identities into the hold body, clears
 # those dependency edges, and only then marks the hold Done. A failure before the
 # final step leaves the captain hold open.
+#
+# `terminal` closes an answered hold without requiring or creating downstream
+# work. It accepts only the listed dispositions, requires an exact decision or
+# evidence file, preserves the original hold record with that evidence in Done
+# history, and accepts only an identity-matching retry.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -184,6 +193,20 @@ verify_hold_resolved() {  # <hold-id>
   return 1
 }
 
+verify_hold_terminally_resolved() {  # <hold-id>
+  local id=$1 show state kind body
+  show=$(task_show "$id") || return 1
+  state=$(show_field "$show" state)
+  kind=$(show_field "$show" kind)
+  body=$(show_field "$show" body)
+  [ "$state" = "done" ] || return 1
+  [ "$kind" = captain ] || return 1
+  case "$body" in
+    *"Terminal disposition recorded by fm-decision-hold."*"Original decision record:"*) return 0 ;;
+  esac
+  return 1
+}
+
 verify_hold_durable() {  # <hold-id>
   local id=$1 show state held kind hold_kind body
   show=$(task_show "$id") || fail "captain decision $id is absent from $FM_HOME/data/backlog.md"
@@ -198,6 +221,7 @@ verify_hold_durable() {  # <hold-id>
   if [ "$state" = "done" ] && [ "$kind" = captain ]; then
     case "$body" in
       *"Resolution recorded by fm-decision-hold."*"Routed work:"*) return 0 ;;
+      *"Terminal disposition recorded by fm-decision-hold."*"Original decision record:"*) return 0 ;;
     esac
   fi
   fail "captain decision $id is neither actively held nor durably resolved"
@@ -221,6 +245,26 @@ verify_resolution_identity() {
     || fail "captain hold $id records a different captain decision"
   [ "$recorded_routes" = "$routed_csv" ] \
     || fail "captain hold $id records different routed work"
+}
+
+verify_terminal_identity() {  # <hold-id> <hold-body> <disposition> <evidence-digest>
+  local id=$1 hold_body=$2 disposition=$3 evidence_digest=$4 terminal_prefix terminal_fields recorded_disposition recorded_digest
+  terminal_prefix='"Terminal disposition recorded by fm-decision-hold.\nDisposition: '
+  case "$hold_body" in
+    "$terminal_prefix"*) terminal_fields=${hold_body#"$terminal_prefix"} ;;
+    *) fail "captain hold $id has no terminal retry identity record" ;;
+  esac
+  case "$terminal_fields" in
+    *'\nEvidence digest: '*'\n\nDisposition evidence:'*) : ;;
+    *) fail "captain hold $id has an invalid terminal retry identity record" ;;
+  esac
+  recorded_disposition=${terminal_fields%%\\n*}
+  terminal_fields=${terminal_fields#*\\nEvidence digest: }
+  recorded_digest=${terminal_fields%%\\n*}
+  [ "$recorded_disposition" = "$disposition" ] \
+    || fail "captain hold $id records a different terminal disposition"
+  [ "$recorded_digest" = "$evidence_digest" ] \
+    || fail "captain hold $id records different disposition evidence"
 }
 
 command_id() {
@@ -453,12 +497,86 @@ command_resolve() {
   printf 'resolved: %s -> %s\n' "$id" "$routed"
 }
 
+command_terminal() {
+  local origin=${1:-} key=${2:-} disposition='' decision_file='' disposition_seen=0 file_seen=0 id evidence evidence_digest hold_show hold_body hold_title body resolution_recorded=0
+  [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --disposition)
+        [ "$disposition_seen" = 0 ] || fail "--disposition must be provided exactly once"
+        disposition_seen=1
+        shift
+        disposition=${1:-}
+        ;;
+      --decision-file)
+        [ "$file_seen" = 0 ] || fail "--decision-file must be provided exactly once"
+        file_seen=1
+        shift
+        decision_file=${1:-}
+        ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  validate_slug origin-id "$origin"
+  validate_slug decision-key "$key"
+  [ "$disposition_seen" = 1 ] || fail "--disposition is required"
+  case "$disposition" in
+    implemented|superseded|declined|answered-without-new-work) : ;;
+    *) fail "unsupported terminal disposition: $disposition" ;;
+  esac
+  [ "$file_seen" = 1 ] || fail "--decision-file is required"
+  [ -f "$decision_file" ] || fail "decision file does not exist: $decision_file"
+  evidence=$(cat "$decision_file")
+  [ -n "$evidence" ] || fail "decision file must not be empty"
+  [ "$(printf '%s' "$evidence" | LC_ALL=C wc -c | tr -d ' ')" -le 8192 ] \
+    || fail "decision file exceeds 8192 bytes"
+  evidence_digest=$(sha256_text "$evidence")
+  require_tasks_axi
+  id=$(hold_id "$origin" "$key")
+  if verify_hold_terminally_resolved "$id"; then
+    hold_show=$(task_show "$id")
+    hold_body=$(show_field "$hold_show" body)
+    verify_terminal_identity "$id" "$hold_body" "$disposition" "$evidence_digest"
+    printf 'terminal: %s (%s)\n' "$id" "$disposition"
+    return 0
+  fi
+  if verify_hold_resolved "$id"; then
+    fail "captain hold $id is already resolved through routed work"
+  fi
+  verify_hold_active "$id"
+  hold_show=$(task_show "$id")
+  hold_body=$(show_field "$hold_show" body)
+  hold_title=$(show_field "$hold_show" title)
+  case "$hold_body" in
+    *"Terminal disposition recorded by fm-decision-hold."*)
+      verify_terminal_identity "$id" "$hold_body" "$disposition" "$evidence_digest"
+      resolution_recorded=1
+      ;;
+    *"Resolution recorded by fm-decision-hold."*)
+      fail "captain hold $id already records routed resolution evidence"
+      ;;
+  esac
+
+  if [ "$resolution_recorded" = 0 ]; then
+    body=$(printf 'Terminal disposition recorded by fm-decision-hold.\nDisposition: %s\nEvidence digest: %s\n\nDisposition evidence:\n%s\n\nOriginal decision title:\n%s\n\nOriginal decision record:\n%s' "$disposition" "$evidence_digest" "$evidence" "$hold_title" "$hold_body")
+    tasks_axi update "$id" --body "$body" >/dev/null \
+      || fail "could not record the terminal disposition on $id"
+  fi
+  tasks_axi "done" "$id" >/dev/null || fail "could not close terminal captain hold $id"
+  verify_hold_terminally_resolved "$id" \
+    || fail "captain hold $id did not retain its terminal disposition record"
+  printf 'terminal: %s (%s)\n' "$id" "$disposition"
+}
+
 case "${1:-}" in
   id) shift; command_id "$@" ;;
   hold) shift; command_hold "$@" ;;
   complete) shift; command_complete "$@" ;;
   verify) shift; command_verify "$@" ;;
   resolve) shift; command_resolve "$@" ;;
+  terminal) shift; command_terminal "$@" ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac
