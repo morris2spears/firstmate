@@ -455,6 +455,145 @@ EOF
   pass "main-home and secondmate-home captain holds remain correctly routed"
 }
 
+test_terminal_dispositions_close_without_inventing_work() {
+  local home origin approved_hold late_hold built_hold declined_hold unresolved_hold json show
+  home=$(make_home terminal-dispositions)
+  origin=sample-historical-review
+  mkdir -p "$home/data/$origin"
+  tasks_in "$home" add "$origin" "Historical sample review" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create historical-review origin"
+  write_origin_meta "$home" "$origin"
+  printf 'done: report complete\n' > "$home/state/$origin.status"
+  printf '# Historical sample review\n\nFive decisions were inventoried.\n' > "$home/data/$origin/report.md"
+
+  approved_hold=$(run_decisions "$home" hold "$origin" approved \
+    --title "Approve the sample follow-up" --reason "captain approval pending" --repo sample) \
+    || fail "could not register approved hold"
+  late_hold=$(run_decisions "$home" hold "$origin" late-answer \
+    --title "Choose the retired sample direction" --reason "captain direction pending" --repo sample) \
+    || fail "could not register late-answer hold"
+  built_hold=$(run_decisions "$home" hold "$origin" already-built \
+    --title "Choose the implemented sample behavior" --reason "captain behavior pending" --repo sample) \
+    || fail "could not register already-built hold"
+  declined_hold=$(run_decisions "$home" hold "$origin" declined \
+    --title "Choose whether to continue the sample idea" --reason "captain continuation pending" --repo sample) \
+    || fail "could not register declined hold"
+  unresolved_hold=$(run_decisions "$home" hold "$origin" unresolved \
+    --title "Choose the unresolved sample policy" --reason "captain policy pending" --repo sample) \
+    || fail "could not register unresolved control hold"
+  run_decisions "$home" complete "$origin" \
+    approved late-answer already-built declined unresolved >/dev/null \
+    || fail "could not complete the historical decision inventory"
+
+  json=$(run_bearings "$home") || fail "Bearings failed before terminal dispositions"
+  printf '%s' "$json" | jq -e --arg unresolved "$unresolved_hold" '
+    (.decisions_open | length) == 5
+      and (.decisions_open | any(.id == $unresolved))
+  ' >/dev/null || fail "terminal-disposition fixture did not start with five genuine open decisions: $json"
+
+  run_teardown "$home" "$origin" >/dev/null 2> "$home/teardown.err" \
+    || fail "historical origin teardown failed: $(cat "$home/teardown.err")"
+  tasks_in "$home" "done" "$origin" --report "data/$origin/report.md" --keep 0 >/dev/null \
+    || fail "could not archive historical origin"
+
+  tasks_in "$home" add sample-approved-followup "Apply the approved sample follow-up" \
+    --kind ship --repo sample >/dev/null || fail "could not create unlinked approved task"
+  tasks_in "$home" add sample-completed-implementation "Already completed sample implementation" \
+    --kind ship --repo sample >/dev/null || fail "could not create completed implementation"
+  tasks_in "$home" "done" sample-completed-implementation >/dev/null \
+    || fail "could not complete implementation evidence fixture"
+
+  printf 'The captain approved the follow-up; its separately queued task remains authoritative.\n' \
+    > "$home/approved.txt"
+  run_decisions "$home" terminal "$origin" approved \
+    --disposition answered-without-new-work --decision-file "$home/approved.txt" >/dev/null \
+    || fail "could not terminalize an approved decision whose task was never linked"
+  show=$(tasks_in "$home" show sample-approved-followup --full)
+  assert_contains "$show" "state: queued" "terminal disposition changed the separately queued approved task"
+  assert_contains "$show" "blocked: no" "terminal disposition invented a dependency for the approved task"
+
+  printf 'A later captain choice superseded this direction after the source review completed.\n' \
+    > "$home/late-answer.txt"
+  cat > "$home/fakebin/tasks-axi" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = done ] && [ "\${2:-}" = "$late_hold" ] \
+  && [ ! -f "\$FM_HOME/terminal-done-failed-once" ]; then
+  : > "\$FM_HOME/terminal-done-failed-once"
+  exit 1
+fi
+exec "\$REAL_TASKS_AXI" "\$@"
+EOF
+  chmod +x "$home/fakebin/tasks-axi"
+  if run_decisions "$home" terminal "$origin" late-answer \
+    --disposition superseded --decision-file "$home/late-answer.txt" \
+    > "$home/late-first.out" 2> "$home/late-first.err"; then
+    fail "terminal disposition succeeded after its final close step failed"
+  fi
+  show=$(tasks_in "$home" show "$late_hold" --full)
+  assert_contains "$show" "state: queued" "partial terminal disposition closed the hold"
+  assert_contains "$show" "Terminal disposition recorded by fm-decision-hold" \
+    "partial terminal disposition lost its retry identity"
+  run_decisions "$home" terminal "$origin" late-answer \
+    --disposition superseded --decision-file "$home/late-answer.txt" >/dev/null \
+    || fail "exact terminal retry did not complete after the source work was archived"
+
+  printf 'The selected behavior was already implemented by sample-completed-implementation.\n' \
+    > "$home/implemented.txt"
+  run_decisions "$home" terminal "$origin" already-built \
+    --disposition implemented --decision-file "$home/implemented.txt" >/dev/null \
+    || fail "could not terminalize a decision whose implementation was already done"
+  run_decisions "$home" terminal "$origin" already-built \
+    --disposition implemented --decision-file "$home/implemented.txt" >/dev/null \
+    || fail "identical completed terminal retry was not idempotent"
+  printf 'Different implementation evidence.\n' > "$home/changed-implemented.txt"
+  if run_decisions "$home" terminal "$origin" already-built \
+    --disposition implemented --decision-file "$home/changed-implemented.txt" \
+    > "$home/changed-evidence.out" 2> "$home/changed-evidence.err"; then
+    fail "terminal retry accepted different evidence"
+  fi
+  if run_decisions "$home" terminal "$origin" already-built \
+    --disposition superseded --decision-file "$home/implemented.txt" \
+    > "$home/changed-disposition.out" 2> "$home/changed-disposition.err"; then
+    fail "terminal retry accepted a different disposition"
+  fi
+
+  printf 'The captain declined further work on this sample idea.\n' > "$home/declined.txt"
+  run_decisions "$home" terminal "$origin" declined \
+    --disposition declined --decision-file "$home/declined.txt" >/dev/null \
+    || fail "could not record a declined terminal disposition"
+  if run_decisions "$home" terminal "$origin" unresolved \
+    --disposition ambiguous --decision-file "$home/declined.txt" \
+    > "$home/malformed.out" 2> "$home/malformed.err"; then
+    fail "terminal disposition accepted an unsupported value"
+  fi
+  if run_decisions "$home" terminal "$origin" unresolved \
+    --disposition declined --disposition implemented --decision-file "$home/declined.txt" \
+    > "$home/duplicate.out" 2> "$home/duplicate.err"; then
+    fail "terminal disposition accepted ambiguous duplicate disposition flags"
+  fi
+
+  show=$(tasks_in "$home" show "$built_hold" --full)
+  assert_contains "$show" "state: done" "implemented terminal disposition did not close"
+  assert_contains "$show" "Original decision title:" "terminal history lost the original decision title"
+  assert_contains "$show" "Choose the implemented sample behavior" \
+    "terminal history lost the original decision"
+  assert_contains "$show" "Disposition evidence:" "terminal history lost disposition evidence"
+  assert_contains "$show" "sample-completed-implementation" \
+    "terminal history lost the exact implementation evidence"
+  show=$(tasks_in "$home" show "$unresolved_hold" --full)
+  assert_contains "$show" "state: queued" "malformed terminal attempts closed a genuine unresolved decision"
+  assert_contains "$show" "held: yes" "malformed terminal attempts released a genuine unresolved decision"
+
+  json=$(run_bearings "$home") || fail "Bearings failed after terminal dispositions"
+  printf '%s' "$json" | jq -e \
+    --arg approved "$approved_hold" --arg late "$late_hold" --arg built "$built_hold" \
+    --arg declined "$declined_hold" --arg unresolved "$unresolved_hold" '
+    (.decisions_open | any(.id == $approved or .id == $late or .id == $built or .id == $declined) | not)
+      and (.decisions_open | any(.id == $unresolved and .verb == "captain-hold"))
+  ' >/dev/null || fail "Bearings did not distinguish terminal and genuinely unresolved decisions: $json"
+  pass "terminal dispositions preserve evidence, need no fake task, remain retry-safe, and leave unresolved decisions visible"
+}
+
 # tasks-axi quotes multi-entry blocked_by values as "a,b,c". resolve must strip
 # those surrounding quotes before comma-boundary membership so the first and last
 # list elements match, not only middle elements.
@@ -559,4 +698,5 @@ test_visual_review_uses_shared_completion_owner
 test_none_inventory_and_resolved_prose_do_not_create_holds
 test_terminal_single_owner_status_decision_does_not_block_empty_inventory
 test_secondmate_hold_stays_in_authoritative_home
+test_terminal_dispositions_close_without_inventing_work
 test_resolve_matches_quoted_blocked_by_edges
