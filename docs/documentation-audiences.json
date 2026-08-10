@@ -312,6 +312,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/verification/decision-nudge.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/verification/runtime-backends.md",
       "audience": "maintainer-verification"
     },
