@@ -62,7 +62,7 @@ pass "repeat notification for the same turn stays a single nudge"
 
 # --- disarm clears the record ------------------------------------------------
 
-"$NUDGE" --claude-resolved || fail "resolved exited nonzero"
+"$NUDGE" --claude-resolved < /dev/null || fail "resolved exited nonzero"
 [ ! -e "$MARKER" ] || fail "resolved left the marker behind"
 pass "resolved removes the pending record"
 
@@ -70,11 +70,30 @@ pass "resolved removes the pending record"
 
 : > "$SENT"
 payload p2 | "$NUDGE" --claude-pending
-"$NUDGE" --claude-resolved
+"$NUDGE" --claude-resolved < /dev/null
 sleep 2.5
 [ ! -s "$SENT" ] || fail "a promptly answered question still nudged: $(cat "$SENT")"
 [ ! -e "$MARKER" ] || fail "answered path left a marker"
 pass "a prompt answered inside the delay never nudges"
+
+# --- the disarm drains an oversized hook payload -----------------------------
+
+: > "$SENT"
+payload p2b | "$NUDGE" --claude-pending
+BIG="$TMP/big-posttooluse.json"
+{
+  printf '{"session_id":"sess-1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_response":"'
+  head -c 400000 /dev/zero | tr '\0' 'x'
+  printf '"}'
+} > "$BIG"
+cat "$BIG" | "$NUDGE" --claude-resolved
+[ "${PIPESTATUS[0]}" = 0 ] || fail "the writer was broken mid-payload (SIGPIPE) by the disarm hook"
+[ ! -e "$MARKER" ] || fail "oversized-payload disarm left the marker behind"
+cat "$BIG" | "$NUDGE" --claude-resolved
+[ "${PIPESTATUS[0]}" = 0 ] || fail "the writer was broken mid-payload on the no-marker fast path"
+sleep 2.5
+[ ! -s "$SENT" ] || fail "disarmed prompt still nudged: $(cat "$SENT")"
+pass "the disarm consumes an oversized hook payload instead of breaking the pipe"
 
 # --- a fresh turn after a sent nudge arms again ------------------------------
 
@@ -82,7 +101,7 @@ pass "a prompt answered inside the delay never nudges"
 payload p3 | "$NUDGE" --claude-pending
 sleep 2.5
 [ "$(grep -c Captain "$SENT")" = 1 ] || fail "fresh turn did not arm after a prior sent nudge"
-"$NUDGE" --claude-resolved
+"$NUDGE" --claude-resolved < /dev/null
 pass "a fresh turn arms independently of the prior sent record"
 
 # --- without the Telegram opt-in the feature is inert ------------------------
@@ -117,12 +136,14 @@ pass "only permission_prompt notifications arm"
 : > "$SENT"
 payload p7 | "$NUDGE" --claude-pending
 OLD_NONCE=$(sed -n 's/^nonce=//p' "$MARKER")
-"$NUDGE" --claude-resolved
-payload p8 | "$NUDGE" --claude-pending
+"$NUDGE" --claude-resolved < /dev/null
+# The newer arm gets a long delay so its own timer cannot claim the marker
+# while the stale one runs, leaving only the stale nonce under test.
+payload p8 | FM_DECISION_NUDGE_DELAY_SECS=600 "$NUDGE" --claude-pending
 "$NUDGE" --wait "$OLD_NONCE" &
 wait $! 2>/dev/null || true
 [ "$(sed -n 's/^prompt_id=//p' "$MARKER" 2>/dev/null)" = p8 ] || fail "stale timer disturbed the newer arm"
-"$NUDGE" --claude-resolved
+"$NUDGE" --claude-resolved < /dev/null
 pass "a stale timer nonce cannot fire against a newer arm"
 
 # --- hook registration contract ----------------------------------------------

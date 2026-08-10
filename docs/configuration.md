@@ -425,6 +425,7 @@ The nudge never describes the question: if the captain asks what it is from his 
 It is gated on the same `config/telegram-mode` opt-in flag and on a genuine primary checkout, so a home without the flag and every crewmate or scout task worktree arm nothing and send nothing.
 The tracked `.claude/settings.json` registers the hook points (a `Notification` `permission_prompt` arm plus `PostToolUse`, `UserPromptSubmit`, and `Stop` disarms), and `bin/fm-decision-nudge.sh`'s header owns the marker protocol, the delay override, and the known residual cases.
 A question answered inside the delay never nudges, and one prompt sends at most one nudge.
+The disarm is deliberately uncorrelated (no hook payload ties a finished tool back to the waiting prompt), so any completed tool clears the turn's pending nudge; the two accepted residuals - a decline that fires no event, and a sibling tool completing while the dialog still waits - are documented in the script header and the verification record.
 This covers the Claude Code primary only: a Pi primary equivalent (nudging when a settled turn ends on a captain-facing question in chat) is separate work owned outside this surface, and the remaining primary harnesses are a known follow-up.
 Live hook-payload evidence and the verification procedure live in `docs/verification/decision-nudge.md`.
 

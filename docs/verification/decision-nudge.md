@@ -40,6 +40,7 @@ Negative findings that shaped the design:
 - The `Notification` event fired exactly once per waiting prompt; 75 unanswered seconds produced no repeat and no additional notification type.
 - Declining a permission dialog with "No" fired no event at all (no `PermissionDenied`, no `Stop`), so a decline followed by 30 idle seconds still sends the one nudge; the next captain message clears the record.
   This is the documented residual in the script header.
+- The `Notification` payload names no tool, and every tool call in one assistant block shares a `prompt_id`, so no field correlates a `PostToolUse` back to the waiting prompt. The disarm is therefore matcher `.*` and uncorrelated: a sibling tool finishing while the dialog still waits drops that turn's nudge. Narrowing it would be a worse trade, because `PostToolUse` for an approved tool fires only when that tool finishes - a correlated disarm would page the captain on every approved command that outlives the delay. A missed page in the parallel case (where he is at the keyboard, having just seen the dialog) is the cheaper side. This is the second documented residual in the script header.
 - `permission_mode` in the payload was `bypassPermissions` during the AskUserQuestion capture, so the question prompt notifies regardless of permission mode.
 
 ## Verification procedure

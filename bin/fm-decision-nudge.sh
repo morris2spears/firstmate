@@ -17,17 +17,30 @@
 #     repeat while the same prompt stays unanswered.
 #   PostToolUse matcher .*                  -> --claude-resolved  (disarm)
 #     The question was answered or the permitted tool ran to completion.
+#     Deliberately uncorrelated: the Notification payload names no tool and
+#     parallel calls in one block share prompt_id, so any completed tool
+#     disarms. See "Known residuals" on why this stays the coarse rule.
 #   UserPromptSubmit                        -> --claude-resolved  (disarm)
 #     The captain typed something, so he is present.
 #   Stop                                    -> --claude-resolved  (disarm)
 #     The turn ended, so nothing is blocking.
 #   (internal) --wait <nonce>               -> detached 30s timer
 #
-# Known residual: declining a permission dialog with "No" aborts the turn
-# without firing any hook event, so a decline followed by 30 idle seconds
-# still sends the one nudge. The session genuinely is idle awaiting the
-# captain's next instruction at that point, and his next message clears the
-# record, so this stays a harmless near-miss rather than a repeat pager.
+# Known residuals (both verified live, both accepted):
+#   1. Declining a permission dialog with "No" aborts the turn without firing
+#      any hook event, so a decline followed by 30 idle seconds still sends
+#      the one nudge. The session genuinely is idle awaiting the captain's
+#      next instruction at that point, and his next message clears the
+#      record, so this stays a harmless near-miss rather than a repeat pager.
+#   2. The disarm is uncorrelated, so a sibling tool finishing while the
+#      dialog still waits (parallel tool block, background or subagent
+#      completion) drops that turn's nudge. This is a missed page, not a
+#      spurious one, and narrowing it is a worse trade: PostToolUse for an
+#      approved tool only fires when that tool FINISHES, so a correlated
+#      disarm would page the captain every time he approves a command that
+#      runs longer than the delay - a frequent false positive traded for a
+#      rare false negative. The captain is at the keyboard in the parallel
+#      case (he just saw the dialog), so the coarse rule stays.
 #
 # Scope and consent:
 #   - fm_primary_scope_matches gates arming, so crewmate/scout task worktrees
@@ -72,9 +85,13 @@ case "$DELAY" in ''|*[!0-9]*|0) DELAY=30 ;; esac
 MODE="${1:-}"
 
 # --claude-resolved is on the hot path of every tool call and turn end, so it
-# must cost one stat in the common no-marker case and exit before any sourcing
-# or subprocess work.
+# drains its payload and exits before any sourcing, JSON parsing, or scope
+# work; the common no-marker case costs one stat on top of that.
+# The drain is not optional: PostToolUse payloads embed tool_response, which
+# routinely exceeds the pipe buffer, and exiting with the pipe unread would
+# EPIPE the harness mid-write.
 if [ "$MODE" = --claude-resolved ]; then
+  cat >/dev/null 2>&1 || true
   [ -e "$MARKER" ] || exit 0
   rm -f "$MARKER" 2>/dev/null || true
   exit 0
