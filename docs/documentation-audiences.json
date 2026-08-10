@@ -316,6 +316,10 @@
       "audience": "maintainer-verification"
     },
     {
+      "path": "docs/verification/pi-decision-nudge.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/verification/runtime-backends.md",
       "audience": "maintainer-verification"
     },

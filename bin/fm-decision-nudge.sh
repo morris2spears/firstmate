@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Captain-attention nudge for the firstmate PRIMARY session (Claude Code).
+# Captain-attention nudge for firstmate PRIMARY sessions (Claude Code and Pi).
 #
-# When the primary session blocks on a direct interactive decision prompt -
-# Claude Code's AskUserQuestion tool or a permission dialog - and the captain
-# has not answered within FM_DECISION_NUDGE_DELAY_SECS (default 30), send him
-# ONE deliberately content-free Telegram message through the phone-inbox tg
-# client. The nudge never describes the question; if he asks what it is from
-# his phone, the existing Telegram-mode flow (fmtg-respond) answers normally.
+# When the primary session waits on a direct captain decision - Claude Code's
+# AskUserQuestion tool or a permission dialog, or a settled Pi turn that ends
+# by asking the captain something - and he has not answered within
+# FM_DECISION_NUDGE_DELAY_SECS (default 30), send him ONE deliberately
+# content-free Telegram message through the phone-inbox tg client. The nudge
+# never describes the question; if he asks what it is from his phone, the
+# existing Telegram-mode flow (fmtg-respond) answers normally.
 #
 # Hook wiring (.claude/settings.json, this repo only - never the captain's
 # global settings). Event payloads below were captured live from Claude Code
@@ -26,7 +27,14 @@
 #     The turn ended, so nothing is blocking.
 #   (internal) --wait <nonce>               -> detached 30s timer
 #
-# Known residuals (both verified live, both accepted):
+# Pi wiring (.pi/extensions/fm-primary-decision-nudge.ts):
+#   agent_settled      -> --pi-arm <assistant entry id> (arm after heuristic)
+#   input              -> --pi-resolved (disarm on genuine captain presence)
+#   before_agent_start -> --pi-resolved (disarm before any next run)
+#   session_shutdown   -> --pi-resolved (disarm when this session leaves)
+# The Pi extension passes only the assistant entry id, never the question text.
+#
+# Known Claude residuals (both verified live, both accepted):
 #   1. Declining a permission dialog with "No" aborts the turn without firing
 #      any hook event, so a decline followed by 30 idle seconds still sends
 #      the one nudge. The session genuinely is idle awaiting the captain's
@@ -53,7 +61,8 @@
 #     script never reads or prints any credential.
 #
 # Pending-marker protocol (state/.decision-nudge-pending):
-#   prompt_id=<claude prompt id>   the user-turn this prompt belongs to
+#   prompt_id=<claude prompt id>|pi:<Pi assistant entry id>
+#                                  identifies the harness wait
 #   nonce=<pid.epoch.random>       binds the marker to its own timer
 #   status=pending|sent            sent suppresses re-arming for the same turn
 # The marker is private volatile state; disarm simply removes it. One nudge
@@ -66,10 +75,9 @@
 # Environment overrides (tests): FM_ROOT_OVERRIDE, FM_HOME, FM_STATE_OVERRIDE,
 # FM_CONFIG_OVERRIDE, FM_DECISION_NUDGE_DELAY_SECS, FMTG_TG_BIN.
 #
-# Other harnesses: this covers the Claude Code primary only. A Pi primary
-# equivalent (nudging on a settled turn that ends with a captain-facing
-# question in chat) is separate work, and the remaining primary harnesses are
-# a known follow-up. See docs/configuration.md "Captain-attention nudge".
+# Other harnesses: this covers Claude Code and Pi/pi-signed primaries. The
+# remaining primary harnesses are a known follow-up. See docs/configuration.md
+# "Captain-attention nudge".
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,14 +92,15 @@ case "$DELAY" in ''|*[!0-9]*|0) DELAY=30 ;; esac
 
 MODE="${1:-}"
 
-# --claude-resolved is on the hot path of every tool call and turn end, so it
-# drains its payload and exits before any sourcing, JSON parsing, or scope
-# work; the common no-marker case costs one stat on top of that.
-# The drain is not optional: PostToolUse payloads embed tool_response, which
-# routinely exceeds the pipe buffer, and exiting with the pipe unread would
-# EPIPE the harness mid-write.
-if [ "$MODE" = --claude-resolved ]; then
-  cat >/dev/null 2>&1 || true
+# Both resolve modes are on the hot path of every tool call and turn end, so
+# they exit before any sourcing, JSON parsing, or scope work; the common
+# no-marker case costs one stat.
+# The --claude-resolved drain is not optional: PostToolUse payloads embed
+# tool_response, which routinely exceeds the pipe buffer, and exiting with the
+# pipe unread would EPIPE the harness mid-write. --pi-resolved is spawned by
+# the Pi extension with stdio ignored, so it has no payload to drain.
+if [ "$MODE" = --claude-resolved ] || [ "$MODE" = --pi-resolved ]; then
+  [ "$MODE" = --claude-resolved ] && { cat >/dev/null 2>&1 || true; }
   [ -e "$MARKER" ] || exit 0
   rm -f "$MARKER" 2>/dev/null || true
   exit 0
@@ -107,19 +116,28 @@ marker_field() {  # <file> <key>
 }
 
 case "$MODE" in
-  --claude-pending)
-    # Reading stdin first keeps the hook pipe drained even on an early exit.
-    PAYLOAD=$(cat 2>/dev/null || true)
-    [ -n "$PAYLOAD" ] || exit 0
-    # jq is the repo's established JSON dependency; without it degrade to a
-    # silent no-op exactly like the turn-end guard.
-    command -v jq >/dev/null 2>&1 || exit 0
-    NTYPE=$(printf '%s' "$PAYLOAD" | jq -r '.notification_type // ""' 2>/dev/null) || exit 0
-    [ "$NTYPE" = permission_prompt ] || exit 0
+  --claude-pending|--pi-arm)
+    if [ "$MODE" = --claude-pending ]; then
+      # Reading stdin first keeps the hook pipe drained even on an early exit.
+      PAYLOAD=$(cat 2>/dev/null || true)
+      [ -n "$PAYLOAD" ] || exit 0
+      # jq is the repo's established JSON dependency; without it degrade to a
+      # silent no-op exactly like the turn-end guard.
+      command -v jq >/dev/null 2>&1 || exit 0
+      NTYPE=$(printf '%s' "$PAYLOAD" | jq -r '.notification_type // ""' 2>/dev/null) || exit 0
+      [ "$NTYPE" = permission_prompt ] || exit 0
+      PROMPT_ID=$(printf '%s' "$PAYLOAD" | jq -r '.prompt_id // .session_id // "unknown"' 2>/dev/null) || exit 0
+    else
+      # The Pi extension already applied the captain-facing-ask heuristic; all
+      # that arrives here is the assistant entry id it settled on.
+      ENTRY_ID=${2:-}
+      [ -n "$ENTRY_ID" ] || exit 0
+      case "$ENTRY_ID" in *$'\n'*|*$'\r'*) exit 0 ;; esac
+      PROMPT_ID="pi:$ENTRY_ID"
+    fi
     fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
     # No standing Telegram opt-in means the whole feature stays inert.
     fmtg_enabled "$FM_HOME" || exit 0
-    PROMPT_ID=$(printf '%s' "$PAYLOAD" | jq -r '.prompt_id // .session_id // "unknown"' 2>/dev/null) || exit 0
     if [ -f "$MARKER" ] && [ "$(marker_field "$MARKER" prompt_id)" = "$PROMPT_ID" ]; then
       # Same user turn: either the timer is already running or the one nudge
       # for this turn was already sent. Never arm a second timer.
@@ -174,7 +192,7 @@ case "$MODE" in
     exit 0
     ;;
   *)
-    echo "usage: $(basename "$0") --claude-pending | --claude-resolved | --wait <nonce>" >&2
+    echo "usage: $(basename "$0") --claude-pending | --claude-resolved | --pi-arm <entry-id> | --pi-resolved | --wait <nonce>" >&2
     exit 2
     ;;
 esac
