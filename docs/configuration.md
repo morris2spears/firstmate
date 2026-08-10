@@ -418,6 +418,17 @@ Every send goes through the ledger by construction: `telegram_away_deliver` requ
 A successful `tg` exit means the Telegram API returned an accepted response end to end; it does not prove the captain read the notice.
 This away-only use does not change inbound notes, linked-task follow-ups, opt-out behavior, watcher ownership, return catch-up, or buffering outside away mode.
 
+## Captain-attention nudge (Claude Code primary)
+
+When the primary Claude Code session blocks on a direct interactive decision prompt - an AskUserQuestion question or a permission dialog - and the captain has not answered within 30 seconds, firstmate sends him one deliberately content-free Telegram message ("Captain, something's awaiting your attention.") through the same phone-inbox client Telegram mode uses.
+The nudge never describes the question: if the captain asks what it is from his phone, the normal Telegram-mode note flow answers.
+It is gated on the same `config/telegram-mode` opt-in flag and on a genuine primary checkout, so a home without the flag and every crewmate or scout task worktree arm nothing and send nothing.
+The tracked `.claude/settings.json` registers the hook points (a `Notification` `permission_prompt` arm plus `PostToolUse`, `UserPromptSubmit`, and `Stop` disarms), and `bin/fm-decision-nudge.sh`'s header owns the marker protocol, the delay override, and the known residual cases.
+A question answered inside the delay never nudges, and one prompt sends at most one nudge.
+The disarm is deliberately uncorrelated (no hook payload ties a finished tool back to the waiting prompt), so any completed tool clears the turn's pending nudge; the two accepted residuals - a decline that fires no event, and a sibling tool completing while the dialog still waits - are documented in the script header and the verification record.
+This covers the Claude Code primary only: a Pi primary equivalent (nudging when a settled turn ends on a captain-facing question in chat) is separate work owned outside this surface, and the remaining primary harnesses are a known follow-up.
+Live hook-payload evidence and the verification procedure live in `docs/verification/decision-nudge.md`.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):
