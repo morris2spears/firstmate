@@ -400,6 +400,12 @@ Completion follow-ups go through `bin/fm-tg-followup.sh`, which sends through th
 Follow-ups are deliberately not gated on the opt-in flag: removing the flag stops new notes and new links, but a task linked before opt-out may still finish its follow-up thread within the same cap and window, so a request the captain made from his phone always gets its outcome.
 Every live send notifies the captain's phone, so nothing in this mode sends as a test.
 
+The same opt-in flag gates the captain-attention nudge, this section's third outbound class and the single owner of its contract.
+When a Pi or pi-signed primary session settles on a message that addresses the captain and asks him a question or clearly requests a decision, `.pi/extensions/fm-primary-decision-nudge.ts` arms `bin/fm-decision-nudge.sh`, which records a private `state/.decision-nudge-pending` marker, waits `FM_DECISION_NUDGE_DELAY_SECS` (default 30) in a detached timer, and then sends exactly one deliberately content-free message, `Captain, something's awaiting your attention.`, through the same phone-inbox `tg` client (`FMTG_TG_BIN`).
+The nudge never carries the question text, sends at most once per waiting turn, and is cancelled outright when the captain answers, a new agent run starts, or the session shuts down; the routine `Captain, shipshape.` reply and empty or tool-only turns never arm it, and crewmate and scout worktrees of this repo neither arm nor cancel it.
+Without the flag it arms nothing and sends nothing, exactly like the rest of this mode.
+The script header owns the full per-harness event contract, and [`verification/pi-decision-nudge.md`](verification/pi-decision-nudge.md) records the Pi evidence and why Pi's coverage stops at settled chat asks.
+
 While `state/.afk` is present, the away daemon also routes each captain-relevant escalation batch through the same phone-inbox `tg` client before its in-session delivery.
 Each notice carries an explicit reminder that delivery grants no approval for a merge, privileged change, destructive action, or security-sensitive action.
 `bin/fm-away-ledger-lib.sh` owns one ledger per batch in `state/.subsuper-escalations.since` - the batch identity plus its `reserved`, `confirmed`, and `accounted` line counts, its attempt ordinal, and its retry schedule - and the away daemon, away start, and away return all query and transition that one owner instead of keeping counters of their own. Older record shapes are migrated in place on read, so upgrading the daemon mid-session keeps the batch's counts rather than failing closed.
@@ -418,7 +424,9 @@ Every send goes through the ledger by construction: `telegram_away_deliver` requ
 A successful `tg` exit means the Telegram API returned an accepted response end to end; it does not prove the captain read the notice.
 This away-only use does not change inbound notes, linked-task follow-ups, opt-out behavior, watcher ownership, return catch-up, or buffering outside away mode.
 
-## Captain-attention nudge (Claude Code primary)
+## Captain-attention nudge
+
+Both covered primaries share `bin/fm-decision-nudge.sh`, its marker protocol, and this one message; they differ only in the event that arms it.
 
 When the primary Claude Code session blocks on a direct interactive decision prompt - an AskUserQuestion question or a permission dialog - and the captain has not answered within 30 seconds, firstmate sends him one deliberately content-free Telegram message ("Captain, something's awaiting your attention.") through the same phone-inbox client Telegram mode uses.
 The nudge never describes the question: if the captain asks what it is from his phone, the normal Telegram-mode note flow answers.
@@ -426,8 +434,11 @@ It is gated on the same `config/telegram-mode` opt-in flag and on a genuine prim
 The tracked `.claude/settings.json` registers the hook points (a `Notification` `permission_prompt` arm plus `PostToolUse`, `UserPromptSubmit`, and `Stop` disarms), and `bin/fm-decision-nudge.sh`'s header owns the marker protocol, the delay override, and the known residual cases.
 A question answered inside the delay never nudges, and one prompt sends at most one nudge.
 The disarm is deliberately uncorrelated (no hook payload ties a finished tool back to the waiting prompt), so any completed tool clears the turn's pending nudge; the two accepted residuals - a decline that fires no event, and a sibling tool completing while the dialog still waits - are documented in the script header and the verification record.
-This covers the Claude Code primary only: a Pi primary equivalent (nudging when a settled turn ends on a captain-facing question in chat) is separate work owned outside this surface, and the remaining primary harnesses are a known follow-up.
 Live hook-payload evidence and the verification procedure live in `docs/verification/decision-nudge.md`.
+
+The Pi and pi-signed primary arms on a settled turn instead of a blocking prompt, as described under [Telegram mode](#telegram-mode-configtelegram-mode) above: `.pi/extensions/fm-primary-decision-nudge.ts` arms the same script through `--pi-arm` when the settled turn's latest assistant chat text addresses the captain and asks him something, and disarms through `--pi-resolved` on captain input, before a new agent run, and on session shutdown.
+Pi exposes no global hook around an arbitrary blocking `ctx.ui` prompt, so Pi coverage stops at settled chat asks; `docs/verification/pi-decision-nudge.md` records that evidence.
+The remaining primary harnesses are a known follow-up.
 
 ## Environment variables
 
@@ -483,6 +494,7 @@ FMTG_REOFFER_SECS=1800  # seconds before a still-unclaimed Telegram note is offe
 FMTG_TG_BIN=            # phone-inbox outbound client used for Telegram follow-ups; unset means ~/dev/phone-inbox/tg
 FMTG_FOLLOWUP_MAX_AGE_SECS=604800   # local window for sending Telegram-mode completion follow-ups (7 days)
 FMTG_FOLLOWUP_MAX_COUNT=3   # local cap on Telegram-mode completion follow-ups per linked note
+FM_DECISION_NUDGE_DELAY_SECS=30   # seconds a captain-facing decision may sit unanswered before the one content-free Telegram nudge is sent
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=300      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
 FM_CLAUDE_AUTOARM_SYNC_WAIT_MS=800   # milliseconds the --claude turn-end guard waits for the Stop auto-arm's claim, health, or fresh rewake epoch before re-blocking
