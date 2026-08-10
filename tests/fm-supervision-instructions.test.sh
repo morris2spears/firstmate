@@ -156,15 +156,18 @@ test_grok_command_sources_effective_config() {
 }
 
 test_pi_snippet_uses_effective_extension_path() {
-  local home out turnend watch
+  local home out turnend watch nudge
   home="$TMP_ROOT/pi-home"
   turnend="$ROOT/.pi/extensions/fm-primary-turnend-guard.ts"
   watch="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
+  nudge="$ROOT/.pi/extensions/fm-primary-decision-nudge.ts"
   mkdir -p "$home/state" "$home/config"
   out=$(FM_HOME="$home" "$RENDER" --harness pi)
-  assert_contains "$out" "-e $turnend -e $watch" "pi snippet did not render both effective extension launch paths"
+  assert_contains "$out" "-e $turnend -e $watch -e $nudge" "pi snippet did not render every effective extension launch path"
   assert_contains "$out" "The turn-end guard extension lives at \`$turnend\`" "pi snippet did not render the turn-end guard extension path"
   assert_contains "$out" "The watcher extension lives at \`$watch\`" "pi snippet did not render the watcher extension path"
+  assert_contains "$out" "The captain-attention nudge extension lives at \`$nudge\`" "pi snippet did not render the captain-attention nudge extension path"
+  assert_not_contains "$out" "__FM_PI_NUDGE_EXT__" "renderer leaked the Pi nudge extension path placeholder"
   assert_not_contains "$out" "__FM_PI_EXT__" "renderer leaked the Pi extension path placeholder"
   assert_not_contains "$out" "__FM_PI_TURNEND_EXT__" "renderer leaked the Pi turn-end extension path placeholder"
   assert_not_contains "$out" "state/fm-primary-pi-watch.ts" "pi snippet kept the old generated state-relative extension path"

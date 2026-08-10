@@ -5,12 +5,12 @@
 // assistant text and arms bin/fm-decision-nudge.sh only for an explicit
 // captain-facing question or decision request. The shared script owns primary
 // scope, Telegram opt-in, marker, timer, and send semantics.
-import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { extensionVersionOf, lockOwnership } from "./lib/fm-primary-loaded-marker.ts";
 
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
@@ -21,48 +21,14 @@ const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const nudgeScript = `${fmRoot}/bin/fm-decision-nudge.sh`;
 const loadedMarker = `${state}/.pi-decision-nudge-extension-loaded`;
-const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
-
-type LockOwnership = "owned" | "missing" | "other";
-
-function parentPid(pid: string): string {
-  const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
-  if (result.status !== 0) return "";
-  return result.stdout.trim();
-}
-
-function pidAlive(pid: string): boolean {
-  try {
-    process.kill(Number(pid), 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function lockOwnership(): LockOwnership {
-  let lockPid = "";
-  try {
-    lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
-  } catch {
-    return "missing";
-  }
-  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
-  let pid = String(process.pid);
-  for (let i = 0; i < 8; i += 1) {
-    if (pid === lockPid) return "owned";
-    pid = parentPid(pid);
-    if (!pid || pid === "1") break;
-  }
-  return pidAlive(lockPid) ? "other" : "missing";
-}
+const extensionVersion = extensionVersionOf(extensionFile);
 
 // Same loaded-marker contract as the two sibling primary extensions, so
 // bin/fm-session-start.sh can report this one as missing instead of silently
 // losing the nudge when project trust was never approved.
 function markLoaded(): void {
   try {
-    if (!existsSync(state) || lockOwnership() === "other") return;
+    if (!existsSync(state) || lockOwnership(state) === "other") return;
     writeFileSync(loadedMarker, `${extensionVersion}\n${process.pid}\n`);
   } catch {
   }

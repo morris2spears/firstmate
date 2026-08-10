@@ -7,6 +7,7 @@ set -u
 
 TMP_ROOT=$(fm_test_tmproot fm-pi-watch-extension)
 EXT="$ROOT/.pi/extensions/fm-primary-pi-watch.ts"
+LOADED_MARKER_LIB="$ROOT/.pi/extensions/lib/fm-primary-loaded-marker.ts"
 # Node 24 warns when these test-only dynamic imports load tracked ESM plugins
 # from a clean checkout with no tracked .opencode/package.json. The warning is
 # unrelated to plugin output, which the assertions intentionally require empty.
@@ -22,6 +23,7 @@ install_pi_watch_extension_fixture() {
   cp "$EXT" "$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cp "$ROOT/.pi/extensions/lib/fm-calm-visibility.ts" "$repo/.pi/extensions/lib/fm-calm-visibility.ts"
   cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$repo/.pi/extensions/lib/fm-operational-input.ts"
+  cp "$ROOT/.pi/extensions/lib/fm-primary-loaded-marker.ts" "$repo/.pi/extensions/lib/fm-primary-loaded-marker.ts"
   mkdir -p "$repo/bin"
   cp "$ROOT/bin/fm-operational-input.sh" "$repo/bin/fm-operational-input.sh"
   chmod +x "$repo/bin/fm-operational-input.sh"
@@ -60,10 +62,12 @@ JS
 }
 
 test_tracked_extension_present_and_self_hashing() {
-  local text expected_config_source
+  local text lib_text expected_config_source
   expected_config_source="config_dir=\\\"\${FM_CONFIG_OVERRIDE:-\$FM_HOME/config}\\\""
   assert_present "$EXT" "tracked Pi primary watcher extension is missing"
   text=$(cat "$EXT")
+  assert_present "$LOADED_MARKER_LIB" "shared Pi primary loaded-marker library is missing"
+  lib_text=$(cat "$LOADED_MARKER_LIB")
   assert_contains "$text" "fm_watch_arm_pi" "tracked extension missing tool name"
   assert_contains "$text" "fm-watch-arm-pi" "tracked extension missing command name"
   assert_contains "$text" "fm-watch-arm.sh" "tracked extension missing watcher arm"
@@ -71,13 +75,15 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" 'encodeFirstmateOperationalInput' "tracked extension does not construct typed synthetic user-role wakes"
   assert_contains "$text" "deliverAs: \"followUp\"" "tracked extension missing followUp delivery"
   assert_contains "$text" ".pi-watch-extension-loaded" "tracked extension missing loaded marker"
-  assert_contains "$text" 'createHash("sha256").update(readFileSync(extensionFile)).digest("hex")' "tracked extension does not self-hash its own content for extensionVersion"
+  assert_contains "$text" 'extensionVersionOf(extensionFile)' "tracked extension does not self-hash its own content for extensionVersion"
+  assert_contains "$text" './lib/fm-primary-loaded-marker.ts' "tracked extension does not share the loaded-marker and lock-ownership contract"
+  assert_contains "$lib_text" 'createHash("sha256").update(readFileSync(extensionFile)).digest("hex")' "shared loaded-marker library does not self-hash the extension content for extensionVersion"
   assert_contains "$text" 'fileURLToPath(import.meta.url)' "tracked extension does not self-locate via import.meta.url"
-  assert_contains "$text" 'type LockOwnership = "owned" | "missing" | "other"' "tracked extension does not distinguish missing lock from another owner"
-  assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
-  assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
-  assert_contains "$text" 'if (lockOwnership() === "other") return' "tracked extension overwrites another live session marker"
-  assert_contains "$text" 'const ownership = lockOwnership()' "tracked extension arm does not inspect the distinct lock ownership state"
+  assert_contains "$lib_text" 'export type LockOwnership = "owned" | "missing" | "other"' "shared loaded-marker library does not distinguish missing lock from another owner"
+  assert_contains "$lib_text" "readFileSync(\`\${state}/.lock\`" "shared loaded-marker library does not read the effective session lock"
+  assert_contains "$lib_text" 'return pidAlive(lockPid) ? "other" : "missing"' "shared loaded-marker library does not allow a pre-lock load marker"
+  assert_contains "$text" 'if (lockOwnership(state) === "other") return' "tracked extension overwrites another live session marker"
+  assert_contains "$text" 'const ownership = lockOwnership(state)' "tracked extension arm does not inspect the distinct lock ownership state"
   assert_contains "$text" 'if (ownership === "other") return { ok: false' "tracked extension arm does not preserve the live-other read-only refusal"
   assert_contains "$text" 'if (ownership === "missing")' "tracked extension arm collapses a stale or absent lock into the live-other refusal"
   assert_contains "$text" "no live session holds the lock" "tracked extension arm missing stale-lock recovery guidance"

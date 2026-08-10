@@ -12,6 +12,8 @@ The backward scan skips empty and tool-only assistant entries and stops at the t
 The primary-scope check gates disarming as well as arming: this tracked entrypoint also runs in crewmate and scout worktrees, which can inherit `FM_HOME` from the daemon environment, and must never cancel a nudge the captain's own session armed.
 The Pi extension disarms on interactive or RPC input, before a new agent run, and on session shutdown.
 It writes the same `state/.pi-decision-nudge-extension-loaded` marker its two sibling primary extensions write, so `bin/fm-session-start.sh` reports it as not loaded instead of silently losing the nudge, and `bin/fm-spawn.sh` passes it with an explicit `-e` in pi secondmate homes, where project trust is never approved.
+All three primary extensions take their session-lock-ownership and version-stamp contract from one place, `.pi/extensions/lib/fm-primary-loaded-marker.ts`, so the writers cannot drift from what the session-start diagnostic checks.
+The rendered Pi supervision snippet and the read-only repair line name all three extensions, so the documented trust-free `-e` fallback is exactly what clears the diagnostic.
 The shared script header is the single owner of its Claude-compatible and Pi-compatible CLI.
 
 Pi 0.82.1 exposes lifecycle events around agent runs and extension-owned UI calls, but it does not expose a global event when arbitrary code enters or leaves `ctx.ui.confirm`, `ctx.ui.select`, `ctx.ui.input`, or `ctx.ui.custom`.
