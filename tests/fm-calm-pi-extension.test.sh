@@ -1056,6 +1056,7 @@ test_rendering_and_session_lifecycle() {
   cp "$NONCONVERSATION_LAYOUT" "$fixture/lib/fm-calm-nonconversation-layout.ts"
   cp "$VISIBILITY" "$fixture/lib/fm-calm-visibility.ts"
   cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$fixture/lib/fm-operational-input.ts"
+  cp "$ROOT/.pi/extensions/lib/fm-primary-loaded-marker.ts" "$fixture/lib/fm-primary-loaded-marker.ts"
   cp "$WATCH_EXT" "$fixture/fm-primary-pi-watch.ts"
   ln -s "$PI_PACKAGE_DIR" "$fixture/node_modules/@earendil-works/pi-coding-agent"
   ln -s "$PI_PACKAGE_DIR/node_modules/@earendil-works/pi-tui" "$fixture/node_modules/@earendil-works/pi-tui"
@@ -2765,6 +2766,7 @@ test_interactive_terminal_e2e() {
   : > "$project/AGENTS.md"
   cp "$VISIBILITY" "$project/.pi/extensions/lib/fm-calm-visibility.ts"
   cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$project/.pi/extensions/lib/fm-operational-input.ts"
+  cp "$ROOT/.pi/extensions/lib/fm-primary-loaded-marker.ts" "$project/.pi/extensions/lib/fm-primary-loaded-marker.ts"
   cp "$WATCH_EXT" "$project/.pi/extensions/fm-primary-pi-watch.ts"
   cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$project/.pi/extensions/fm-primary-turnend-guard.ts"
   cp \
