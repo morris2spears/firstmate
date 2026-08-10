@@ -8,7 +8,7 @@
 // a new live generation so monitoring can arm again without restarting Pi. Terminal
 // quit leaves the final generation stopped so late callbacks cannot rearm. Stale
 // callbacks from a prior generation are no-ops against the active replacement.
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
