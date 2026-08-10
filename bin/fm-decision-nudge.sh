@@ -9,7 +9,7 @@
 # never describes the question; if he asks what it is from his phone, the
 # existing Telegram-mode flow (fmtg-respond) answers normally.
 #
-# Hook wiring (.claude/settings.json, this repo only - never the captain's
+# Claude wiring (.claude/settings.json, this repo only - never the captain's
 # global settings). Event payloads below were captured live from Claude Code
 # 2.1.226 (docs/verification/decision-nudge.md):
 #   Notification matcher permission_prompt  -> --claude-pending   (arm)
@@ -51,8 +51,11 @@
 #      case (he just saw the dialog), so the coarse rule stays.
 #
 # Scope and consent:
-#   - fm_primary_scope_matches gates arming, so crewmate/scout task worktrees
-#     of this repo (linked worktrees, no secondmate marker) never nudge.
+#   - fm_primary_scope_matches gates arming AND disarming, so crewmate/scout
+#     task worktrees of this repo (linked worktrees, no secondmate marker)
+#     never nudge, and - because such a pane can inherit FM_HOME from the
+#     daemon env and resolve STATE to the captain's primary home - can never
+#     cancel a nudge the captain's own session armed either.
 #   - Telegram mode's opt-in flag (config/telegram-mode, fmtg_enabled) gates
 #     every send: without the captain's standing opt-in this script arms
 #     nothing and sends nothing, matching the away-mode escalation precedent
@@ -77,7 +80,8 @@
 #
 # Other harnesses: this covers Claude Code and Pi/pi-signed primaries. The
 # remaining primary harnesses are a known follow-up. See docs/configuration.md
-# "Captain-attention nudge".
+# "Captain-attention nudge"; Pi verification lives in
+# docs/verification/pi-decision-nudge.md.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,8 +97,9 @@ case "$DELAY" in ''|*[!0-9]*|0) DELAY=30 ;; esac
 MODE="${1:-}"
 
 # Both resolve modes are on the hot path of every tool call and turn end, so
-# they exit before any sourcing, JSON parsing, or scope work; the common
-# no-marker case costs one stat.
+# the common no-marker case costs one stat and exits before any sourcing,
+# JSON parsing, or scope work. Only a session that could have armed this
+# marker is allowed to clear it.
 # The --claude-resolved drain is not optional: PostToolUse payloads embed
 # tool_response, which routinely exceeds the pipe buffer, and exiting with the
 # pipe unread would EPIPE the harness mid-write. --pi-resolved is spawned by
@@ -102,12 +107,17 @@ MODE="${1:-}"
 if [ "$MODE" = --claude-resolved ] || [ "$MODE" = --pi-resolved ]; then
   [ "$MODE" = --claude-resolved ] && { cat >/dev/null 2>&1 || true; }
   [ -e "$MARKER" ] || exit 0
-  rm -f "$MARKER" 2>/dev/null || true
-  exit 0
 fi
 
 # shellcheck source=bin/fm-primary-scope-lib.sh
 . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
+
+if [ "$MODE" = --claude-resolved ] || [ "$MODE" = --pi-resolved ]; then
+  fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
+  rm -f "$MARKER" 2>/dev/null || true
+  exit 0
+fi
+
 # shellcheck source=bin/fm-tg-lib.sh
 . "$SCRIPT_DIR/fm-tg-lib.sh"
 

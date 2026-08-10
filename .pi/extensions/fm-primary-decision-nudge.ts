@@ -5,23 +5,83 @@
 // assistant text and arms bin/fm-decision-nudge.sh only for an explicit
 // captain-facing question or decision request. The shared script owns primary
 // scope, Telegram opt-in, marker, timer, and send semantics.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const extensionDir = dirname(fileURLToPath(import.meta.url));
+const extensionFile = fileURLToPath(import.meta.url);
+const extensionDir = dirname(extensionFile);
 const root = resolve(extensionDir, "../..");
 const fmRoot = process.env.FM_ROOT_OVERRIDE || root;
 const fmHome = process.env.FM_HOME || process.env.FM_ROOT_OVERRIDE || root;
 const state = process.env.FM_STATE_OVERRIDE || `${fmHome}/state`;
 const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const nudgeScript = `${fmRoot}/bin/fm-decision-nudge.sh`;
+const loadedMarker = `${state}/.pi-decision-nudge-extension-loaded`;
+const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 
+type LockOwnership = "owned" | "missing" | "other";
+
+function parentPid(pid: string): string {
+  const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
+  if (result.status !== 0) return "";
+  return result.stdout.trim();
+}
+
+function pidAlive(pid: string): boolean {
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function lockOwnership(): LockOwnership {
+  let lockPid = "";
+  try {
+    lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
+  } catch {
+    return "missing";
+  }
+  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
+  let pid = String(process.pid);
+  for (let i = 0; i < 8; i += 1) {
+    if (pid === lockPid) return "owned";
+    pid = parentPid(pid);
+    if (!pid || pid === "1") break;
+  }
+  return pidAlive(lockPid) ? "other" : "missing";
+}
+
+// Same loaded-marker contract as the two sibling primary extensions, so
+// bin/fm-session-start.sh can report this one as missing instead of silently
+// losing the nudge when project trust was never approved.
+function markLoaded(): void {
+  try {
+    if (!existsSync(state) || lockOwnership() === "other") return;
+    writeFileSync(loadedMarker, `${extensionVersion}\n${process.pid}\n`);
+  } catch {
+  }
+}
+
+// A bare decision verb is not an ask: a settled watcher turn like "Captain, PR
+// #7 is merged. I'll confirm the deploy once you're back." must not page him.
+// The verb only counts in an imperative (sentence- or vocative-initial) or
+// second-person/explicit-request position.
+const DECISION_VERBS = "choose|select|pick|decide|confirm|approve";
 const DECISION_PATTERNS = [
   /\b(?:yes\s*\/\s*no|yes\s+or\s+no)\b/i,
   /\b(?:do you want|would you like|shall I|should I|may I|can I)\b/i,
-  /\b(?:choose|select|pick|decide|confirm|approve)\b/i,
+  new RegExp(String.raw`(?:^|[.!?]\s+|\n\s*|\bcaptain\s*[,:-]\s*)(?:please\s+)?(?:${DECISION_VERBS})\b`, "i"),
+  new RegExp(
+    String.raw`\b(?:please|need you to|needs you to|want you to|waiting (?:on|for) you to|for you to|your call|up to you)\b[^.?!]{0,60}\b(?:${DECISION_VERBS})\b`,
+    "i",
+  ),
+  new RegExp(String.raw`\byou\s+(?:${DECISION_VERBS})\b`, "i"),
   /\b(?:need|needs|awaiting|requires?|requesting)\b.{0,80}\b(?:decision|approval|choice|answer|confirmation)\b/i,
   /\b(?:decision|approval|choice|answer|confirmation)\b.{0,80}\b(?:needed|required|awaiting|please)\b/i,
   /\boptions?\s*:/i,
@@ -61,9 +121,14 @@ export function latestCaptainAttentionWait(ctx: Pick<ExtensionContext, "sessionM
   const branch = ctx.sessionManager.getBranch() as SessionMessageEntry[];
   for (let index = branch.length - 1; index >= 0; index -= 1) {
     const entry = branch[index];
-    if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
-    const id = typeof entry.id === "string" ? entry.id : "";
+    if (entry.type !== "message") continue;
+    // The scan stops at the turn boundary: an ask from an earlier turn the
+    // captain already answered must never re-arm.
+    if (entry.message?.role === "user") return null;
+    if (entry.message?.role !== "assistant") continue;
     const text = assistantText(entry.message.content);
+    if (!text) continue;
+    const id = typeof entry.id === "string" ? entry.id : "";
     return id && isCaptainAttentionWait(text) ? { id, text } : null;
   }
   return null;
@@ -113,4 +178,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     disarm();
   });
+
+  pi.on?.("session_start", () => {
+    markLoaded();
+  });
+
+  markLoaded();
 }

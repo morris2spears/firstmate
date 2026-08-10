@@ -61,6 +61,8 @@ const yes = [
   "Captain, should I merge this?",
   "Captain, I need your decision: choose A or B.",
   "Captain, options: keep the old behavior or use the new behavior.",
+  "Captain, please approve the deploy plan before I continue.",
+  "Captain, choose the branch you want me to land this on.",
 ];
 for (const text of yes) {
   if (!mod.isCaptainAttentionWait(text)) throw new Error(`expected arm: ${text}`);
@@ -70,6 +72,9 @@ const no = [
   "Captain, the review is complete.",
   "Should I continue?",
   "",
+  "Captain, PR #7 is merged and CI is green. I'll confirm the deploy once you're back.",
+  "Captain, the watcher cycle is healthy and I'll pick the next task from the queue.",
+  "Captain, I approved the crewmate's plan and landed it on main.",
 ];
 for (const text of no) {
   if (mod.isCaptainAttentionWait(text)) throw new Error(`unexpected arm: ${text}`);
@@ -90,6 +95,22 @@ const ctx = {
 const wait = mod.latestCaptainAttentionWait(ctx);
 if (wait?.id !== "assistant1" || wait.text !== "Captain, approve option A?") {
   throw new Error(`latest assistant wait not found: ${JSON.stringify(wait)}`);
+}
+const branchCtx = (entries) => ({ sessionManager: { getBranch: () => entries } });
+const toolNoise = mod.latestCaptainAttentionWait(branchCtx([
+  { type: "message", id: "user1", message: { role: "user", content: "go" } },
+  { type: "message", id: "assistant1", message: { role: "assistant", content: [{ type: "text", text: "Captain, approve option A?" }] } },
+  { type: "message", id: "assistant2", message: { role: "assistant", content: [{ type: "tool_use", id: "t1" }] } },
+]));
+if (toolNoise?.id !== "assistant1") {
+  throw new Error(`tool-only trailing entry hid the latest non-empty ask: ${JSON.stringify(toolNoise)}`);
+}
+const answered = mod.latestCaptainAttentionWait(branchCtx([
+  { type: "message", id: "assistant1", message: { role: "assistant", content: [{ type: "text", text: "Captain, approve option A?" }] } },
+  { type: "message", id: "user2", message: { role: "user", content: "yes" } },
+]));
+if (answered !== null) {
+  throw new Error(`scan crossed the turn boundary: ${JSON.stringify(answered)}`);
 }
 JS
 pass "Pi heuristic arms only explicit captain-facing waits"
@@ -200,5 +221,15 @@ FM_ROOT_OVERRIDE="$WT" FM_HOME="$WT" FM_STATE_OVERRIDE="$WT/state" \
 sleep 0.2
 [ ! -e "$WT/state/.decision-nudge-pending" ] || fail "linked task worktree armed the nudge"
 pass "non-primary linked worktrees stay out of scope"
+
+FM_DECISION_NUDGE_DELAY_SECS=10 "$NUDGE" --pi-arm scope-disarm \
+  || fail "primary arm before the crew disarm probe failed"
+wait_for_file "$MARKER" || fail "primary arm did not create the pending marker"
+FM_ROOT_OVERRIDE="$WT" FM_HOME="$FIX" FM_STATE_OVERRIDE="$FIX/state" \
+  FM_CONFIG_OVERRIDE="$FIX/config" "$NUDGE" --pi-resolved
+[ -e "$MARKER" ] || fail "a crew worktree cancelled the captain's armed nudge"
+"$NUDGE" --pi-resolved || fail "primary resolve exited nonzero"
+[ ! -e "$MARKER" ] || fail "primary resolve left the marker behind"
+pass "only a primary session can disarm the captain's pending nudge"
 
 printf 'ok - Pi captain-attention decision-nudge suite complete\n'
