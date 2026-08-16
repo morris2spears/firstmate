@@ -214,6 +214,33 @@ test_ship_modes_generate_clean_briefs() {
   pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
 }
 
+test_pr_modes_require_github_issue_closing_phrases() {
+  local home id brief guidance
+  home="$TMP_ROOT/issue-closing-home"
+  write_registry "$home"
+  # shellcheck disable=SC2016 # Literal backticks must match the generated Markdown.
+  guidance='use `gh-axi` to confirm that the final PR body contains a recognized closing keyword immediately followed by the issue reference'
+
+  for id_proj in "brief-issue-nomistakes:no-registry-proj" "brief-issue-direct:direct-proj"; do
+    id=${id_proj%%:*}
+    proj=${id_proj##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_grep "$guidance" "$brief" "$id: PR Definition of done omitted GitHub issue-closing guidance"
+    assert_grep "\`Closes #123\`" "$brief" "$id: PR Definition of done omitted the same-repository closing form"
+    assert_grep "\`Closes owner/repo#123\`" "$brief" "$id: PR Definition of done omitted the cross-repository closing form"
+    assert_grep "\`gh pr edit\`" "$brief" "$id: PR Definition of done omitted the repair command"
+  done
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-issue-local local-proj >/dev/null 2>&1
+  assert_no_grep "$guidance" "$home/data/brief-issue-local/brief.md" \
+    "local-only brief gained PR-body guidance despite opening no PR"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-issue-scout no-registry-proj --scout >/dev/null 2>&1
+  assert_no_grep "$guidance" "$home/data/brief-issue-scout/brief.md" \
+    "scout brief gained ship-only PR-body guidance"
+  pass "fm-brief.sh: PR modes verify GitHub issue-closing phrases without changing local-only or scout briefs"
+}
+
 test_faster_paths_use_configured_authority_without_stacked_review() {
   local home id brief
   home="$TMP_ROOT/configured-authority-home"
@@ -622,6 +649,7 @@ test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
+test_pr_modes_require_github_issue_closing_phrases
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
