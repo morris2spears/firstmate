@@ -310,7 +310,9 @@ case "$MODE" in
 # Definition of done
 This project ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+When it is implemented and committed, push your branch and open a PR with \`gh-axi\`.
+If the task names a GitHub issue this PR should close, use \`gh-axi\` to confirm that the final PR body contains a recognized closing keyword immediately followed by the issue reference (for example, \`Closes #123\`, or \`Closes owner/repo#123\` when the issue is in another repository), appending that exact-form phrase with \`gh pr edit\` if needed before reporting done.
+Then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
     ;;
@@ -346,7 +348,8 @@ Two firstmate-specific rules layer on top of that guidance:
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: it would silently bypass firstmate's authority check and any required captain escalation.
 
-After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
+After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), use \`gh-axi\` to confirm that the final PR body contains a recognized closing keyword immediately followed by the issue reference whenever the task names a GitHub issue this PR should close (for example, \`Closes #123\`, or \`Closes owner/repo#123\` when the issue is in another repository), appending that exact-form phrase with \`gh pr edit\` if needed before reporting done.
+Then append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
     ;;
 esac
