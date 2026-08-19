@@ -8,12 +8,25 @@
 # --merge, --rebase, or --method after the optional -- separator. Extra args
 # must not include --repo or -R because the repository comes only from the URL.
 # Usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra gh-axi pr merge args>]
+#
+# GitHub only auto-closes a linked issue when the PR body carries a real
+# closing keyword ("Closes #N"); a bare "issue #N" mention is not enough and
+# is easy for a crewmate to write by accident (seen live on iinvy #133/PR #134).
+# Trusting every future PR body to phrase this correctly is not durable, so
+# after a successful merge this script independently closes any GitHub issue
+# this task's own backlog line already links, regardless of PR body wording.
+# The backlog line - not the PR body - is the authority for "which issue this
+# task addresses" because firstmate itself records that link at dispatch time.
+# This step is best-effort and idempotent: a missing/manual-backend backlog,
+# an unparseable line, or an already-closed issue are all silently skipped,
+# and it never fails the merge itself.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
@@ -82,3 +95,24 @@ if ! caller_has_merge_method "$@"; then
 fi
 
 gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]+"${merge_args[@]}"}" "$@"
+
+close_linked_issues() {
+  local backlog="$DATA/backlog.md" line issue_numbers n state
+  [ -f "$backlog" ] || return 0
+  line=$(grep -F "] $ID -" "$backlog" | head -n1) || return 0
+  [ -n "$line" ] || return 0
+  issue_numbers=$(printf '%s\n' "$line" \
+    | grep -oE "github\.com/$PR_OWNER/$PR_REPO/issues/[0-9]+" \
+    | grep -oE '[0-9]+$' | sort -u) || true
+  [ -n "$issue_numbers" ] || return 0
+  for n in $issue_numbers; do
+    state=$(gh-axi issue view "$n" --repo "$PR_OWNER/$PR_REPO" 2>/dev/null | grep -E '^ *state: ' | head -n1) || continue
+    case "$state" in
+      *open*) ;;
+      *) continue ;;
+    esac
+    gh-axi issue close "$n" --repo "$PR_OWNER/$PR_REPO" --reason completed \
+      --comment "Fixed by #$PR_NUMBER ($URL), merged." 2>&1 || true
+  done
+}
+close_linked_issues
