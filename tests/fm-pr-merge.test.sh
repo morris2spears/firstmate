@@ -14,6 +14,10 @@
 #   (f) malformed PR URL fails fast without calling gh-axi
 #   (g) explicit merge method is not overridden by the default --squash
 #   (h) repo override args fail fast because the repo comes from the URL
+#   (i) an open issue linked from the task's own backlog line is closed after merge
+#   (j) an already-closed linked issue is left alone (idempotent, no duplicate close)
+#   (k) no backlog line / no linked issue URL closes nothing
+#   (l) a linked issue in a different repo than the merged PR is not closed
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -88,6 +92,7 @@ run_pr_merge() {
   local case_dir=$1 rc; shift
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_DATA_OVERRIDE="$case_dir/data" \
   FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_MERGE" "$@"
@@ -97,6 +102,37 @@ run_pr_merge() {
     return 1
   fi
   return "$rc"
+}
+
+# gh-axi mock for the issue-closing tests: records every call like add_gh_mocks,
+# and additionally answers `issue view <n>` with the given state so
+# close_linked_issues's open/closed branch is exercised. Args: case_dir head_sha issue_state
+add_gh_mocks_with_issue_state() {
+  local case_dir=$1 head=$2 issue_state=$3
+  cat > "$case_dir/fakebin/gh-axi" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\$FM_TEST_GH_AXI_LOG"
+case "\${1:-} \${2:-}" in
+  "issue view")
+    echo "issue:"
+    echo "  state: $issue_state"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  cat > "$case_dir/fakebin/gh" <<SH
+#!/usr/bin/env bash
+case "\${1:-} \${2:-}" in
+  "pr view")
+    case " \$* " in
+      *headRefOid*) printf '%s\n' '$head' ; exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
 }
 
 test_records_pr_and_head_before_merging() {
@@ -301,6 +337,87 @@ test_parses_pr_url_for_gh_axi() {
   pass "fm-pr-merge parses a GitHub PR URL into gh-axi number and --repo arguments"
 }
 
+test_closes_open_linked_issue_after_merge() {
+  local case_dir
+  case_dir=$(make_case closes-open-linked-issue)
+  mkdir -p "$case_dir/wt" "$case_dir/data"
+  add_gh_mocks_with_issue_state "$case_dir" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa open
+  : > "$case_dir/gh-axi.log"
+  cat > "$case_dir/data/backlog.md" <<'EOF'
+# Backlog
+## Done
+- [x] task-x1 - fix thing (issue #42) https://github.com/example/repo/issues/42 (kind: ship)
+EOF
+
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/30 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "closes-open-linked-issue: fm-pr-merge failed"
+
+  grep -qxF 'issue close 42 --repo example/repo --reason completed --comment Fixed by #30 (https://github.com/example/repo/pull/30), merged.' \
+    "$case_dir/gh-axi.log" \
+    || fail "closes-open-linked-issue: gh-axi issue close was not invoked for the backlog-linked open issue"
+  pass "fm-pr-merge closes an open issue linked from the task's own backlog line"
+}
+
+test_leaves_already_closed_linked_issue_alone() {
+  local case_dir
+  case_dir=$(make_case leaves-closed-issue-alone)
+  mkdir -p "$case_dir/wt" "$case_dir/data"
+  add_gh_mocks_with_issue_state "$case_dir" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb closed
+  : > "$case_dir/gh-axi.log"
+  cat > "$case_dir/data/backlog.md" <<'EOF'
+# Backlog
+## Done
+- [x] task-x1 - fix thing (issue #43) https://github.com/example/repo/issues/43 (kind: ship)
+EOF
+
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/31 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "leaves-closed-issue-alone: fm-pr-merge failed"
+
+  assert_no_grep 'issue close' "$case_dir/gh-axi.log" \
+    "leaves-closed-issue-alone: gh-axi issue close was invoked for an already-closed issue"
+  pass "fm-pr-merge does not re-close an already-closed linked issue"
+}
+
+test_no_linked_issue_closes_nothing() {
+  local case_dir
+  case_dir=$(make_case no-linked-issue)
+  mkdir -p "$case_dir/wt" "$case_dir/data"
+  add_gh_mocks_with_issue_state "$case_dir" cccccccccccccccccccccccccccccccccccccccc open
+  : > "$case_dir/gh-axi.log"
+  cat > "$case_dir/data/backlog.md" <<'EOF'
+# Backlog
+## Done
+- [x] task-x1 - fix thing with no issue link (kind: ship)
+EOF
+
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/32 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "no-linked-issue: fm-pr-merge failed"
+
+  assert_no_grep 'issue ' "$case_dir/gh-axi.log" \
+    "no-linked-issue: gh-axi issue subcommand was invoked with no linked issue in the backlog line"
+  pass "fm-pr-merge closes nothing when the task's backlog line has no linked issue"
+}
+
+test_linked_issue_in_different_repo_not_closed() {
+  local case_dir
+  case_dir=$(make_case linked-issue-different-repo)
+  mkdir -p "$case_dir/wt" "$case_dir/data"
+  add_gh_mocks_with_issue_state "$case_dir" dddddddddddddddddddddddddddddddddddddddd open
+  : > "$case_dir/gh-axi.log"
+  cat > "$case_dir/data/backlog.md" <<'EOF'
+# Backlog
+## Done
+- [x] task-x1 - fix thing (issue #44) https://github.com/other-org/other-repo/issues/44 (kind: ship)
+EOF
+
+  run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/33 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || fail "linked-issue-different-repo: fm-pr-merge failed"
+
+  assert_no_grep 'issue ' "$case_dir/gh-axi.log" \
+    "linked-issue-different-repo: an issue linked in a different repo than the merged PR was closed"
+  pass "fm-pr-merge does not close an issue linked in a different repo than the merged PR"
+}
+
 test_records_pr_and_head_before_merging
 test_merge_failure_propagates_after_recording
 test_extra_merge_args_forwarded
@@ -311,3 +428,7 @@ test_repo_override_args_refuse_before_recording
 test_explicit_merge_method_not_overridden
 test_method_equals_merge_method_not_overridden
 test_parses_pr_url_for_gh_axi
+test_closes_open_linked_issue_after_merge
+test_leaves_already_closed_linked_issue_alone
+test_no_linked_issue_closes_nothing
+test_linked_issue_in_different_repo_not_closed
