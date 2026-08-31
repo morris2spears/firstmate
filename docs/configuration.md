@@ -82,6 +82,7 @@ Only the first unchanged hold emits its bounded actionable diagnostic.
 Recovery from a transient hold is automatic: the watcher's slow check cadence runs `bin/fm-cipher-hook.sh retry-held` whenever hold records exist, so an event held while the gateway was down, timing out, or returning a transient HTTP failure is redelivered after the gateway recovers, with no manual record edits.
 Each retried event re-enters its own preflighted trigger path and adopts the recorded request, so the exact body and request ID are resent and the gateway's idempotent duplicate response remains a success.
 A transiently held event whose task records are gone, whose identity was replaced by a newer exact-head event, or whose decision was closed through the existing authority is durably marked superseded instead of retried, and the sweep reports only delivered or superseded outcomes.
+A held iinvy pull-request event is deliberately not superseded when its checks are merely not green right now - checks can regress and return to green on the same head under the same request identity - so it keeps retrying until it is delivered or until teardown removes the task records.
 Configuration-class holds - a missing or invalid route configuration, a bad secret, a non-transient HTTP rejection, or an invalid acknowledgement - are deliberately not auto-retried; after repairing the configuration, re-run the original trigger command, which adopts and retries the same recorded event.
 
 An absent bridge or `decision_route=disabled` leaves the existing Firstmate decision authority unchanged.

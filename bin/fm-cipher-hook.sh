@@ -170,6 +170,12 @@ case "${1:-}" in
           fi
           ;;
         iinvy-pr-ready)
+          # Deliberately asymmetric with needs-decision: a not-green state is
+          # never a supersede here. Checks can regress and come back green on
+          # the SAME head, which keeps the same request identity, so killing
+          # the event on a temporarily not-green read would drop a delivery
+          # that must still retry. A merged or declined pull request instead
+          # supersedes once teardown removes the task metadata.
           case "$STATE_LINE" in
             "state: done"*"checks green"*)
               if FM_CIPHER_RETRIES=1 run_python deliver iinvy-pr-ready "$ID" "$ARGUMENT"; then
