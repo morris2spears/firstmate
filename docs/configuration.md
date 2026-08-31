@@ -74,7 +74,7 @@ An idempotent retry succeeds only on HTTP 200 with exactly `{"status":"duplicate
 Every other HTTP status or response shape is invalid and holds the event.
 
 `bin/fm-cipher-hook.sh` validates genuine current state before delivery - reconciled local state, or for the PR-ready event GitHub's own answer that the pull request is open, CLEAN, and carries a passed check rollup - and `bin/fm-cipher-hook.py` owns the payload, HMAC, retry, response, and private-record mechanics.
-Requests are written before network delivery under mode-0700 `state/cipher-hooks/`, with separate mode-0600 request, sent, acknowledgement, hold, diagnostic, and authenticated-return records.
+Requests are written before network delivery under mode-0700 `state/cipher-hooks/`, with separate mode-0600 request, sent, acknowledgement, hold, announcement, diagnostic, and authenticated-return records.
 An acknowledged logical event is not sent again after restart, while a transiently held event retries the same exact body and request ID with a fresh V2 timestamp.
 Timeouts, connection failures, transient HTTP failures, authentication failures, malformed responses, unsafe local files, and schema failures never print a response body or secret.
 Only the first unchanged hold emits its bounded actionable diagnostic.
