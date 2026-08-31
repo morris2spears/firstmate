@@ -120,15 +120,25 @@ fm_pr_poll_publish_prepared || {
   exit 1
 }
 
+printf 'armed: state/%s.check.sh\n' "$ID"
+
 # Canonical iinvy checks-green transitions are routed only after metadata and
-# the merge poll bind the exact PR head. Every other repository keeps the
-# existing PR-ready path and does not read Cipher config or spend a token.
-if [ "$PROVIDER" = github ] && "$SCRIPT_DIR/fm-cipher-hook.sh" repo-gated "$PROJECT_PATH"; then
-  if "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL"; then
-    :
-  else
-    CIPHER_RC=$?
-    [ "$CIPHER_RC" -eq 4 ] || exit 1
+# the merge poll bind the exact PR head, and an armed task that cannot be
+# routed holds. Every other repository keeps the existing PR-ready path and
+# does not read Cipher config or spend a token.
+GATED_RC=1
+if [ "$PROVIDER" = github ]; then
+  GATED_RC=0
+  "$SCRIPT_DIR/fm-cipher-hook.sh" repo-gated "$PROJECT_PATH" || GATED_RC=$?
+fi
+if [ "$GATED_RC" -gt 1 ]; then
+  echo "error: the Cipher repository gate could not be evaluated" >&2
+  exit 1
+fi
+if [ "$GATED_RC" -eq 0 ]; then
+  CIPHER_RC=0
+  "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || CIPHER_RC=$?
+  if [ "$CIPHER_RC" -ne 0 ] && [ "$CIPHER_RC" -ne 4 ]; then
+    exit 1
   fi
 fi
-printf 'armed: state/%s.check.sh\n' "$ID"

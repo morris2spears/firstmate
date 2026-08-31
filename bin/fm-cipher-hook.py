@@ -300,7 +300,17 @@ def identity_for_event(kind: str, task_id: str, argument: str | None) -> dict[st
         "decision_id": decision_id,
         "evidence": evidence,
     }
-    logical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if kind == "needs-decision":
+        identity: dict[str, Any] = {
+            "schema": SCHEMA,
+            "event_type": kind,
+            "task_id": task_id,
+            "repository": repo,
+            "decision_id": decision_id,
+        }
+    else:
+        identity = payload
+    logical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     request_id = "fmch-v1-" + hashlib.sha256(logical).hexdigest()
     payload["request_id"] = request_id
     validate_payload(payload)

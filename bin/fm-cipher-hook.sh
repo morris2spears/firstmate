@@ -85,8 +85,16 @@ case "${1:-}" in
     case "$2" in
       ''|.*|*..*|*[!A-Za-z0-9._/-]*|*/*/*) exit 1 ;;
     esac
-    grep -qxF -- "$2" "$SCRIPT_DIR/fm-cipher-hook-repositories"
-    exit $?
+    ALLOWLIST="$SCRIPT_DIR/fm-cipher-hook-repositories"
+    if [ ! -f "$ALLOWLIST" ] || [ -L "$ALLOWLIST" ] || [ ! -r "$ALLOWLIST" ]; then
+      echo "error: Cipher repository allowlist is unavailable" >&2
+      exit 2
+    fi
+    CANONICAL_REPO=$(printf '%s' "$2" | LC_ALL=C tr 'A-Z' 'a-z') || exit 2
+    LC_ALL=C grep -qxF -- "$CANONICAL_REPO" "$ALLOWLIST"
+    GATED_RC=$?
+    [ "$GATED_RC" -le 1 ] || exit 2
+    exit "$GATED_RC"
     ;;
   needs-decision)
     [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }
