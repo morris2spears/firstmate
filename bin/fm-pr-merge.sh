@@ -74,6 +74,18 @@ reject_repo_overrides() {
   done
 }
 
+reject_cipher_head_override() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --match-head-commit|--match-head-commit=*)
+        echo "error: Cipher-gated merges bind the inspected PR head automatically" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
 reject_repo_overrides "$@" || exit 1
 
 # Task-derived paths are constructed only after the canonical ID validation.
@@ -81,6 +93,20 @@ META="$STATE/$ID.meta"
 if [ ! -f "$META" ] || [ -L "$META" ]; then
   echo "error: task metadata is unavailable" >&2
   exit 1
+fi
+
+CIPHER_HEAD=
+if fm_cipher_repo_gated "$PR_OWNER/$PR_REPO"; then
+  reject_cipher_head_override "$@" || exit 1
+  "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || {
+    echo "error: this iinvy PR is not currently checks-green or its Cipher event is held" >&2
+    exit 1
+  }
+  CIPHER_HEAD=$("$SCRIPT_DIR/fm-cipher-hook.sh" verify-merge \
+    "$ID" "$URL" "${FM_CIPHER_MERGE_REQUEST_ID:-}") || {
+      echo "error: this iinvy merge remains held for Cipher's exact-head production inspection" >&2
+      exit 1
+    }
 fi
 
 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
@@ -92,6 +118,9 @@ grep -qxF "pr=$URL" "$META" || {
 merge_args=()
 if ! caller_has_merge_method "$@"; then
   merge_args=(--squash)
+fi
+if [ -n "$CIPHER_HEAD" ]; then
+  merge_args+=(--match-head-commit "$CIPHER_HEAD")
 fi
 
 gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]+"${merge_args[@]}"}" "$@"

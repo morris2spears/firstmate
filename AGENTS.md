@@ -72,6 +72,7 @@ config/calm     Pi Calm presentation preference; LOCAL, gitignored, and not inhe
 config/herdr-presentation-spaces  optional Herdr presentation layout selector (empty or "task" = disposable single-task projection, "project" = one shared workspace per project); LOCAL, gitignored; inherited by secondmate homes; see docs/herdr-backend.md "Optional presentation spaces" and "Project workspaces"
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
+config/cipher-hooks and config/cipher-hooks.secret  optional local Cipher/Hermes route and HMAC secret; LOCAL, gitignored, mode 0600, and not inherited; see docs/configuration.md "Cipher/Hermes bridge"
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 config/telegram-mode  Telegram-mode opt-in flag file (no secret); LOCAL, gitignored; presence-gates section 15
 config/tg-mode.env   generated Telegram-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
@@ -110,6 +111,8 @@ state/               volatile runtime signals; gitignored
   tg-away-digest/    away-mode private 0600 working copies of the escalation lines an accepted Telegram notice carried; read these when a delivery receipt points at them, folded into return catch-up, and retired with the away session (bin/fm-away-ledger-lib.sh)
   tg-away-versions/  away-mode immutable batch versions, one complete v.<id>/ copy of the escalation buffer, ledger sidecar, wedge marker, and digests per ledger transition, plus the single active/active.applied pointer and the .owner.lock every transition holds; the live artifacts are that pointer's projection, and retained versions fold into return catch-up and retire whole once it is acknowledged (bin/fm-away-ledger-lib.sh)
   pending-replies/   parent-owned secondmate pending-reply records (correlation id, delivery vs reply, recovery, escalation); fm-pending-reply-lib.sh
+  cipher-hooks/      private request, sent, acknowledgement, hold, diagnostic, and authenticated-return records for the optional Cipher/Hermes bridge; bin/fm-cipher-hook.sh
+  cipher-receive.turn-ended  append-only content-free monitoring edge for authenticated Cipher return records already in the durable wake queue; bin/fm-cipher-receive.sh
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated X-mode durable per-request reply context and one-wake offer markers, keyed by request_id; survives inbox cleanup and expires within seven days (section 14; bin/fm-x-lib.sh)
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
@@ -305,7 +308,8 @@ For a no-mistakes ship, trigger validation on the same worker after its implemen
 The task worker that starts a no-mistakes run drives the pipeline and owns every `no-mistakes axi run` and `no-mistakes axi respond` call through the next gate or outcome.
 Firstmate never invokes `no-mistakes axi respond` for a crew-owned run.
 
-An ask-user finding returns as `needs-decision`; firstmate decides only when the configured authority permits, otherwise escalates to the captain.
+On a genuine `needs-decision`, load `cipher-hook` before deciding or escalating; it owns whether Cipher or the existing authority handles that gate.
+When `cipher-hook` returns the existing-authority path, firstmate decides only when the configured authority permits, otherwise escalates to the captain.
 Send the same worker one exact decision naming the decision key, step, action, affected finding IDs, instructions where needed, and exact response command.
 Require the matching `resolved` event, forbid `--yes`, and require the worker to process every synchronous return until completion or a genuinely new escalation.
 Resume fleet supervision immediately after the decision lands.
@@ -319,6 +323,7 @@ The worker reports the PR when CI first becomes green rather than waiting for me
 
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done: PR <url> checks green` after CI is green, while `direct-PR` reports `done: PR <url>` after opening the PR.
 Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and the forge's `pr_head=` when available in the task's meta and arms the watcher's merge poll.
+For a checks-green PR in either canonical iinvy repository, load `cipher-hook`; its exact-head production-outage boundary supersedes routine merge authority.
 Tell the captain the PR's full URL, always the complete `https://...` link rather than a bare `#number`, a concise outcome summary, and the no-mistakes risk level when applicable.
 A captain instruction to merge is explicit authority; `yolo` is the only standing routine authority.
 The same poll also watches for the captain declining the work by closing the pull request without merging it after commenting on it; load `pr-decline-feedback` on that wake before acting on his comment.
@@ -486,6 +491,7 @@ These skills are not captain-invocable; load them only at their precise triggers
 - `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap section prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `TANGLE:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `PR_CHECK_MIGRATION:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `NUDGE_SECONDMATES:`, `FMX:`, or `FMTG:`); silence and `BOOTSTRAP_INFO:` need no load.
 - `diagnostic-reasoning` - load before scoping a reported bug and before acting on a diagnostic report.
 - `ask-user-authority` - load before deciding any ask-user finding, regardless of the project's `yolo` posture.
+- `cipher-hook` - load after reconciling a genuine `needs-decision`, for a checks-green iinvy or iinvy-storefront PR, or on an authenticated `cipher-comment` check notification.
 - `quota-array-dispatch` - load before choosing among a matched crew-dispatch profile array from current quota-axi output.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
 - `firstmate-orca` - load before switching to Orca, spawning or supervising Orca-backed work, smoke-testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.

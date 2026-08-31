@@ -120,6 +120,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/cipher-hook/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/bootstrap-diagnostics/SKILL.md",
       "audience": "agent-runtime"
     },

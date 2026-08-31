@@ -33,6 +33,75 @@ The `/calm` command replaces the file atomically before changing live presentati
 The extension reloads this preference on every Pi `session_start` of a trusted interactive TUI, including startup, new, resume, fork, and reload reasons; other Pi modes keep stock presentation without consulting it, and [`calm.md`](calm.md) owns that scoping.
 This preference is local to each Firstmate home and is not part of secondmate inherited configuration.
 
+## Cipher/Hermes bridge
+
+The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the two canonical iinvy repositories.
+Gated membership is decided by the literal case-insensitive `FM_CIPHER_GATED_REPOSITORIES` list in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh), which needs no file or configuration read, and `bin/fm-cipher-hook-repositories` carries the same list for the Python payload owner with a test holding the two in step.
+It is not a generic notification channel, does not copy Firstmate supervision state, and never sends worker prose.
+GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow iinvy production-outage inspection and merge action.
+
+The bridge reads `config/cipher-hooks` from the effective Firstmate home, or from `FM_CONFIG_OVERRIDE` for isolated tests.
+The file must be a regular single-link mode-0600 file with this exact key set and no duplicate or unknown keys:
+
+```text
+version=1
+decision_route=enabled
+iinvy_pr_ready_route=enabled
+endpoint=http://127.0.0.1:8787/webhooks/firstmate-hook
+secret_file=/absolute/path/to/firstmate/config/cipher-hooks.secret
+```
+
+Blank lines and lines beginning with `#` are ignored.
+The endpoint must use plain HTTP, the literal host `127.0.0.1`, an explicit port, and an installed Hermes agent route shaped as `/webhooks/<route>` or `/p/<profile>/webhooks/<route>` with only letters, digits, underscore, and hyphen in its variable segments.
+The Hermes route itself must remain bound to `127.0.0.1` and must not expose a production credential or network listener.
+The secret path must be absolute with no traversal and must name a regular single-link mode-0600 file whose sole non-whitespace content is 64 lower-case hexadecimal characters.
+A compatible synthetic secret can be generated locally with `umask 077` followed by `openssl rand -hex 32 > config/cipher-hooks.secret`, after which `secret_file` must contain that file's absolute path.
+Neither configuration file is inherited into secondmate homes or copied into project worktrees.
+
+Production delivery uses Hermes generic HMAC V2.
+`X-Webhook-Timestamp` is the Unix-seconds timestamp, and `X-Webhook-Signature-V2` is the lower-case hexadecimal HMAC-SHA256 of the exact ASCII form `<timestamp>.<body>` using the configured secret.
+`X-Request-ID` and `Idempotency-Key` both carry the stable logical request ID.
+The production sender does not send legacy `X-Webhook-Signature`.
+A doubly explicit test seam exercises Hermes's legacy body-only `X-Webhook-Signature` compatibility path, but no local production configuration value can select it.
+
+The compact JSON request is no larger than 4096 bytes and has exactly these versioned allowlisted fields: `schema`, `event_type`, `request_id`, `task_id`, `repository`, `issue_url`, `pr_url`, `pr_head_sha`, `decision_id`, and `evidence`.
+`event_type` is `needs-decision` or `iinvy-pr-ready`, which is the installed Hermes adapter's recognized event selector.
+Unknown values are JSON `null`, and evidence contains only the validated relative pointers `state/<task-id>.meta` and `state/<task-id>.status` with fixed kind names.
+The request ID is a stable SHA-256 identity over the event's own logical scope: a decision identity covers only the schema, event type, task, repository, and decision key, while a PR-ready identity covers the whole exact-head event, so a keyed decision emits once even after PR metadata is later recorded and each distinct PR head emits once.
+The first recorded request body for a logical decision stays canonical, so a later repeat of the same key retries or dedupes that exact body rather than sending a second event.
+A first delivery succeeds only on HTTP 202 with exactly `{"status":"accepted","route":"<configured-route-name>","event":"<same-event-type>","delivery_id":"<same-request-id>"}` and no additional fields.
+An idempotent retry succeeds only on HTTP 200 with exactly `{"status":"duplicate","delivery_id":"<same-request-id>"}` and no additional fields.
+Every other HTTP status or response shape is invalid and holds the event.
+
+`bin/fm-cipher-hook.sh` validates current reconciled state before delivery, and `bin/fm-cipher-hook.py` owns the payload, HMAC, retry, response, and private-record mechanics.
+Requests are written before network delivery under mode-0700 `state/cipher-hooks/`, with separate mode-0600 request, sent, acknowledgement, hold, diagnostic, and authenticated-return records.
+An acknowledged logical event is not sent again after restart, while a transiently held event retries the same exact body and request ID with a fresh V2 timestamp.
+Timeouts, connection failures, transient HTTP failures, authentication failures, malformed responses, unsafe local files, and schema failures never print a response body or secret.
+Only the first unchanged hold emits its bounded actionable diagnostic.
+
+An absent bridge or `decision_route=disabled` leaves the existing Firstmate decision authority unchanged.
+When the decision route is enabled, Cipher may select only a routine reversible option within the accepted GitHub issue contract and must write its recommendation, selected option, reasoning, and reversal path on GitHub before asking Firstmate to continue.
+Cipher escalates to Morris instead of deciding when no safe recommendation exists or the choice expands the product or engineering contract, is destructive or irreversible, changes security or credentials, migrates production data, or spends money.
+Firstmate keeps the worker parked until it fetches the exact durable GitHub comment.
+
+The iinvy route is fail-safe rather than optional for `morris2spears/iinvy` and `morris2spears/iinvy-storefront`.
+A missing config, disabled route, unavailable gateway, timeout, invalid response, or missing exact head holds those merges, while every other repository keeps its existing PR-ready and merge behavior without reading bridge configuration or sending an event.
+Cipher's review is limited to cross-repository provider and consumer contracts, migration and deployment ordering, runtime dependency install/import/restart behavior, and production-realistic smoke or health gates.
+Cipher invokes `bin/fm-cipher-hook.sh merge` with the request ID it inspected, and the guarded merge path adds GitHub's exact-head condition so a later head cannot inherit an earlier inspection.
+After merge confirmation, the Cipher webhook session separately verifies deployment and the appropriate live smoke or health outcome, then posts one concise Cipher Discord receipt containing the validated canonical PR URL and validated owning issue URL from the event or refreshed live Firstmate and GitHub state.
+The receipt reads `Merged PR #N, closing issue #M.` with both identifiers rendered as Markdown links only when issue closure is guaranteed or verified, and otherwise uses `linked to` instead of `closing`.
+Cipher never invents or infers an issue link, never posts the receipt before merge confirmation, and includes the deployment or health outcome alongside it.
+This Discord receipt is Cipher-side acceptance and does not add a Firstmate delivery or notification responsibility.
+
+After Cipher writes a decision or blocker comment, its authenticated route invokes `bin/fm-cipher-receive.sh` with the event kind, task ID, acknowledged request ID, and exact GitHub comment URL.
+The receive command validates those identities, appends one durable notification directly to the owning Firstmate home's queue, and advances `state/cipher-receive.turn-ended` only as the content-free edge that wakes live monitoring without discovering or writing a terminal pane.
+A self-repo ship worker can therefore coexist with the real primary without appearing to be a second primary to Hermes, while terminal transports retain their exactly-one-primary safety check unchanged.
+
+For a local rollback, stop the Hermes route first, set `decision_route=disabled` to restore ordinary decision handling, then remove `config/cipher-hooks` and its secret when no event is in flight.
+Removing or disabling the iinvy route deliberately leaves iinvy merges held and never restores autonomous merging.
+Reverting the tracked feature is the only rollback that removes that production boundary.
+The private event records contain no secret and can remain for restart-safe deduplication.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.
