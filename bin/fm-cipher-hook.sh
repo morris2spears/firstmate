@@ -3,8 +3,10 @@
 # Cipher's narrow exact-head entrypoint into the guarded iinvy merge path.
 #
 # `needs-decision` first proves that the named keyed decision remains open and
-# current; `pr-ready` first proves that current-state reconciliation reports a
-# checks-green PR. The Python module receives only validated identity fields,
+# current; `pr-ready` first proves the PR is genuinely checks-green - either
+# current-state reconciliation reports it, or GitHub itself reports the pull
+# request open and CLEAN, so a wedged or stale local CI monitor cannot hide a
+# forge-green PR forever. The Python module receives only validated identity fields,
 # never worker prose. It owns strict payload/config validation, HMAC-SHA256 over
 # the exact request bytes, stable request IDs, private request/sent/ack/hold
 # records under state/cipher-hooks/, bounded retry, and localhost transport.
@@ -37,11 +39,24 @@
 # <comment-url>" status line while the keyed decision is still open, so an
 # answered decision cannot linger stale or keep held duplicates alive.
 #
+# `reconcile` is the watcher's checks-green reconciliation sweep. For every
+# recorded gated GitHub pull request that is currently checks-green - by local
+# reconciliation or by GitHub's own open-and-CLEAN answer - it re-registers
+# through bin/fm-pr-check.sh - the one canonical trigger, which refreshes the
+# exact head and re-enters this pr-ready path - so a green transition reached
+# after registration (a rebase or sync, a repair or recovery, a manual
+# coordinator reconciliation, a wedged local CI monitor) still emits its
+# exact-head event durably instead of relying on agent prose. It prints one
+# line per newly acknowledged event and nothing otherwise; a held current
+# identity stays with `retry-held` or, for configuration-class holds, with
+# captain repair.
+#
 # Usage:
 #   fm-cipher-hook.sh needs-decision <task-id> [decision-id]
 #   fm-cipher-hook.sh pr-ready <task-id> <pr-url>
 #   fm-cipher-hook.sh retry-held
 #   fm-cipher-hook.sh resolve-decision <task-id> <request-id>
+#   fm-cipher-hook.sh reconcile
 #   fm-cipher-hook.sh merge <task-id> <pr-url> <request-id> [-- <extra merge args>]
 #   fm-cipher-hook.sh verify-merge <task-id> <pr-url> <request-id>
 #   fm-cipher-hook.sh repo-gated <owner/repo>
@@ -61,7 +76,7 @@ CREW_STATE_BIN=${FM_CREW_STATE_BIN:-$SCRIPT_DIR/fm-crew-state.sh}
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 
 usage() {
-  sed -n '2,47s/^# \{0,1\}//p' "$0"
+  sed -n '2,62s/^# \{0,1\}//p' "$0"
 }
 
 run_python() {
@@ -74,6 +89,17 @@ run_python() {
 
 current_state() { # <task-id>
   "$CREW_STATE_BIN" "$1" 2>/dev/null || true
+}
+
+# Checks-green means local reconciliation reports it OR the forge itself does.
+# Local run-step state is the cheap primary read, but it can under-report while
+# the pipeline's own CI monitor is wedged or stale, so GitHub's open-and-CLEAN
+# answer is accepted as equal truth before an event is refused or skipped.
+pr_checks_green_now() { # <current-state-line> <pr-url>
+  case "$1" in
+    "state: done"*"checks green"*) return 0 ;;
+  esac
+  fm_pr_github_checks_green "$2"
 }
 
 decision_is_open() { # <task-id> <decision-id>
@@ -160,10 +186,7 @@ case "${1:-}" in
       exit 2
     }
     STATE_LINE=$(current_state "$ID")
-    case "$STATE_LINE" in
-      "state: done"*"checks green"*) ;;
-      *) exit 4 ;;
-    esac
+    pr_checks_green_now "$STATE_LINE" "$URL" || exit 4
     run_python deliver iinvy-pr-ready "$ID" "$URL"
     exit $?
     ;;
@@ -206,18 +229,54 @@ case "${1:-}" in
           # the event on a temporarily not-green read would drop a delivery
           # that must still retry. A merged or declined pull request instead
           # supersedes once teardown removes the task metadata.
-          case "$STATE_LINE" in
-            "state: done"*"checks green"*)
-              if FM_CIPHER_RETRIES=1 run_python deliver iinvy-pr-ready "$ID" "$ARGUMENT"; then
-                printf 'delivered %s iinvy-pr-ready %s\n' "$REQUEST_ID" "$ID"
-              fi
-              ;;
-          esac
+          if pr_checks_green_now "$STATE_LINE" "$ARGUMENT"; then
+            if FM_CIPHER_RETRIES=1 run_python deliver iinvy-pr-ready "$ID" "$ARGUMENT"; then
+              printf 'delivered %s iinvy-pr-ready %s\n' "$REQUEST_ID" "$ID"
+            fi
+          fi
           ;;
       esac
     done <<EOF
 $PLAN
 EOF
+    exit 0
+    ;;
+  reconcile)
+    [ "$#" -eq 1 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }
+    ACKS="$STATE/cipher-hooks/acks"
+    HOLDS="$STATE/cipher-hooks/holds"
+    for META in "$STATE"/*.meta; do
+      [ -f "$META" ] && [ ! -L "$META" ] || continue
+      ID=$(basename "$META" .meta)
+      fm_task_id_creation_valid "$ID" || continue
+      URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2-)
+      [ -n "$URL" ] || continue
+      fm_pr_url_parse "$URL" || continue
+      [ "$FM_PR_PROVIDER" = github ] || continue
+      fm_cipher_repo_gated "$FM_PR_PATH" || continue
+      STATE_LINE=$(current_state "$ID")
+      pr_checks_green_now "$STATE_LINE" "$URL" || continue
+      RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2-)
+      LIVE_HEAD=$(fm_pr_github_live_head "$META" "$URL")
+      RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || RID=
+      if [ -z "$LIVE_HEAD" ] || [ "$LIVE_HEAD" = "$RECORDED_HEAD" ]; then
+        # Same or unknown live head: an acknowledged current identity is
+        # complete, and a held one belongs to retry-held or captain repair.
+        # Only a live head that moved past the recorded one re-registers
+        # regardless, so a post-hold rebase still gets its fresh event.
+        if [ -n "$RID" ] && { [ -f "$ACKS/$RID.json" ] || [ -f "$HOLDS/$RID.json" ]; }; then
+          continue
+        fi
+      fi
+      BEFORE_ACKS=$(ls "$ACKS" 2>/dev/null || true)
+      "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL" >/dev/null 2>&1 || true
+      RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || continue
+      [ -f "$ACKS/$RID.json" ] || continue
+      case "$BEFORE_ACKS" in
+        *"$RID.json"*) ;;
+        *) printf 'delivered %s iinvy-pr-ready %s\n' "$RID" "$ID" ;;
+      esac
+    done
     exit 0
     ;;
   verify-merge)

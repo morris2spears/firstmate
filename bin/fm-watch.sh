@@ -821,6 +821,19 @@ while :; do
       fi
       break
     done
+    # Checks-green reconciliation for Cipher-gated pull requests runs on this
+    # same slow cadence over durable task metadata, so a green transition
+    # reached after registration (rebase/sync, repair, manual coordinator
+    # reconciliation) still emits its exact-head event. Silent unless a new
+    # event is acknowledged, so steady state costs no wake.
+    run_check_capture "$SCRIPT_DIR/fm-cipher-hook.sh" reconcile || exit 1
+    out=$FM_CHECK_RESULT
+    if [ -n "$out" ]; then
+      reason="check: cipher-reconcile: $out"
+      fm_wake_append check cipher-reconcile "$reason" || exit 1
+      touch "$STATE/.last-check"
+      wake "$reason"
+    fi
     touch "$STATE/.last-check"
   fi
 

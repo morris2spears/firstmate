@@ -224,8 +224,35 @@ fm_pr_head_valid() {
   [[ "$head" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]
 }
 
-# The two GitHub repositories whose checks-green merge boundary belongs to
-# Cipher. Membership is decided here, by a literal case-insensitive comparison
+# Best-effort live GitHub head for a task's recorded pull request, read through
+# gh from the recorded task worktree. Prints the validated SHA or nothing, and
+# never fails, so a missing worktree, absent gh, or forge error reads as "head
+# unknown" rather than an error a caller could mistake for state.
+fm_pr_github_live_head() { # <meta-path> <pr-url>
+  local meta=$1 url=$2 wt head
+  wt=$(grep '^worktree=' "$meta" | tail -1 | cut -d= -f2-) || true
+  [ -n "$wt" ] && [ -d "$wt" ] && command -v gh >/dev/null 2>&1 || return 0
+  head=$(cd "$wt" && gh pr view "$url" --json headRefOid -q .headRefOid 2>/dev/null) || return 0
+  fm_pr_head_valid "$head" || return 0
+  printf '%s\n' "$head"
+}
+
+# GitHub's own merge-readiness for a pull request: open and CLEAN, meaning
+# every required check passed and the merge is not blocked. This is forge-side
+# truth, independent of any local pipeline or monitor state, so a wedged or
+# stale local CI monitor cannot hide a genuinely green pull request. Any error,
+# absent gh, or transitional forge answer reads as not green - the safe
+# direction for a caller deciding whether to emit a merge-boundary event.
+fm_pr_github_checks_green() { # <pr-url>
+  local url=$1 answer
+  command -v gh >/dev/null 2>&1 || return 1
+  answer=$(gh pr view "$url" --json state,mergeStateStatus \
+    -q '.state + " " + .mergeStateStatus' 2>/dev/null) || return 1
+  [ "$answer" = "OPEN CLEAN" ]
+}
+
+# The GitHub repositories whose checks-green merge boundary belongs to Cipher.
+# Membership is decided here, by a literal case-insensitive comparison
 # with no file, subprocess, or configuration dependency, so an unrelated
 # repository can never be blocked by a failure in the bridge's machinery and a
 # gated repository can never be released by one. bin/fm-cipher-hook-repositories
@@ -233,6 +260,7 @@ fm_pr_head_valid() {
 FM_CIPHER_GATED_REPOSITORIES=(
   morris2spears/iinvy
   morris2spears/iinvy-storefront
+  morris2spears/iinvy-control-plane
 )
 
 fm_cipher_repo_gated() { # <owner/repo>

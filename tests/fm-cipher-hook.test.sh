@@ -140,7 +140,12 @@ SH
   cat > "$dir/fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
-  "pr view") printf '%s\n' "${FM_TEST_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+  "pr view")
+    case "$*" in
+      *mergeStateStatus*) printf '%s\n' "${FM_TEST_FORGE_GREEN:-}" ;;
+      *) printf '%s\n' "${FM_TEST_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+    esac
+    ;;
 esac
 SH
   cat > "$dir/fakebin/gh-axi" <<'SH'
@@ -633,6 +638,7 @@ test_pr_check_allowlist_and_safe_holds() {
     <(grep -v -e '^#' -e '^$' "$ROOT/bin/fm-cipher-hook-repositories") >/dev/null \
     || fail "the shell gate list and the Cipher allowlist file disagree"
   fm_cipher_repo_gated Morris2Spears/iinvy || fail "mixed-case iinvy owner was not recognized as gated"
+  fm_cipher_repo_gated morris2spears/iinvy-control-plane || fail "the control-plane repository was not recognized as gated"
   fm_cipher_repo_gated example/other && fail "an unrelated repository was treated as gated"
   dir=$(make_case pr-check)
   export FM_TEST_CREW_STATE_MARKER="$dir/crew-state.called"
@@ -653,7 +659,7 @@ test_pr_check_allowlist_and_safe_holds() {
   expect_code 0 "$rc" "non-green iinvy PR registration should keep waiting for checks"
   assert_absent "$dir/state/cipher-hooks" "non-green iinvy PR emitted a Cipher event"
 
-  for repo in morris2spears/iinvy morris2spears/iinvy-storefront; do
+  for repo in "${FM_CIPHER_GATED_REPOSITORIES[@]}"; do
     rm -f "$dir/config/cipher-hooks" "$dir/crew-state.called"
     set +e
     prepare_pr_case "$dir" "missing-${repo##*/}" "$repo" > "$dir/missing.out" 2> "$dir/missing.err"
@@ -992,6 +998,197 @@ test_watcher_retries_held_delivery() {
   pass "normal supervision retries a held delivery after gateway recovery and wakes firstmate once"
 }
 
+test_reconcile_delivers_post_registration_green() {
+  local dir port out rc request_id count head_c
+  head_c='cccccccccccccccccccccccccccccccccccccccc'
+  dir=$(make_case reconcile)
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] sync-task - close the reconciliation gap https://github.com/morris2spears/iinvy-control-plane/issues/19 (kind: ship)
+EOF
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+
+  # Registration while the PR is behind or red records the PR, keeps waiting
+  # for checks, and spends no Cipher event.
+  set +e
+  prepare_pr_case "$dir" sync-task morris2spears/iinvy-control-plane "$HEAD_A" \
+    'state: working · source: run-step · ci running' > "$dir/register.out" 2> "$dir/register.err"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "non-green control-plane registration should keep waiting for checks"
+  assert_absent "$dir/state/cipher-hooks" "non-green registration emitted a Cipher event"
+
+  # A reconcile sweep while the task is still not green stays silent.
+  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+    run_hook "$dir" reconcile 2> "$dir/reconcile-red.err") || fail "not-green reconcile sweep failed"
+  [ -z "$out" ] || fail "not-green reconcile produced output: $out"
+  assert_absent "$dir/state/cipher-hooks" "not-green reconcile emitted a Cipher event"
+
+  # A manual coordinator sync/rebase advances the head and checks reach green
+  # outside the registration path. The sweep re-registers through the one
+  # canonical trigger, refreshes the exact head, and delivers exactly once.
+  out=$(FM_TEST_HEAD=$HEAD_B \
+    FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" reconcile 2> "$dir/reconcile-green.err") || fail "green reconcile sweep failed"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  [ -n "$request_id" ] || fail "reconcile did not record the PR-ready request"
+  [ "$out" = "delivered $request_id iinvy-pr-ready sync-task" ] \
+    || fail "reconcile did not report the delivered outcome: $out"
+  grep -qxF "pr_head=$HEAD_B" "$dir/state/sync-task.meta" \
+    || fail "reconcile did not refresh the synced exact head in task metadata"
+  jq -e --arg head "$HEAD_B" 'select(.body.pr_head_sha == $head and .v2_valid)' \
+    "$dir/server.log" >/dev/null || fail "delivered event did not bind the synced exact head"
+  assert_present "$dir/state/cipher-hooks/requests/$request_id.json" \
+    "reconcile delivery did not record its durable request"
+  assert_present "$dir/state/cipher-hooks/sent/$request_id.json" \
+    "reconcile delivery did not record its delivery attempts"
+  assert_present "$dir/state/cipher-hooks/acks/$request_id.json" \
+    "reconcile delivery was not durably acknowledged"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "reconcile delivered $count times"
+
+  # Duplicate reconciliation of the same green exact head is silent and does
+  # not redeliver.
+  out=$(FM_TEST_HEAD=$HEAD_B \
+    FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "duplicate reconcile sweep failed"
+  [ -z "$out" ] || fail "duplicate reconcile redelivered: $out"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "duplicate reconcile reached the gateway"
+
+  # A further head advance while still green emits exactly one fresh
+  # exact-head event under a new request identity.
+  out=$(FM_TEST_HEAD=$head_c \
+    FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "advanced-head reconcile sweep failed"
+  case "$out" in
+    "delivered fmch-v1-"*" iinvy-pr-ready sync-task") ;;
+    *) fail "advanced head reconcile did not deliver a fresh event: $out" ;;
+  esac
+  case "$out" in
+    *"$request_id"*) fail "advanced head reused the earlier request identity" ;;
+  esac
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 2 ] || fail "advanced head reconcile delivered $count total events"
+  pass "reconcile delivers a post-registration checks-green transition once with the fresh exact head"
+}
+
+test_watcher_reconciles_post_registration_green() {
+  local dir port request_id out wpid i
+  dir=$(make_case watcher-reconcile)
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] recover-task - reconcile after recovery https://github.com/morris2spears/iinvy-control-plane/issues/20 (kind: ship)
+EOF
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+  # Register while red, then lose the observing session: only durable records
+  # remain when the PR later reaches green.
+  set +e
+  prepare_pr_case "$dir" recover-task morris2spears/iinvy-control-plane "$HEAD_A" \
+    'state: working · source: run-step · ci running' >/dev/null 2>&1
+  set -e
+  assert_absent "$dir/state/cipher-hooks" "red registration emitted a Cipher event"
+
+  out="$dir/watch.out"
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_HOME="$dir" \
+  FM_STATE_OVERRIDE="$dir/state" \
+  FM_DATA_OVERRIDE="$dir/data" \
+  FM_CONFIG_OVERRIDE="$dir/config" \
+  FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state" \
+  FM_TEST_HEAD=$HEAD_B \
+  FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+  FM_CIPHER_RETRIES=1 FM_CIPHER_RETRY_DELAY_SECS=0 \
+  FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 FM_HEARTBEAT=999999 \
+  PATH="$dir/fakebin:$PATH" \
+    "$ROOT/bin/fm-watch.sh" > "$out" 2> "$dir/watch.err" &
+  wpid=$!
+  i=0
+  while kill -0 "$wpid" 2>/dev/null && [ "$i" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$wpid" 2>/dev/null; then
+    kill "$wpid" 2>/dev/null || true
+    wait "$wpid" 2>/dev/null || true
+    fail "watcher did not exit on the cipher reconcile wake"
+  fi
+  wait "$wpid" 2>/dev/null || true
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  [ -n "$request_id" ] || fail "watcher reconcile did not record the PR-ready request"
+  assert_grep "check: cipher-reconcile: delivered $request_id iinvy-pr-ready recover-task" "$out" \
+    "watcher did not surface the reconciled delivery outcome"
+  assert_grep "cipher-reconcile" "$dir/state/.wake-queue" \
+    "watcher did not queue the durable cipher reconcile wake"
+  assert_present "$dir/state/cipher-hooks/acks/$request_id.json" \
+    "watcher reconcile did not record the durable acknowledgement"
+  grep -qxF "pr_head=$HEAD_B" "$dir/state/recover-task.meta" \
+    || fail "watcher reconcile did not refresh the green exact head"
+  pass "normal supervision reconciles a post-registration checks-green transition and wakes firstmate once"
+}
+
+test_forge_green_overrides_wedged_local_monitor() {
+  local dir port out rc request_id count
+  dir=$(make_case forge-green)
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] wedged-task - transactionless entity https://github.com/morris2spears/iinvy/issues/292 (kind: ship)
+- [ ] wedged-at-arm-task - same wedge at registration https://github.com/morris2spears/iinvy/issues/293 (kind: ship)
+EOF
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+
+  # Registration while neither the local pipeline nor GitHub is green: the
+  # "armed:" line is a watch confirmation only, never a delivery.
+  set +e
+  prepare_pr_case "$dir" wedged-task morris2spears/iinvy "$HEAD_A" \
+    'state: working · source: run-step · validating (running)' \
+    > "$dir/register.out" 2> "$dir/register.err"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "not-yet-green registration should keep waiting for checks"
+  assert_grep "armed: state/wedged-task.check.sh" "$dir/register.out" \
+    "registration did not arm the merge poll"
+  assert_absent "$dir/state/cipher-hooks" "an armed poll was mistaken for a delivery"
+
+  # GitHub reaches green/CLEAN while the pipeline's own CI monitor stays
+  # silently wedged in a validating state: forge-side truth delivers anyway.
+  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' \
+    FM_TEST_CREW_STATE='state: working · source: run-step · validating (running)' \
+    run_hook "$dir" reconcile 2> "$dir/reconcile.err") || fail "forge-green reconcile sweep failed"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  [ -n "$request_id" ] || fail "forge-green reconcile did not record the PR-ready request"
+  [ "$out" = "delivered $request_id iinvy-pr-ready wedged-task" ] \
+    || fail "forge-green reconcile did not report the delivered outcome: $out"
+  assert_present "$dir/state/cipher-hooks/acks/$request_id.json" \
+    "forge-green delivery was not durably acknowledged"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "forge-green reconcile delivered $count times"
+
+  # Repeating the sweep with the monitor still wedged does not redeliver.
+  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' \
+    FM_TEST_CREW_STATE='state: working · source: run-step · validating (running)' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "repeated forge-green sweep failed"
+  [ -z "$out" ] || fail "repeated forge-green sweep redelivered: $out"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "repeated forge-green sweep reached the gateway"
+
+  # When GitHub is already green at registration time, the registration-time
+  # trigger itself delivers despite the wedged local monitor.
+  set +e
+  FM_TEST_FORGE_GREEN='OPEN CLEAN' \
+    prepare_pr_case "$dir" wedged-at-arm-task morris2spears/iinvy "$HEAD_B" \
+    'state: working · source: run-step · validating (running)' \
+    > "$dir/register2.out" 2> "$dir/register2.err"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "forge-green registration should deliver and arm"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 2 ] || fail "forge-green registration delivered $count total events"
+  jq -e --arg head "$HEAD_B" 'select(.body.pr_head_sha == $head and .body.task_id == "wedged-at-arm-task")' \
+    "$dir/server.log" >/dev/null || fail "registration-time forge-green event did not bind its exact head"
+  pass "GitHub-side green truth delivers the PR-ready event despite a wedged local CI monitor"
+}
+
 test_v2_decision_and_pr_delivery_dedupe
 test_note_keyed_decision_single_hook_and_park
 test_resolve_decision_requires_and_follows_authenticated_answer
@@ -1006,3 +1203,6 @@ test_receive_api_ignores_self_repo_worker_pane
 test_retry_held_after_gateway_recovery
 test_retry_supersedes_obsolete_holds
 test_watcher_retries_held_delivery
+test_reconcile_delivers_post_registration_green
+test_watcher_reconciles_post_registration_green
+test_forge_green_overrides_wedged_local_monitor

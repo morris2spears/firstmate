@@ -1,8 +1,8 @@
 ---
 name: cipher-hook
 description: >-
-  Agent-only playbook for a genuine needs-decision transition, an iinvy checks-green transition, an authenticated cipher-comment notification, or a cipher-retry check notification.
-  It owns the Cipher authority split, durable GitHub answer fetch, iinvy merge hold, held-delivery retry outcomes, and local receive command that avoids primary-pane ambiguity.
+  Agent-only playbook for a genuine needs-decision transition, an iinvy checks-green transition, an authenticated cipher-comment notification, or a cipher-retry or cipher-reconcile check notification.
+  It owns the Cipher authority split, durable GitHub answer fetch, iinvy merge hold, held-delivery retry and reconciliation outcomes, and local receive command that avoids primary-pane ambiguity.
 user-invocable: false
 metadata:
   internal: true
@@ -10,7 +10,7 @@ metadata:
 
 # Cipher hook
 
-Load this after current-state reconciliation proves a genuine `needs-decision`, when a checks-green pull request belongs to `morris2spears/iinvy` or `morris2spears/iinvy-storefront`, or on a `cipher-comment` or `cipher-retry` check notification.
+Load this after current-state reconciliation proves a genuine `needs-decision`, when a checks-green pull request belongs to a repository listed in [`bin/fm-cipher-hook-repositories`](../../../bin/fm-cipher-hook-repositories), or on a `cipher-comment`, `cipher-retry`, or `cipher-reconcile` check notification.
 The local setup and wire schema are owned by [`docs/configuration.md`](../../../docs/configuration.md#cipherhermes-bridge), while the command contracts are owned by the headers of [`bin/fm-cipher-hook.sh`](../../../bin/fm-cipher-hook.sh) and [`bin/fm-cipher-receive.sh`](../../../bin/fm-cipher-receive.sh).
 
 ## Genuine needs-decision
@@ -38,9 +38,11 @@ Never use gateway response prose as the decision ledger because GitHub is author
 
 ## Iinvy checks-green boundary
 
-`bin/fm-pr-check.sh` emits the exact-head event automatically after it records a checks-green iinvy PR.
+`bin/fm-pr-check.sh` emits the exact-head event automatically after it records a checks-green iinvy PR, and the watcher's `reconcile` sweep re-registers through that same trigger when a recorded gated PR reaches checks-green only later - after a rebase or sync, a repair or recovery, or a manual coordinator reconciliation.
+Checks-green is decided by local reconciliation or by GitHub's own open-and-CLEAN answer, so a wedged local CI monitor never hides a forge-green PR, and the trigger's `armed:` line confirms only the merge watch, never delivery.
+A `cipher-reconcile` check notification reporting `delivered <request-id> iinvy-pr-ready <task-id>` is that checks-green transition reaching Cipher: treat it as the PR-ready milestone, report the PR to the captain with its full URL if not already reported, and keep the merge with Cipher exactly as below.
 A missing or disabled route, timeout, unavailable gateway, invalid acknowledgement, or delivery failure keeps the merge held.
-Do not invoke the ordinary merge command for either gated repository, even after event delivery succeeds.
+Do not invoke the ordinary merge command for any gated repository, even after event delivery succeeds.
 Cipher alone invokes `bin/fm-cipher-hook.sh merge <id> <PR-url> <request-id>` after its narrow production-outage inspection, and that command still enters the guarded merge helper with an exact-head condition.
 Cipher's inspection is limited to cross-repository provider and consumer contracts, migration or deployment order, runtime install/import/restart behavior, and production-realistic health or smoke gates.
 It does not repeat code review, style review, architecture review, or no-mistakes review.
