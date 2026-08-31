@@ -1096,6 +1096,64 @@ EOF
   pass "reconcile delivers a post-registration checks-green transition once with the fresh exact head"
 }
 
+test_reconcile_hold_leaves_no_stale_announcement() {
+  local dir port request_id out count
+  dir=$(make_case reconcile-hold)
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] held-task - held reconciliation https://github.com/morris2spears/iinvy/issues/21 (kind: ship)
+EOF
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+  stop_server "$(cat "$dir/server.pid")"
+
+  # Registration while the task is red spends no event even with the gateway
+  # already down.
+  set +e
+  prepare_pr_case "$dir" held-task morris2spears/iinvy "$HEAD_A" \
+    'state: working · source: run-step · ci running' >/dev/null 2>&1
+  set -e
+  assert_absent "$dir/state/cipher-hooks" "red registration emitted a Cipher event"
+
+  # The sweep reaches green while the gateway is unavailable: the delivery
+  # holds fail-closed, the sweep stays silent, and it owes no announcement.
+  out=$(FM_TEST_HEAD=$HEAD_A FM_CIPHER_RETRIES=1 FM_CIPHER_RETRY_DELAY_SECS=0 \
+    FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "held reconcile sweep failed"
+  [ -z "$out" ] || fail "a held reconcile delivery was announced: $out"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  [ -n "$request_id" ] || fail "held reconcile did not record the PR-ready request"
+  assert_present "$dir/state/cipher-hooks/holds/$request_id.json" \
+    "held reconcile did not record its durable hold"
+  assert_absent "$dir/state/cipher-hooks/announced/held-task.pending" \
+    "a held reconcile iteration left a stale pending announcement"
+
+  # A repeated sweep against the same held identity is silent and still owes
+  # nothing, so the hold stays with retry-held.
+  out=$(FM_TEST_HEAD=$HEAD_A \
+    FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "repeated held reconcile sweep failed"
+  [ -z "$out" ] || fail "a repeated held reconcile sweep produced output: $out"
+  assert_present "$dir/state/cipher-hooks/holds/$request_id.json" \
+    "repeated held reconcile dropped the transient hold"
+  assert_absent "$dir/state/cipher-hooks/announced/held-task.pending" \
+    "a repeated held reconcile iteration left a stale pending announcement"
+
+  # retry-held owns the recovery and reports the delivery once. The next
+  # reconcile sweep must not announce that same acknowledgement again.
+  start_server "$dir" accepted "$port" >/dev/null
+  out=$(FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" retry-held 2>/dev/null) || fail "retry sweep failed after gateway recovery"
+  [ "$out" = "delivered $request_id iinvy-pr-ready held-task" ] \
+    || fail "recovered retry did not report the delivered outcome: $out"
+  out=$(FM_TEST_HEAD=$HEAD_A \
+    FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "post-recovery reconcile sweep failed"
+  [ -z "$out" ] || fail "reconcile re-announced a retry-held delivery: $out"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "post-recovery sweeps reached the gateway $count times"
+  pass "a held reconcile delivery owes no announcement and is never re-announced after retry-held"
+}
+
 test_watcher_reconciles_post_registration_green() {
   local dir port request_id out wpid i
   dir=$(make_case watcher-reconcile)
@@ -1244,5 +1302,6 @@ test_retry_held_after_gateway_recovery
 test_retry_supersedes_obsolete_holds
 test_watcher_retries_held_delivery
 test_reconcile_delivers_post_registration_green
+test_reconcile_hold_leaves_no_stale_announcement
 test_watcher_reconciles_post_registration_green
 test_forge_green_overrides_wedged_local_monitor

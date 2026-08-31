@@ -261,11 +261,13 @@ EOF
     # be killed by the watcher's check timeout after the acknowledgement is
     # already written, and diffing the acks directory in memory would then
     # leave that PR-ready silently unannounced forever. A task the sweep is
-    # about to register is marked pending first, so an acknowledgement that
-    # appears for a pending task is announced on a later cadence even if the
-    # sweep that produced it never got to print. An acknowledgement the sweep
-    # never registered was already reported by its own registration, so it is
-    # recorded as announced without a wake and steady state stays silent.
+    # about to register is marked pending first and unmarked as soon as that
+    # iteration reaches any outcome of its own, so the marker outlives the
+    # iteration only when the sweep was killed inside the delivery window and
+    # a later cadence still owes the announcement. An acknowledgement the
+    # sweep never registered was already reported by its own registration or
+    # by the retry-held sweep, so it is recorded as announced without a wake
+    # and steady state stays silent.
     marker_path() { # <name>
       case "$1" in
         *[!A-Za-z0-9._-]*|''|.|..) return 1 ;;
@@ -331,14 +333,18 @@ EOF
           continue
         fi
         if [ -n "$RID" ] && [ -f "$HOLDS/$RID.json" ]; then
+          clear_marker "$ID.pending"
           continue
         fi
       fi
       mark_announced "$ID.pending"
       "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL" >/dev/null 2>&1 || true
-      RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || continue
-      [ -f "$ACKS/$RID.json" ] || continue
-      announce_reconciled "$RID" "$ID"
+      RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || RID=
+      if [ -n "$RID" ] && [ -f "$ACKS/$RID.json" ]; then
+        announce_reconciled "$RID" "$ID"
+      else
+        clear_marker "$ID.pending"
+      fi
     done
     exit 0
     ;;
