@@ -296,15 +296,32 @@ EOF
       clear_marker "$id.pending"
       return 0
     }
-    for META in "$STATE"/*.meta; do
-      [ -f "$META" ] && [ ! -L "$META" ] || continue
-      ID=$(basename "$META" .meta)
-      fm_task_id_creation_valid "$ID" || continue
-      URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2-)
-      [ -n "$URL" ] || continue
-      fm_pr_url_parse "$URL" || continue
-      [ "$FM_PR_PROVIDER" = github ] || continue
-      fm_cipher_repo_gated "$FM_PR_PATH" || continue
+    # Markers outlive nothing they describe. A request marker is only ever
+    # written beside a durable acknowledgement, and a pending marker only ever
+    # for a live task, so a marker whose acknowledgement or task metadata is
+    # gone - a rebased head, a torn-down task - is orphaned and pruned here.
+    # Without this the directory grows one permanent entry per gated head.
+    prune_markers() {
+      local file name
+      [ -d "$ANNOUNCED" ] || return 0
+      for file in "$ANNOUNCED"/*; do
+        [ -f "$file" ] || continue
+        name=$(basename "$file")
+        case "$name" in
+          *.pending)
+            [ -f "$STATE/${name%.pending}.meta" ] || rm -f -- "$file" 2>/dev/null || true
+            ;;
+          *)
+            [ -f "$ACKS/$name.json" ] || rm -f -- "$file" 2>/dev/null || true
+            ;;
+        esac
+      done
+      return 0
+    }
+    reconcile_task() { # <task-id> <pr-url>
+      local ID=$1 URL=$2 META="$STATE/$1.meta"
+      local WORKTREE LIVE_HEAD STATE_LINE RECORDED_HEAD RID
+      [ -f "$META" ] && [ ! -L "$META" ] || return 0
       # One forge round-trip answers both questions this sweep asks of a gated
       # pull request - is it green, and where is its head now - inside a check
       # budget shared with every other task in the glob.
@@ -314,7 +331,7 @@ EOF
       STATE_LINE=$(current_state "$ID")
       case "$STATE_LINE" in
         "state: done"*"checks green"*) ;;
-        *) [ "$FM_PR_GITHUB_GREEN" = 1 ] || continue ;;
+        *) [ "$FM_PR_GITHUB_GREEN" = 1 ] || return 0 ;;
       esac
       RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2-)
       RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || RID=
@@ -330,11 +347,11 @@ EOF
           else
             mark_announced "$RID"
           fi
-          continue
+          return 0
         fi
         if [ -n "$RID" ] && [ -f "$HOLDS/$RID.json" ]; then
           clear_marker "$ID.pending"
-          continue
+          return 0
         fi
       fi
       mark_announced "$ID.pending"
@@ -345,7 +362,62 @@ EOF
       else
         clear_marker "$ID.pending"
       fi
+      return 0
+    }
+    # Selecting the gated pull requests costs no forge call, so the whole
+    # inventory is always known; only the per-task forge work is bounded. The
+    # watcher runs this sweep under a check timeout, and an unbounded sweep
+    # killed by it would restart at the same alphabetical head every cadence
+    # and never reach the later tasks - the very class of missed transition
+    # this sweep exists to close. So the sweep resumes where the last one
+    # stopped and takes at most a fixed number of tasks per cadence, and it
+    # records each task as taken before spending the round trip, so even a task
+    # whose own iteration is killed cannot pin the cursor and starve the rest.
+    RECONCILE_IDS=()
+    RECONCILE_URLS=()
+    for META in "$STATE"/*.meta; do
+      [ -f "$META" ] && [ ! -L "$META" ] || continue
+      ID=$(basename "$META" .meta)
+      fm_task_id_creation_valid "$ID" || continue
+      URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2-)
+      [ -n "$URL" ] || continue
+      fm_pr_url_parse "$URL" || continue
+      [ "$FM_PR_PROVIDER" = github ] || continue
+      fm_cipher_repo_gated "$FM_PR_PATH" || continue
+      RECONCILE_IDS+=("$ID")
+      RECONCILE_URLS+=("$URL")
     done
+    TOTAL=${#RECONCILE_IDS[@]}
+    if [ "$TOTAL" -gt 0 ]; then
+      # Sweep bookkeeping, never a Cipher record, so it lives beside the task
+      # state rather than inside the private cipher-hooks record tree, which
+      # exists only once a real event does.
+      CURSOR="$STATE/.cipher-reconcile-cursor"
+      BUDGET=${FM_CIPHER_RECONCILE_BUDGET:-8}
+      case "$BUDGET" in
+        ''|*[!0-9]*|0) BUDGET=8 ;;
+      esac
+      LAST=
+      [ ! -f "$CURSOR" ] || LAST=$(head -1 "$CURSOR" 2>/dev/null) || LAST=
+      START=0
+      INDEX=0
+      while [ "$INDEX" -lt "$TOTAL" ]; do
+        if [ "${RECONCILE_IDS[$INDEX]}" = "$LAST" ]; then
+          START=$(( (INDEX + 1) % TOTAL ))
+          break
+        fi
+        INDEX=$((INDEX + 1))
+      done
+      TAKEN=0
+      while [ "$TAKEN" -lt "$TOTAL" ] && [ "$TAKEN" -lt "$BUDGET" ]; do
+        INDEX=$(( (START + TAKEN) % TOTAL ))
+        TAKEN=$((TAKEN + 1))
+        ID=${RECONCILE_IDS[$INDEX]}
+        (umask 077 && printf '%s\n' "$ID" > "$CURSOR") 2>/dev/null || true
+        reconcile_task "$ID" "${RECONCILE_URLS[$INDEX]}"
+      done
+    fi
+    prune_markers
     exit 0
     ;;
   verify-merge)

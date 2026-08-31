@@ -250,7 +250,7 @@ FM_PR_GITHUB_SNAPSHOT_QUERY='
   | ($checks | map(
       (.status == "COMPLETED" and .conclusion == "SUCCESS")
       or .state == "SUCCESS")) as $passed
-  | [(.state // ""), (.mergeStateStatus // ""), (.headRefOid // "-"),
+  | [(.state // "-"), (.mergeStateStatus // "-"), (.headRefOid // "-"),
      (if ($passed | any) and ($settled | all) then "1" else "0" end)]
   | join(" ")'
 
@@ -283,14 +283,21 @@ EOF
 }
 
 # Best-effort live GitHub head for a task's recorded pull request, read through
-# gh from the recorded task worktree. Prints the validated SHA or nothing, and
-# never fails, so a missing worktree, absent gh, or forge error reads as "head
-# unknown" rather than an error a caller could mistake for state.
+# gh from the recorded task worktree when there still is one and from the
+# ordinary environment when there is not - the pull request URL identifies the
+# repository on its own, and a task whose worktree is already gone still has a
+# head worth recording. Prints the validated SHA or nothing, and never fails,
+# so an absent gh or a forge error reads as "head unknown" rather than an error
+# a caller could mistake for state.
 fm_pr_github_live_head() { # <meta-path> <pr-url>
   local meta=$1 url=$2 wt head
   wt=$(grep '^worktree=' "$meta" | tail -1 | cut -d= -f2-) || true
-  [ -n "$wt" ] && [ -d "$wt" ] && command -v gh >/dev/null 2>&1 || return 0
-  head=$(cd "$wt" && gh pr view "$url" --json headRefOid -q .headRefOid 2>/dev/null) || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    head=$(cd "$wt" && gh pr view "$url" --json headRefOid -q .headRefOid 2>/dev/null) || return 0
+  else
+    head=$(gh pr view "$url" --json headRefOid -q .headRefOid 2>/dev/null) || return 0
+  fi
   fm_pr_head_valid "$head" || return 0
   printf '%s\n' "$head"
 }

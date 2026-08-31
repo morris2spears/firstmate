@@ -1287,6 +1287,58 @@ EOF
   pass "GitHub-side green truth delivers the PR-ready event despite a wedged local CI monitor"
 }
 
+# The gh fake answers the snapshot query's own output shape, so the jq program
+# that decides whether an unverified pull request may spend a merge-boundary
+# event is exercised here directly, against real gh-shaped rollups.
+test_forge_green_query_classifies_check_rollup() {
+  local query verdict rollup expected line fields
+  query=$(bash -uc '. "$1"; printf "%s" "$FM_PR_GITHUB_SNAPSHOT_QUERY"' _ "$ROOT/bin/fm-pr-lib.sh") \
+    || fail "could not read the forge snapshot query"
+  [ -n "$query" ] || fail "the forge snapshot query is empty"
+  snapshot_line() { # <rollup-json>
+    printf '{"state":"OPEN","mergeStateStatus":"CLEAN","headRefOid":"%s","statusCheckRollup":%s}' \
+      "$HEAD_A" "$1" | jq -r "$query"
+  }
+  while IFS='|' read -r rollup expected; do
+    [ -n "$rollup" ] || continue
+    line=$(snapshot_line "$rollup") || fail "the snapshot query failed on rollup: $rollup"
+    fields=$(printf '%s\n' "$line" | awk '{print NF}')
+    [ "$fields" = 4 ] || fail "the snapshot query answered $fields fields for rollup $rollup: $line"
+    verdict=$(printf '%s\n' "$line" | awk '{print $4}')
+    [ "$verdict" = "$expected" ] \
+      || fail "rollup $rollup answered green=$verdict, expected $expected"
+  done <<'EOF'
+null|0
+[]|0
+[{"__typename":"CheckRun","status":"QUEUED"}]|0
+[{"__typename":"CheckRun","status":"IN_PROGRESS"}]|0
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]|0
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"CANCELLED"}]|0
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SKIPPED"}]|0
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"NEUTRAL"}]|0
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]|1
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SKIPPED"}]|1
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","status":"IN_PROGRESS"}]|0
+[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]|0
+[{"__typename":"StatusContext","state":"SUCCESS"}]|1
+[{"__typename":"StatusContext","state":"PENDING"}]|0
+[{"__typename":"StatusContext","state":"FAILURE"}]|0
+[{"__typename":"StatusContext","state":"SUCCESS"},{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]|1
+EOF
+
+  # Every column keeps its place when GitHub answers without a state, a
+  # mergeability, or a head, so a caller never reads one field's value as
+  # another's.
+  line=$(printf '{"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]}' | jq -r "$query") \
+    || fail "the snapshot query failed on a field-less answer"
+  fields=$(printf '%s\n' "$line" | awk '{print NF}')
+  [ "$fields" = 4 ] || fail "a field-less answer collapsed to $fields fields: $line"
+  [ "$(printf '%s\n' "$line" | awk '{print $4}')" = 1 ] \
+    || fail "a field-less answer misplaced the green verdict: $line"
+  pass "the forge snapshot query calls only a genuinely passed check rollup green"
+}
+
+test_forge_green_query_classifies_check_rollup
 test_v2_decision_and_pr_delivery_dedupe
 test_note_keyed_decision_single_hook_and_park
 test_resolve_decision_requires_and_follows_authenticated_answer
