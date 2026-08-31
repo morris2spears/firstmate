@@ -23,9 +23,17 @@
 # identity, while GitHub's exact-head condition prevents a later head from riding
 # an earlier inspection.
 #
+# `retry-held` is the watcher's recovery sweep for transiently held deliveries
+# (gateway unavailable, timeout, transient HTTP). Each still-current held event
+# re-enters its own preflighted trigger path, which adopts the recorded request
+# so the exact body and request ID are retried with no duplicate delivery. It
+# prints one line per delivered or superseded event and nothing while an event
+# simply stays held; configuration-class holds are never auto-retried.
+#
 # Usage:
 #   fm-cipher-hook.sh needs-decision <task-id> [decision-id]
 #   fm-cipher-hook.sh pr-ready <task-id> <pr-url>
+#   fm-cipher-hook.sh retry-held
 #   fm-cipher-hook.sh merge <task-id> <pr-url> <request-id> [-- <extra merge args>]
 #   fm-cipher-hook.sh verify-merge <task-id> <pr-url> <request-id>
 #   fm-cipher-hook.sh repo-gated <owner/repo>
@@ -45,7 +53,7 @@ CREW_STATE_BIN=${FM_CREW_STATE_BIN:-$SCRIPT_DIR/fm-crew-state.sh}
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 
 usage() {
-  sed -n '2,31s/^# \{0,1\}//p' "$0"
+  sed -n '2,39s/^# \{0,1\}//p' "$0"
 }
 
 run_python() {
@@ -128,6 +136,53 @@ case "${1:-}" in
     esac
     run_python deliver iinvy-pr-ready "$ID" "$URL"
     exit $?
+    ;;
+  retry-held)
+    [ "$#" -eq 1 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }
+    [ -d "$STATE/cipher-hooks/holds" ] || exit 0
+    PLAN=$(run_python retry-plan) || exit 1
+    [ -n "$PLAN" ] || exit 0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      case "$line" in
+        superseded\ *)
+          printf '%s\n' "$line"
+          continue
+          ;;
+        retry\ *) ;;
+        *) continue ;;
+      esac
+      read -r _ REQUEST_ID KIND ID ARGUMENT <<<"$line"
+      [ -n "${ARGUMENT:-}" ] || continue
+      STATE_LINE=$(current_state "$ID")
+      case "$KIND" in
+        needs-decision)
+          case "$STATE_LINE" in
+            "state: parked"*) DECISION_CURRENT=1 ;;
+            *) DECISION_CURRENT=0 ;;
+          esac
+          if [ "$DECISION_CURRENT" -eq 1 ] && decision_is_open "$ID" "$ARGUMENT"; then
+            if FM_CIPHER_RETRIES=1 run_python deliver needs-decision "$ID" "$ARGUMENT"; then
+              printf 'delivered %s needs-decision %s\n' "$REQUEST_ID" "$ID"
+            fi
+          elif run_python supersede "$REQUEST_ID" decision-closed; then
+            printf 'superseded %s (decision-closed)\n' "$REQUEST_ID"
+          fi
+          ;;
+        iinvy-pr-ready)
+          case "$STATE_LINE" in
+            "state: done"*"checks green"*)
+              if FM_CIPHER_RETRIES=1 run_python deliver iinvy-pr-ready "$ID" "$ARGUMENT"; then
+                printf 'delivered %s iinvy-pr-ready %s\n' "$REQUEST_ID" "$ID"
+              fi
+              ;;
+          esac
+          ;;
+      esac
+    done <<EOF
+$PLAN
+EOF
+    exit 0
     ;;
   verify-merge)
     [ "$#" -eq 4 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }

@@ -1,8 +1,8 @@
 ---
 name: cipher-hook
 description: >-
-  Agent-only playbook for a genuine needs-decision transition, an iinvy checks-green transition, or an authenticated cipher-comment check notification.
-  It owns the Cipher authority split, durable GitHub answer fetch, iinvy merge hold, and local receive command that avoids primary-pane ambiguity.
+  Agent-only playbook for a genuine needs-decision transition, an iinvy checks-green transition, or an authenticated cipher-comment or cipher-retry check notification.
+  It owns the Cipher authority split, durable GitHub answer fetch, iinvy merge hold, held-delivery retry outcomes, and local receive command that avoids primary-pane ambiguity.
 user-invocable: false
 metadata:
   internal: true
@@ -10,7 +10,7 @@ metadata:
 
 # Cipher hook
 
-Load this after current-state reconciliation proves a genuine `needs-decision`, when a checks-green pull request belongs to `morris2spears/iinvy` or `morris2spears/iinvy-storefront`, or on a `cipher-comment` check notification.
+Load this after current-state reconciliation proves a genuine `needs-decision`, when a checks-green pull request belongs to `morris2spears/iinvy` or `morris2spears/iinvy-storefront`, or on a `cipher-comment` or `cipher-retry` check notification.
 The local setup and wire schema are owned by [`docs/configuration.md`](../../../docs/configuration.md#cipherhermes-bridge), while the command contracts are owned by the headers of [`bin/fm-cipher-hook.sh`](../../../bin/fm-cipher-hook.sh) and [`bin/fm-cipher-receive.sh`](../../../bin/fm-cipher-receive.sh).
 
 ## Genuine needs-decision
@@ -46,6 +46,13 @@ The post-merge deployment and health verification plus durable-link Discord rece
 An authenticated `cipher-comment pr-blocker ...` notification points to Cipher's exact production-outage evidence on the owning GitHub issue or PR.
 Fetch that comment with `gh-axi`, relay the outcome in captain-facing language when needed, and return the evidence to the task's own worker through the existing fix path.
 Do not merge until the blocker is resolved, checks are green again, and a new exact-head event is emitted.
+
+## Automatic retry of held deliveries
+
+A delivery held for a transient gateway failure (unavailable, timeout, transient HTTP) is retried automatically by live monitoring on its slow check cadence, with the same recorded body and request ID, so gateway recovery needs no manual record edits or re-triggering.
+A `cipher-retry` check notification reports only the outcomes: `delivered <request-id> <event> <task-id>` means the previously held event has now reached Cipher, so resume the normal post-delivery behavior for that event and update the captain if the outage was previously reported.
+`superseded <request-id> (<why>)` means the held event became obsolete before delivery - the decision was answered through the existing authority, the PR head advanced so a fresh exact-head event owns the transition, or the task's records are gone - and it will never be delivered; no action is needed beyond noting it.
+A hold for a configuration-class failure (missing or invalid route configuration, bad secret, non-transient HTTP rejection, invalid acknowledgement) is deliberately never auto-retried: surface the concrete blocker, and after the captain repairs it re-run the original trigger command, which adopts the recorded request and retries the exact same event.
 
 ## Pane-independent return path
 
