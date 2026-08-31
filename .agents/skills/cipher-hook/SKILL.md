@@ -1,7 +1,7 @@
 ---
 name: cipher-hook
 description: >-
-  Agent-only playbook for a genuine needs-decision transition, an iinvy checks-green transition, or an authenticated cipher-comment or cipher-retry check notification.
+  Agent-only playbook for a genuine needs-decision transition, an iinvy checks-green transition, an authenticated cipher-comment notification, or a cipher-retry check notification.
   It owns the Cipher authority split, durable GitHub answer fetch, iinvy merge hold, held-delivery retry outcomes, and local receive command that avoids primary-pane ambiguity.
 user-invocable: false
 metadata:
