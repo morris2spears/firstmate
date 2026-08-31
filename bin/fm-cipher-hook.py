@@ -50,6 +50,8 @@ COMMENT_RE = re.compile(
     r"([A-Za-z0-9._-]{1,100})/(?:issues|pull)/[1-9][0-9]*#issuecomment-[1-9][0-9]*$"
 )
 TRANSIENT_HTTP = frozenset({408, 425, 429})
+SUPERSEDED_PREFIX = "superseded-"
+SUPERSEDE_REASON_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 MAX_BODY = 4096
 MAX_RESPONSE = 4096
 MAX_META = 65536
@@ -549,6 +551,32 @@ def load_config(kind: str) -> dict[str, Any]:
     }
 
 
+def transient_hold_reason(reason: str) -> bool:
+    """True only for delivery failures expected to clear on gateway recovery."""
+    if reason in {"unavailable", "timeout"}:
+        return True
+    match = re.fullmatch(r"http-([1-9][0-9]{2})", reason)
+    if not match:
+        return False
+    code = int(match.group(1))
+    return code in TRANSIENT_HTTP or 500 <= code <= 599
+
+
+def read_hold(dirs: dict[str, Path], request_id: str) -> dict[str, Any] | None:
+    record = read_json_record(dirs["holds"] / f"{request_id}.json")
+    if record is None:
+        return None
+    if (
+        set(record) != {"schema", "request_id", "event_type", "reason"}
+        or record.get("schema") != HOLD_SCHEMA
+        or record.get("request_id") != request_id
+        or record.get("event_type") not in {"needs-decision", "iinvy-pr-ready"}
+        or not isinstance(record.get("reason"), str)
+    ):
+        raise HookError("state-record-invalid")
+    return record
+
+
 def diagnostic_message(reason: str) -> str:
     messages = {
         "configuration-missing": "local Cipher route configuration is missing",
@@ -568,6 +596,8 @@ def diagnostic_message(reason: str) -> str:
         "repository-mismatch": "the task repository does not match its pull request",
         "pr-metadata-mismatch": "the pull request does not match task metadata",
     }
+    if reason.startswith(SUPERSEDED_PREFIX):
+        return f"the held event was superseded ({reason.removeprefix(SUPERSEDED_PREFIX)})"
     if reason.startswith("http-"):
         return f"the local Cipher gateway rejected delivery ({reason})"
     return messages.get(reason, f"Cipher delivery is held ({reason})")
@@ -842,6 +872,67 @@ def deliver(kind: str, task_id: str, argument: str | None) -> int:
     return 1
 
 
+def retry_plan() -> int:
+    """Plan supervision retries for transiently held deliveries.
+
+    A transient hold whose recorded event still matches the task's current
+    identity prints one "retry" line for the shell entrypoint to redeliver
+    through the ordinary preflighted trigger path, which adopts the recorded
+    request so the exact body and request ID are retried. A transient hold
+    whose task records are gone or whose identity has been replaced by a newer
+    event is durably marked superseded instead and never retried again.
+    Non-transient holds and unreadable records are left untouched.
+    """
+    dirs = record_dirs()
+    for path in sorted(dirs["holds"].glob("*.json")):
+        request_id = path.name.removesuffix(".json")
+        if not REQUEST_RE.fullmatch(request_id):
+            continue
+        try:
+            hold = read_hold(dirs, request_id)
+            if hold is None or not transient_hold_reason(hold["reason"]):
+                continue
+            request = read_json_record(dirs["requests"] / f"{request_id}.json")
+            if request is None:
+                continue
+            validate_payload(request)
+            if request["request_id"] != request_id:
+                continue
+        except HookError:
+            continue
+        kind = request["event_type"]
+        argument = request["decision_id"] if kind == "needs-decision" else request["pr_url"]
+        if argument is None:
+            continue
+        try:
+            current = identity_for_event(kind, request["task_id"], argument)
+        except HookError as exc:
+            write_hold(dirs, request, SUPERSEDED_PREFIX + exc.reason)
+            print(f"superseded {request_id} ({exc.reason})")
+            continue
+        if current["request_id"] != request_id:
+            write_hold(dirs, request, SUPERSEDED_PREFIX + "identity-advanced")
+            print(f"superseded {request_id} (identity-advanced)")
+            continue
+        print(f"retry {request_id} {kind} {request['task_id']} {argument}")
+    return 0
+
+
+def supersede(request_id: str, why: str) -> None:
+    if not REQUEST_RE.fullmatch(request_id):
+        raise HookError("invalid-request-id", usage=True)
+    if not SUPERSEDE_REASON_RE.fullmatch(why):
+        raise HookError("invalid-supersede-reason", usage=True)
+    dirs = record_dirs()
+    hold = read_hold(dirs, request_id)
+    if hold is None:
+        raise HookError("hold-record-missing")
+    if not transient_hold_reason(hold["reason"]):
+        raise HookError("hold-not-transient")
+    marker = {"request_id": request_id, "event_type": hold["event_type"]}
+    write_hold(dirs, marker, SUPERSEDED_PREFIX + why)
+
+
 def validated_request_record(dirs: dict[str, Path], request_id: str) -> dict[str, Any]:
     if not REQUEST_RE.fullmatch(request_id):
         raise HookError("invalid-request-id", usage=True)
@@ -949,6 +1040,8 @@ def main(argv: list[str]) -> int:
         print(
             "usage: fm-cipher-hook.py repo-gated <owner/repo> | "
             "deliver <needs-decision|iinvy-pr-ready> <task-id> [decision-id|pr-url] | "
+            "retry-plan | "
+            "supersede <request-id> <reason> | "
             "verify-merge <task-id> <pr-url> <request-id> | "
             "prepare-receive <kind> <task-id> <request-id> <comment-url> | "
             "commit-receive <kind> <task-id> <request-id> <comment-url> | "
@@ -967,6 +1060,11 @@ def main(argv: list[str]) -> int:
             kind = argv[1]
             argument = argv[3] if len(argv) == 4 else None
             return deliver(kind, argv[2], argument)
+        if command == "retry-plan" and len(argv) == 1:
+            return retry_plan()
+        if command == "supersede" and len(argv) == 3:
+            supersede(argv[1], argv[2])
+            return 0
         if command == "verify-merge" and len(argv) == 4:
             print(verify_merge(argv[1], argv[2], argv[3]))
             return 0

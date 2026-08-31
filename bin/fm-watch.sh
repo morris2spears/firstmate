@@ -805,6 +805,22 @@ while :; do
       touch "$STATE/.last-check"
       wake "$reason"
     fi
+    # Transiently held Cipher deliveries (the gateway was down or timing out at
+    # trigger time) retry on this same slow cadence through the trusted
+    # repository entrypoint; it prints only delivered or superseded outcomes,
+    # so a still-unavailable gateway stays silent and costs one local attempt.
+    for cipher_hold in "$STATE"/cipher-hooks/holds/*.json; do
+      [ -e "$cipher_hold" ] || continue
+      run_check_capture "$SCRIPT_DIR/fm-cipher-hook.sh" retry-held || exit 1
+      out=$FM_CHECK_RESULT
+      if [ -n "$out" ]; then
+        reason="check: cipher-retry: $out"
+        fm_wake_append check cipher-retry "$reason" || exit 1
+        touch "$STATE/.last-check"
+        wake "$reason"
+      fi
+      break
+    done
     touch "$STATE/.last-check"
   fi
 

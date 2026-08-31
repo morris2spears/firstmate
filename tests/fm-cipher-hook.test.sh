@@ -32,11 +32,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-start_server() { # <dir> <mode>
-  local dir=$1 mode=$2 port_file="$1/server.port" log="$1/server.log" pid i
+start_server() { # <dir> <mode> [fixed-port]
+  local dir=$1 mode=$2 fixed_port=${3:-0} port_file="$1/server.port" log="$1/server.log" pid i
   : > "$log"
   rm -f "$port_file"
-  python3 - "$port_file" "$log" "$dir/config/cipher-hooks.secret" "$mode" >/dev/null 2>&1 <<'PY' &
+  python3 - "$port_file" "$log" "$dir/config/cipher-hooks.secret" "$mode" "$fixed_port" >/dev/null 2>&1 <<'PY' &
 import hashlib
 import hmac
 import http.server
@@ -44,7 +44,7 @@ import json
 import sys
 import time
 
-port_file, log_path, secret_path, mode = sys.argv[1:]
+port_file, log_path, secret_path, mode, fixed_port = sys.argv[1:]
 secret = open(secret_path, "rb").read().decode("ascii").strip().encode("ascii")
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -105,7 +105,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+server = http.server.ThreadingHTTPServer(("127.0.0.1", int(fixed_port)), Handler)
 with open(port_file, "w", encoding="ascii") as handle:
     handle.write(str(server.server_port))
 server.serve_forever()
@@ -642,6 +642,188 @@ EOF
   pass "authenticated receive routes by task identity when a self-repo worker pane is present"
 }
 
+prepare_retry_pr_hold() { # <dir> <id> <port>
+  local dir=$1 id=$2 port=$3 rc
+  write_config "$dir" "$port" enabled enabled
+  fm_write_meta "$dir/state/$id.meta" \
+    "window=fm-$id" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" "mode=no-mistakes" \
+    "pr=https://github.com/morris2spears/iinvy/pull/21" "pr_head=$HEAD_A"
+  printf 'done: PR https://github.com/morris2spears/iinvy/pull/21 checks green\n' > "$dir/state/$id.status"
+  cat >> "$dir/data/backlog.md" <<EOF
+- [ ] $id - recovery https://github.com/morris2spears/iinvy/issues/16 (kind: ship)
+EOF
+  set +e
+  FM_CIPHER_RETRIES=1 FM_CIPHER_RETRY_DELAY_SECS=0 \
+  FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" pr-ready "$id" https://github.com/morris2spears/iinvy/pull/21 \
+    > "$dir/$id.trigger.out" 2> "$dir/$id.trigger.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unavailable gateway must hold the $id trigger"
+}
+
+test_retry_held_after_gateway_recovery() {
+  local dir port request_id out count
+  dir=$(make_case retry)
+  : > "$dir/data/backlog.md"
+  port=$(start_server "$dir" accepted)
+  stop_server "$(cat "$dir/server.pid")"
+  prepare_retry_pr_hold "$dir" retry-task "$port"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  [ -n "$request_id" ] || fail "held request record missing"
+  jq -e 'select(.reason == "unavailable")' \
+    "$dir/state/cipher-hooks/holds/$request_id.json" >/dev/null \
+    || fail "trigger did not record the transient unavailable hold"
+
+  # The gateway is still down: the sweep stays silent and the hold survives.
+  out=$(FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" retry-held 2> "$dir/retry-down.err") \
+    || fail "retry sweep failed while the gateway was still down"
+  [ -z "$out" ] || fail "a still-unavailable gateway produced sweep output: $out"
+  assert_present "$dir/state/cipher-hooks/holds/$request_id.json" \
+    "silent sweep dropped the transient hold"
+
+  # Gateway recovery on the same configured endpoint.
+  start_server "$dir" accepted "$port" >/dev/null
+  out=$(FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" retry-held 2> "$dir/retry-up.err") \
+    || fail "retry sweep failed after gateway recovery"
+  [ "$out" = "delivered $request_id iinvy-pr-ready retry-task" ] \
+    || fail "recovered gateway did not report the delivered outcome: $out"
+  jq -e --arg id "$request_id" \
+    'select(.request_id == $id and .body.request_id == $id and .v2_valid and .timestamp_fresh and (.v1_present | not))' \
+    "$dir/server.log" >/dev/null \
+    || fail "retried delivery did not resend the exact recorded request with fresh HMAC V2"
+  jq -e 'select(.http_status == 202)' "$dir/state/cipher-hooks/acks/$request_id.json" >/dev/null \
+    || fail "retried delivery did not record its durable acknowledgement"
+  assert_absent "$dir/state/cipher-hooks/holds/$request_id.json" "acknowledged retry left its hold behind"
+  assert_absent "$dir/state/cipher-hooks/diagnostics/$request_id" "acknowledged retry left its diagnostic behind"
+
+  # A second sweep after acknowledgement is silent and sends nothing.
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "recovery retry delivered $count times"
+  out=$(FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" retry-held 2>/dev/null) || fail "post-acknowledgement sweep failed"
+  [ -z "$out" ] || fail "acknowledged event re-entered the retry sweep: $out"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "acknowledged event was delivered again"
+  ! grep -R -F "$SECRET" "$dir/state" "$dir/retry-down.err" "$dir/retry-up.err" >/dev/null \
+    || fail "HMAC secret leaked into retry state or output"
+  pass "a transiently held event is retried and acknowledged once after gateway recovery"
+}
+
+test_retry_supersedes_obsolete_holds() {
+  local dir port request_id decision_id out
+  dir=$(make_case supersede)
+  : > "$dir/data/backlog.md"
+  port=$(start_server "$dir" accepted)
+  stop_server "$(cat "$dir/server.pid")"
+  prepare_retry_pr_hold "$dir" stale-head-task "$port"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+
+  fm_write_meta "$dir/state/gone-task.meta" \
+    "window=fm-gone-task" "worktree=$dir/wt" "project=$dir/wt" "kind=ship"
+  printf 'needs-decision [key=net]: choose network\n' > "$dir/state/gone-task.status"
+  cat >> "$dir/data/backlog.md" <<'EOF'
+- [ ] gone-task - network https://github.com/example/project/issues/16 (kind: ship)
+EOF
+  set +e
+  FM_CIPHER_RETRIES=1 FM_CIPHER_RETRY_DELAY_SECS=0 \
+  FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" needs-decision gone-task net >/dev/null 2>&1
+  set -e
+  decision_id=$(request_id_for_kind "$dir" needs-decision)
+  [ -n "$decision_id" ] || fail "held decision request record missing"
+
+  # The PR head advanced while the gateway was down: a fresh exact-head event
+  # owns the transition, so the old held event is durably superseded.
+  perl -0pi -e "s/pr_head=$HEAD_A/pr_head=$HEAD_B/" "$dir/state/stale-head-task.meta"
+  out=$(FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" retry-held 2>/dev/null) || fail "supersede sweep failed"
+  case "$out" in
+    *"superseded $request_id (identity-advanced)"*) ;;
+    *) fail "advanced head hold was not superseded: $out" ;;
+  esac
+  jq -e 'select(.reason == "superseded-identity-advanced")' \
+    "$dir/state/cipher-hooks/holds/$request_id.json" >/dev/null \
+    || fail "advanced head hold did not record its superseded reason"
+
+  # The decision was answered through the existing authority while held.
+  case "$out" in
+    *"superseded $decision_id"*) fail "an open held decision was superseded early" ;;
+  esac
+  printf 'resolved [key=net]: answered by captain\n' >> "$dir/state/gone-task.status"
+  out=$(FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" retry-held 2>/dev/null) || fail "decision supersede sweep failed"
+  [ "$out" = "superseded $decision_id (decision-closed)" ] \
+    || fail "closed decision hold was not superseded: $out"
+  jq -e 'select(.reason == "superseded-decision-closed")' \
+    "$dir/state/cipher-hooks/holds/$decision_id.json" >/dev/null \
+    || fail "closed decision hold did not record its superseded reason"
+
+  # Superseded holds are non-transient: later sweeps stay silent and send nothing.
+  out=$(FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" retry-held 2>/dev/null) || fail "post-supersede sweep failed"
+  [ -z "$out" ] || fail "superseded holds re-entered the retry sweep: $out"
+  [ ! -s "$dir/server.log" ] || fail "a superseded hold reached the gateway"
+
+  # A retired task's records supersede a fresh transient hold too.
+  prepare_retry_pr_hold "$dir" retired-task "$port"
+  rm -f "$dir/state/retired-task.meta"
+  out=$(FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" retry-held 2>/dev/null) || fail "retired-task sweep failed"
+  case "$out" in
+    *"superseded "*"(file-missing)"*) ;;
+    *) fail "retired task hold was not superseded: $out" ;;
+  esac
+  pass "obsolete transient holds are durably superseded instead of retried"
+}
+
+test_watcher_retries_held_delivery() {
+  local dir port request_id out wpid i
+  dir=$(make_case watcher-retry)
+  : > "$dir/data/backlog.md"
+  port=$(start_server "$dir" accepted)
+  stop_server "$(cat "$dir/server.pid")"
+  prepare_retry_pr_hold "$dir" watch-task "$port"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  start_server "$dir" accepted "$port" >/dev/null
+
+  out="$dir/watch.out"
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_HOME="$dir" \
+  FM_STATE_OVERRIDE="$dir/state" \
+  FM_DATA_OVERRIDE="$dir/data" \
+  FM_CONFIG_OVERRIDE="$dir/config" \
+  FM_CREW_STATE_BIN="$dir/fakebin/fm-crew-state" \
+  FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+  FM_CIPHER_RETRIES=1 FM_CIPHER_RETRY_DELAY_SECS=0 \
+  FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 FM_HEARTBEAT=999999 \
+  PATH="$dir/fakebin:$PATH" \
+    "$ROOT/bin/fm-watch.sh" > "$out" 2> "$dir/watch.err" &
+  wpid=$!
+  i=0
+  while kill -0 "$wpid" 2>/dev/null && [ "$i" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$wpid" 2>/dev/null; then
+    kill "$wpid" 2>/dev/null || true
+    wait "$wpid" 2>/dev/null || true
+    fail "watcher did not exit on the cipher retry wake"
+  fi
+  wait "$wpid" 2>/dev/null || true
+  assert_grep "check: cipher-retry: delivered $request_id iinvy-pr-ready watch-task" "$out" \
+    "watcher did not surface the delivered retry outcome"
+  assert_grep "cipher-retry" "$dir/state/.wake-queue" \
+    "watcher did not queue the durable cipher retry wake"
+  assert_present "$dir/state/cipher-hooks/acks/$request_id.json" \
+    "watcher retry did not record the durable acknowledgement"
+  assert_absent "$dir/state/cipher-hooks/holds/$request_id.json" \
+    "watcher retry left the transient hold behind"
+  pass "normal supervision retries a held delivery after gateway recovery and wakes firstmate once"
+}
+
 test_v2_decision_and_pr_delivery_dedupe
 test_legacy_v1_is_explicit_test_only
 test_real_duplicate_response_is_accepted_exactly
@@ -650,3 +832,6 @@ test_timeout_is_durable_hold
 test_pr_check_allowlist_and_safe_holds
 test_iinvy_merge_requires_cipher_actor_and_exact_head
 test_receive_api_ignores_self_repo_worker_pane
+test_retry_held_after_gateway_recovery
+test_retry_supersedes_obsolete_holds
+test_watcher_retries_held_delivery
