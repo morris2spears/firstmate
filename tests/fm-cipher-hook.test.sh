@@ -137,12 +137,19 @@ make_case() { # <name>
 [ -z "${FM_TEST_CREW_STATE_MARKER:-}" ] || : > "$FM_TEST_CREW_STATE_MARKER"
 printf '%s\n' "${FM_TEST_CREW_STATE:-state: unknown · source: none}"
 SH
+  # The forge snapshot query resolves state, mergeability, head, and the check
+  # rollup verdict in gh's own jq, so the fake answers with that one line:
+  # "<state> <mergeStateStatus> <head> <passed-rollup>". A pull request with no
+  # check run of its own is the default, and is never green.
   cat > "$dir/fakebin/gh" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
   "pr view")
     case "$*" in
-      *mergeStateStatus*) printf '%s\n' "${FM_TEST_FORGE_GREEN:-}" ;;
+      *statusCheckRollup*)
+        printf '%s %s %s\n' "${FM_TEST_FORGE_GREEN:-CLOSED BLOCKED}" \
+          "${FM_TEST_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+          "${FM_TEST_FORGE_CHECKS:-0}" ;;
       *) printf '%s\n' "${FM_TEST_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
     esac
     ;;
@@ -1056,6 +1063,22 @@ EOF
   count=$(wc -l < "$dir/server.log" | tr -d ' ')
   [ "$count" = 1 ] || fail "duplicate reconcile reached the gateway"
 
+  # An announcement is durable, not in-process. A sweep killed by the watcher's
+  # check timeout after the acknowledgement landed leaves the announcement
+  # owed; the next sweep still reports it rather than losing the wake forever,
+  # and reports it without spending a second gateway delivery.
+  rm -f "$dir/state/cipher-hooks/announced/$request_id"
+  : > "$dir/state/cipher-hooks/announced/sync-task.pending"
+  out=$(FM_TEST_HEAD=$HEAD_B \
+    FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "interrupted-announcement sweep failed"
+  [ "$out" = "delivered $request_id iinvy-pr-ready sync-task" ] \
+    || fail "an interrupted announcement was lost instead of reported: $out"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "recovered announcement reached the gateway again"
+  assert_absent "$dir/state/cipher-hooks/announced/sync-task.pending" \
+    "recovered announcement left its pending marker behind"
+
   # A further head advance while still green emits exactly one fresh
   # exact-head event under a new request identity.
   out=$(FM_TEST_HEAD=$head_c \
@@ -1150,9 +1173,26 @@ EOF
     "registration did not arm the merge poll"
   assert_absent "$dir/state/cipher-hooks" "an armed poll was mistaken for a delivery"
 
+  # GitHub answers open and CLEAN for a pull request that has no check run of
+  # its own - CI has not started, or the repository requires no checks. That is
+  # mergeability, never proof that anything was verified, so the sweep must not
+  # treat it as checks-green truth.
+  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' \
+    FM_TEST_CREW_STATE='state: working · source: run-step · validating (running)' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "checkless reconcile sweep failed"
+  [ -z "$out" ] || fail "a pull request with no checks was reported delivered: $out"
+  assert_absent "$dir/state/cipher-hooks" "a pull request with no checks spent a Cipher event"
+
+  # A rollup whose only check is still running is equally not green.
+  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' FM_TEST_FORGE_CHECKS=0 \
+    FM_TEST_CREW_STATE='state: working · source: run-step · validating (running)' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "pending-check reconcile sweep failed"
+  [ -z "$out" ] || fail "a pending check rollup was reported delivered: $out"
+  assert_absent "$dir/state/cipher-hooks" "a pending check rollup spent a Cipher event"
+
   # GitHub reaches green/CLEAN while the pipeline's own CI monitor stays
   # silently wedged in a validating state: forge-side truth delivers anyway.
-  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' \
+  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' FM_TEST_FORGE_CHECKS=1 \
     FM_TEST_CREW_STATE='state: working · source: run-step · validating (running)' \
     run_hook "$dir" reconcile 2> "$dir/reconcile.err") || fail "forge-green reconcile sweep failed"
   request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
@@ -1165,7 +1205,7 @@ EOF
   [ "$count" = 1 ] || fail "forge-green reconcile delivered $count times"
 
   # Repeating the sweep with the monitor still wedged does not redeliver.
-  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' \
+  out=$(FM_TEST_HEAD=$HEAD_A FM_TEST_FORGE_GREEN='OPEN CLEAN' FM_TEST_FORGE_CHECKS=1 \
     FM_TEST_CREW_STATE='state: working · source: run-step · validating (running)' \
     run_hook "$dir" reconcile 2>/dev/null) || fail "repeated forge-green sweep failed"
   [ -z "$out" ] || fail "repeated forge-green sweep redelivered: $out"
@@ -1175,7 +1215,7 @@ EOF
   # When GitHub is already green at registration time, the registration-time
   # trigger itself delivers despite the wedged local monitor.
   set +e
-  FM_TEST_FORGE_GREEN='OPEN CLEAN' \
+  FM_TEST_FORGE_GREEN='OPEN CLEAN' FM_TEST_FORGE_CHECKS=1 \
     prepare_pr_case "$dir" wedged-at-arm-task morris2spears/iinvy "$HEAD_B" \
     'state: working · source: run-step · validating (running)' \
     > "$dir/register2.out" 2> "$dir/register2.err"

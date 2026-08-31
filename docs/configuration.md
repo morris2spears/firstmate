@@ -35,7 +35,7 @@ This preference is local to each Firstmate home and is not part of secondmate in
 
 ## Cipher/Hermes bridge
 
-The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the two canonical iinvy repositories.
+The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the gated iinvy repositories listed in [`bin/fm-cipher-hook-repositories`](../bin/fm-cipher-hook-repositories).
 Gated membership is decided by the literal case-insensitive `FM_CIPHER_GATED_REPOSITORIES` list in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh), which needs no file or configuration read, and `bin/fm-cipher-hook-repositories` carries the same list for the Python payload owner with a test holding the two in step.
 It is not a generic notification channel, does not copy Firstmate supervision state, and never sends worker prose.
 GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow iinvy production-outage inspection and merge action.
@@ -73,7 +73,7 @@ A first delivery succeeds only on HTTP 202 with exactly `{"status":"accepted","r
 An idempotent retry succeeds only on HTTP 200 with exactly `{"status":"duplicate","delivery_id":"<same-request-id>"}` and no additional fields.
 Every other HTTP status or response shape is invalid and holds the event.
 
-`bin/fm-cipher-hook.sh` validates genuine current state before delivery - reconciled local state, or for the PR-ready event GitHub's own open-and-CLEAN answer - and `bin/fm-cipher-hook.py` owns the payload, HMAC, retry, response, and private-record mechanics.
+`bin/fm-cipher-hook.sh` validates genuine current state before delivery - reconciled local state, or for the PR-ready event GitHub's own answer that the pull request is open, CLEAN, and carries a passed check rollup - and `bin/fm-cipher-hook.py` owns the payload, HMAC, retry, response, and private-record mechanics.
 Requests are written before network delivery under mode-0700 `state/cipher-hooks/`, with separate mode-0600 request, sent, acknowledgement, hold, diagnostic, and authenticated-return records.
 An acknowledged logical event is not sent again after restart, while a transiently held event retries the same exact body and request ID with a fresh V2 timestamp.
 Timeouts, connection failures, transient HTTP failures, authentication failures, malformed responses, unsafe local files, and schema failures never print a response body or secret.
@@ -87,7 +87,8 @@ Configuration-class holds - a missing or invalid route configuration, a bad secr
 
 Checks-green reconciliation is likewise automatic and durable rather than agent-driven.
 On the same slow check cadence, the watcher runs `bin/fm-cipher-hook.sh reconcile`, which re-registers every recorded gated pull request that is currently checks-green through `bin/fm-pr-check.sh`, the one canonical trigger that refreshes the exact head and re-enters the idempotent PR-ready path.
-Checks-green itself is decided by local current-state reconciliation or by GitHub's own open-and-CLEAN answer, whichever reports it first, so a wedged or stale local CI monitor cannot silently keep a forge-green pull request from ever emitting its event.
+Checks-green itself is decided by local current-state reconciliation or by GitHub's own answer, whichever reports it first, so a wedged or stale local CI monitor cannot silently keep a forge-green pull request from ever emitting its event.
+The forge answer is deliberately strict: the pull request must be open and CLEAN and its own check rollup must carry at least one passed check with nothing still running or unsuccessful, because GitHub reports CLEAN for a pull request that has no checks at all - before CI registers its first run, and permanently in a repository that requires none - and such a pull request has verified nothing.
 A green transition reached only after registration - a rebase or sync onto the current default branch, a repair or recovery, or a manual coordinator reconciliation run directly in the task's local copy - therefore still emits its exact-head event even though the registration-time trigger saw the pull request before it was green.
 The sweep wakes Firstmate with a `cipher-reconcile` check notification only when a new event is acknowledged; a task that is not green, an identity that is already acknowledged, and a held identity awaiting retry or configuration repair all stay silent, so repeated reconciliation never redelivers.
 

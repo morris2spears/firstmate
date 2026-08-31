@@ -93,8 +93,11 @@ current_state() { # <task-id>
 
 # Checks-green means local reconciliation reports it OR the forge itself does.
 # Local run-step state is the cheap primary read, but it can under-report while
-# the pipeline's own CI monitor is wedged or stale, so GitHub's open-and-CLEAN
-# answer is accepted as equal truth before an event is refused or skipped.
+# the pipeline's own CI monitor is wedged or stale, so GitHub's own answer is
+# accepted as equal truth before an event is refused or skipped. That forge
+# answer is deliberately strict - open, CLEAN, and a check rollup carrying a
+# real passed check - so a pull request whose CI has not run cannot pass as
+# green here (see fm_pr_github_snapshot in bin/fm-pr-lib.sh).
 pr_checks_green_now() { # <current-state-line> <pr-url>
   case "$1" in
     "state: done"*"checks green"*) return 0 ;;
@@ -245,6 +248,52 @@ EOF
     [ "$#" -eq 1 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }
     ACKS="$STATE/cipher-hooks/acks"
     HOLDS="$STATE/cipher-hooks/holds"
+    ANNOUNCED="$STATE/cipher-hooks/announced"
+    # The sweep runs on the watcher's own cadence, so bin/fm-pr-check.sh is
+    # invoked here by a descendant of the watcher rather than by an agent or
+    # coordinator. Its migration takes watcher exclusion by terminating the
+    # live watcher, which would be this process's own ancestor, so the
+    # watcher-internal path asks the migration to defer instead. An un-migrated
+    # home simply reconciles on a later cadence, after a coordinator-run
+    # bin/fm-pr-check.sh has crossed that boundary safely.
+    export FM_PR_CHECK_MIGRATION_DEFER=1
+    # An announcement is durable, not in-process: the check that prints it can
+    # be killed by the watcher's check timeout after the acknowledgement is
+    # already written, and diffing the acks directory in memory would then
+    # leave that PR-ready silently unannounced forever. A task the sweep is
+    # about to register is marked pending first, so an acknowledgement that
+    # appears for a pending task is announced on a later cadence even if the
+    # sweep that produced it never got to print. An acknowledgement the sweep
+    # never registered was already reported by its own registration, so it is
+    # recorded as announced without a wake and steady state stays silent.
+    marker_path() { # <name>
+      case "$1" in
+        *[!A-Za-z0-9._-]*|''|.|..) return 1 ;;
+      esac
+      printf '%s/%s\n' "$ANNOUNCED" "$1"
+    }
+    mark_announced() { # <name>
+      local file
+      file=$(marker_path "$1") || return 0
+      (umask 077 && mkdir -p "$ANNOUNCED" && : > "$file") 2>/dev/null || true
+      return 0
+    }
+    clear_marker() { # <name>
+      local file
+      file=$(marker_path "$1") || return 0
+      rm -f -- "$file" 2>/dev/null || true
+      return 0
+    }
+    announce_reconciled() { # <request-id> <task-id>
+      local rid=$1 id=$2 file
+      file=$(marker_path "$rid") || { clear_marker "$id.pending"; return 0; }
+      if [ ! -f "$file" ]; then
+        printf 'delivered %s iinvy-pr-ready %s\n' "$rid" "$id"
+        mark_announced "$rid"
+      fi
+      clear_marker "$id.pending"
+      return 0
+    }
     for META in "$STATE"/*.meta; do
       [ -f "$META" ] && [ ! -L "$META" ] || continue
       ID=$(basename "$META" .meta)
@@ -254,28 +303,42 @@ EOF
       fm_pr_url_parse "$URL" || continue
       [ "$FM_PR_PROVIDER" = github ] || continue
       fm_cipher_repo_gated "$FM_PR_PATH" || continue
+      # One forge round-trip answers both questions this sweep asks of a gated
+      # pull request - is it green, and where is its head now - inside a check
+      # budget shared with every other task in the glob.
+      WORKTREE=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2-)
+      fm_pr_github_snapshot "$WORKTREE" "$URL"
+      LIVE_HEAD=$FM_PR_GITHUB_HEAD
       STATE_LINE=$(current_state "$ID")
-      pr_checks_green_now "$STATE_LINE" "$URL" || continue
+      case "$STATE_LINE" in
+        "state: done"*"checks green"*) ;;
+        *) [ "$FM_PR_GITHUB_GREEN" = 1 ] || continue ;;
+      esac
       RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2-)
-      LIVE_HEAD=$(fm_pr_github_live_head "$META" "$URL")
       RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || RID=
       if [ -z "$LIVE_HEAD" ] || [ "$LIVE_HEAD" = "$RECORDED_HEAD" ]; then
         # Same or unknown live head: an acknowledged current identity is
-        # complete, and a held one belongs to retry-held or captain repair.
-        # Only a live head that moved past the recorded one re-registers
-        # regardless, so a post-hold rebase still gets its fresh event.
-        if [ -n "$RID" ] && { [ -f "$ACKS/$RID.json" ] || [ -f "$HOLDS/$RID.json" ]; }; then
+        # complete and only needs its announcement to be durable, and a held
+        # one belongs to retry-held or captain repair. Only a live head that
+        # moved past the recorded one re-registers regardless, so a post-hold
+        # rebase still gets its fresh event.
+        if [ -n "$RID" ] && [ -f "$ACKS/$RID.json" ]; then
+          if [ -f "$ANNOUNCED/$ID.pending" ]; then
+            announce_reconciled "$RID" "$ID"
+          else
+            mark_announced "$RID"
+          fi
+          continue
+        fi
+        if [ -n "$RID" ] && [ -f "$HOLDS/$RID.json" ]; then
           continue
         fi
       fi
-      BEFORE_ACKS=$(ls "$ACKS" 2>/dev/null || true)
+      mark_announced "$ID.pending"
       "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL" >/dev/null 2>&1 || true
       RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || continue
       [ -f "$ACKS/$RID.json" ] || continue
-      case "$BEFORE_ACKS" in
-        *"$RID.json"*) ;;
-        *) printf 'delivered %s iinvy-pr-ready %s\n' "$RID" "$ID" ;;
-      esac
+      announce_reconciled "$RID" "$ID"
     done
     exit 0
     ;;

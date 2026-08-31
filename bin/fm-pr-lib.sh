@@ -224,6 +224,64 @@ fm_pr_head_valid() {
   [[ "$head" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]
 }
 
+# One GitHub round-trip for the two facts a merge-boundary caller needs about a
+# pull request: its exact live head, and whether the forge itself reports the
+# pull request genuinely checks-green. Sets FM_PR_GITHUB_HEAD to the validated
+# head SHA or nothing and FM_PR_GITHUB_GREEN to 1 or 0, and never fails, so an
+# absent gh, a forge error, or any transitional answer reads as head-unknown
+# and not green - the safe direction for a caller deciding whether to emit a
+# merge-boundary event.
+#
+# Green requires the pull request open and CLEAN AND its own check rollup to
+# carry at least one completed successful check with no unfinished or
+# unsuccessful entry beside it. Open-and-CLEAN alone is never proof: GitHub
+# answers CLEAN for a pull request with no checks at all - the window before CI
+# registers its first run, and permanently in a repository that requires none -
+# and merging that on a checks-green claim would merge something unverified.
+# Rollup entries are classified by their own fields rather than by type name: a
+# check run carries status/conclusion, a commit status carries state.
+# shellcheck disable=SC2016 # A jq program, evaluated by gh and never by the shell.
+FM_PR_GITHUB_SNAPSHOT_QUERY='
+  (.statusCheckRollup // []) as $checks
+  | ($checks | map(
+      (.status == "COMPLETED"
+        and (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED"))
+      or .state == "SUCCESS")) as $settled
+  | ($checks | map(
+      (.status == "COMPLETED" and .conclusion == "SUCCESS")
+      or .state == "SUCCESS")) as $passed
+  | [(.state // ""), (.mergeStateStatus // ""), (.headRefOid // "-"),
+     (if ($passed | any) and ($settled | all) then "1" else "0" end)]
+  | join(" ")'
+
+fm_pr_github_snapshot() { # <worktree-or-empty> <pr-url>
+  local wt=${1-} url=${2-} answer state merge head green
+  FM_PR_GITHUB_HEAD=
+  FM_PR_GITHUB_GREEN=0
+  command -v gh >/dev/null 2>&1 || return 0
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    answer=$(cd "$wt" && gh pr view "$url" \
+      --json state,mergeStateStatus,headRefOid,statusCheckRollup \
+      -q "$FM_PR_GITHUB_SNAPSHOT_QUERY" 2>/dev/null) || return 0
+  else
+    answer=$(gh pr view "$url" \
+      --json state,mergeStateStatus,headRefOid,statusCheckRollup \
+      -q "$FM_PR_GITHUB_SNAPSHOT_QUERY" 2>/dev/null) || return 0
+  fi
+  read -r state merge head green <<EOF
+$answer
+EOF
+  if fm_pr_head_valid "${head:-}"; then
+    # Consumed by bin/fm-cipher-hook.sh's reconciliation sweep.
+    # shellcheck disable=SC2034
+    FM_PR_GITHUB_HEAD=$head
+  fi
+  if [ "${state:-}" = OPEN ] && [ "${merge:-}" = CLEAN ] && [ "${green:-}" = 1 ]; then
+    FM_PR_GITHUB_GREEN=1
+  fi
+  return 0
+}
+
 # Best-effort live GitHub head for a task's recorded pull request, read through
 # gh from the recorded task worktree. Prints the validated SHA or nothing, and
 # never fails, so a missing worktree, absent gh, or forge error reads as "head
@@ -237,18 +295,13 @@ fm_pr_github_live_head() { # <meta-path> <pr-url>
   printf '%s\n' "$head"
 }
 
-# GitHub's own merge-readiness for a pull request: open and CLEAN, meaning
-# every required check passed and the merge is not blocked. This is forge-side
-# truth, independent of any local pipeline or monitor state, so a wedged or
-# stale local CI monitor cannot hide a genuinely green pull request. Any error,
-# absent gh, or transitional forge answer reads as not green - the safe
-# direction for a caller deciding whether to emit a merge-boundary event.
+# GitHub's own answer to "is this pull request genuinely checks-green": the
+# forge-side truth a wedged or stale local CI monitor cannot hide. Every
+# not-green direction - absent gh, forge error, no checks yet, a check still
+# running - reads as not green.
 fm_pr_github_checks_green() { # <pr-url>
-  local url=$1 answer
-  command -v gh >/dev/null 2>&1 || return 1
-  answer=$(gh pr view "$url" --json state,mergeStateStatus \
-    -q '.state + " " + .mergeStateStatus' 2>/dev/null) || return 1
-  [ "$answer" = "OPEN CLEAN" ]
+  fm_pr_github_snapshot "" "${1-}"
+  [ "$FM_PR_GITHUB_GREEN" = 1 ]
 }
 
 # The GitHub repositories whose checks-green merge boundary belongs to Cipher.

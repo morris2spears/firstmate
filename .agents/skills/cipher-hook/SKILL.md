@@ -39,7 +39,7 @@ Never use gateway response prose as the decision ledger because GitHub is author
 ## Iinvy checks-green boundary
 
 `bin/fm-pr-check.sh` emits the exact-head event automatically after it records a checks-green iinvy PR, and the watcher's `reconcile` sweep re-registers through that same trigger when a recorded gated PR reaches checks-green only later - after a rebase or sync, a repair or recovery, or a manual coordinator reconciliation.
-Checks-green is decided by local reconciliation or by GitHub's own open-and-CLEAN answer, so a wedged local CI monitor never hides a forge-green PR, and the trigger's `armed:` line confirms only the merge watch, never delivery.
+Checks-green is decided by local reconciliation or by GitHub's own answer - open, CLEAN, and a check rollup carrying a real passed check, never mergeability alone - so a wedged local CI monitor never hides a forge-green PR while a PR whose CI has not run is never mistaken for one, and the trigger's `armed:` line confirms only the merge watch, never delivery.
 A `cipher-reconcile` check notification reporting `delivered <request-id> iinvy-pr-ready <task-id>` is that checks-green transition reaching Cipher: treat it as the PR-ready milestone, report the PR to the captain with its full URL if not already reported, and keep the merge with Cipher exactly as below.
 A missing or disabled route, timeout, unavailable gateway, invalid acknowledgement, or delivery failure keeps the merge held.
 Do not invoke the ordinary merge command for any gated repository, even after event delivery succeeds.

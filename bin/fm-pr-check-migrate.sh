@@ -278,6 +278,19 @@ fi
 # shellcheck source=bin/fm-wake-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
+# Watcher exclusion below pauses the live watcher by signalling it. A caller
+# that is itself running under that watcher - the Cipher checks-green
+# reconciliation sweep on the watcher's own cadence - would be asking this
+# migration to kill its own ancestor, so such a caller sets
+# FM_PR_CHECK_MIGRATION_DEFER and the migration refuses instead of racing it.
+# Reaching this point means real migration work remains; it is left for the
+# next coordinator-run or agent-run invocation, which owns the exclusion
+# protocol safely.
+if [ "${FM_PR_CHECK_MIGRATION_DEFER:-0}" = 1 ]; then
+  echo "PR_CHECK_MIGRATION: deferred; migration needs watcher exclusion and cannot run under the watcher" >&2
+  exit 1
+fi
+
 stopped_watcher=0
 pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
 if fm_pid_alive "$pid"; then
