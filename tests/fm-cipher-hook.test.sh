@@ -449,6 +449,55 @@ EOF
   pass "system Python gateway timeout is a durable fail-safe hold"
 }
 
+test_legacy_socket_timeout_is_classified_as_timeout() {
+  local dir
+  dir=$(make_case legacy-socket-timeout)
+  python3 - "$ROOT/bin/fm-cipher-hook.py" > "$dir/out" 2> "$dir/err" <<'PY'
+import importlib.util
+import socket
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_cipher_hook", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class LegacySocketTimeout(OSError):
+    pass
+
+
+assert not issubclass(LegacySocketTimeout, TimeoutError), "stub must not inherit TimeoutError"
+
+
+class Connection:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def request(self, *_args, **_kwargs):
+        raise LegacySocketTimeout("timed out")
+
+    def close(self):
+        pass
+
+
+socket.timeout = LegacySocketTimeout
+module.http.client.HTTPConnection = Connection
+config = {
+    "secret": b"0" * 64,
+    "host": "127.0.0.1",
+    "port": 1,
+    "route": "/hooks/decision",
+    "route_name": "decision",
+}
+result = module.post_once(config, b"{}", "req-1", "needs-decision", 0.1)
+assert result == ("timeout", None, None), f"unexpected classification: {result}"
+print(result[0])
+PY
+  [ "$(cat "$dir/out")" = "timeout" ] \
+    || fail "socket.timeout that is not a TimeoutError was not classified as timeout"
+  pass "legacy socket.timeout is classified as timeout on every runtime"
+}
+
 assert_direct_merge_held() { # <dir> <id> <repo> <label>
   local dir=$1 id=$2 repo=$3 label=$4 rc
   : > "$dir/gh-axi.log"
@@ -833,6 +882,7 @@ test_legacy_v1_is_explicit_test_only
 test_real_duplicate_response_is_accepted_exactly
 test_malformed_and_unavailable_hold_without_leakage
 test_timeout_is_durable_hold
+test_legacy_socket_timeout_is_classified_as_timeout
 test_pr_check_allowlist_and_safe_holds
 test_iinvy_merge_requires_cipher_actor_and_exact_head
 test_receive_api_ignores_self_repo_worker_pane
