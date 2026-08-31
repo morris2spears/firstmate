@@ -66,7 +66,8 @@ A doubly explicit test seam exercises Hermes's legacy body-only `X-Webhook-Signa
 The compact JSON request is no larger than 4096 bytes and has exactly these versioned allowlisted fields: `schema`, `event_type`, `request_id`, `task_id`, `repository`, `issue_url`, `pr_url`, `pr_head_sha`, `decision_id`, and `evidence`.
 `event_type` is `needs-decision` or `iinvy-pr-ready`, which is the installed Hermes adapter's recognized event selector.
 Unknown values are JSON `null`, and evidence contains only the validated relative pointers `state/<task-id>.meta` and `state/<task-id>.status` with fixed kind names.
-The request ID is a stable SHA-256 identity over the logical event before the ID field is added, so a keyed decision emits once and each distinct PR head emits once.
+The request ID is a stable SHA-256 identity over the event's own logical scope: a decision identity covers only the schema, event type, task, repository, and decision key, while a PR-ready identity covers the whole exact-head event, so a keyed decision emits once even after PR metadata is later recorded and each distinct PR head emits once.
+The first recorded request body for a logical decision stays canonical, so a later repeat of the same key retries or dedupes that exact body rather than sending a second event.
 A first delivery succeeds only on HTTP 202 with exactly `{"status":"accepted","route":"<configured-route-name>","event":"<same-event-type>","delivery_id":"<same-request-id>"}` and no additional fields.
 An idempotent retry succeeds only on HTTP 200 with exactly `{"status":"duplicate","delivery_id":"<same-request-id>"}` and no additional fields.
 Every other HTTP status or response shape is invalid and holds the event.

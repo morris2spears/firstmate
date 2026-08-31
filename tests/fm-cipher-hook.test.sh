@@ -261,6 +261,16 @@ EOF
   ' "$dir/state/cipher-hooks/acks/$decision_id.json" >/dev/null \
     || fail "accepted acknowledgement was not bound to the real Hermes HTTP 202 shape"
 
+  fm_write_meta "$dir/state/decision-task.meta" \
+    "window=fm-decision-task" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" "mode=no-mistakes" \
+    "pr=https://github.com/example/project/pull/4" "pr_head=$HEAD_A"
+  FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" needs-decision decision-task route \
+    >> "$dir/decision.out" 2>> "$dir/decision.err" \
+    || fail "decision dedupe failed once PR metadata was recorded"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "recorded PR metadata re-delivered the same logical decision"
+
   cat >> "$dir/data/backlog.md" <<'EOF'
 - [ ] pr-task - fix production path https://github.com/morris2spears/iinvy/issues/8 (kind: ship)
 EOF
@@ -449,6 +459,13 @@ assert_direct_merge_held() { # <dir> <id> <repo> <label>
 
 test_pr_check_allowlist_and_safe_holds() {
   local dir rc port count repo
+  # shellcheck source=bin/fm-pr-lib.sh
+  . "$ROOT/bin/fm-pr-lib.sh"
+  diff <(printf '%s\n' "${FM_CIPHER_GATED_REPOSITORIES[@]}") \
+    <(grep -v -e '^#' -e '^$' "$ROOT/bin/fm-cipher-hook-repositories") >/dev/null \
+    || fail "the shell gate list and the Cipher allowlist file disagree"
+  fm_cipher_repo_gated Morris2Spears/iinvy || fail "mixed-case iinvy owner was not recognized as gated"
+  fm_cipher_repo_gated example/other && fail "an unrelated repository was treated as gated"
   dir=$(make_case pr-check)
   export FM_TEST_CREW_STATE_MARKER="$dir/crew-state.called"
   set +e
@@ -477,6 +494,14 @@ test_pr_check_allowlist_and_safe_holds() {
     expect_code 1 "$rc" "$repo missing hook must hold"
     assert_direct_merge_held "$dir" "missing-${repo##*/}" "$repo" "$repo missing hook"
   done
+
+  rm -f "$dir/config/cipher-hooks" "$dir/crew-state.called"
+  set +e
+  prepare_pr_case "$dir" mixed-case-iinvy Morris2Spears/iinvy > "$dir/mixed.out" 2> "$dir/mixed.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a mixed-case iinvy owner must still be gated and held"
+  assert_direct_merge_held "$dir" mixed-case-iinvy Morris2Spears/iinvy "mixed-case iinvy owner"
 
   port=$(start_server "$dir" accepted)
   write_config "$dir" "$port" enabled disabled

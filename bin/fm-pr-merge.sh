@@ -96,13 +96,7 @@ if [ ! -f "$META" ] || [ -L "$META" ]; then
 fi
 
 CIPHER_HEAD=
-CIPHER_GATED_RC=0
-"$SCRIPT_DIR/fm-cipher-hook.sh" repo-gated "$PR_OWNER/$PR_REPO" || CIPHER_GATED_RC=$?
-if [ "$CIPHER_GATED_RC" -gt 1 ]; then
-  echo "error: the Cipher repository gate could not be evaluated" >&2
-  exit 1
-fi
-if [ "$CIPHER_GATED_RC" -eq 0 ]; then
+if fm_cipher_repo_gated "$PR_OWNER/$PR_REPO"; then
   reject_cipher_head_override "$@" || exit 1
   "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || {
     echo "error: this iinvy PR is not currently checks-green or its Cipher event is held" >&2

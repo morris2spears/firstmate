@@ -126,16 +126,7 @@ printf 'armed: state/%s.check.sh\n' "$ID"
 # the merge poll bind the exact PR head, and an armed task that cannot be
 # routed holds. Every other repository keeps the existing PR-ready path and
 # does not read Cipher config or spend a token.
-GATED_RC=1
-if [ "$PROVIDER" = github ]; then
-  GATED_RC=0
-  "$SCRIPT_DIR/fm-cipher-hook.sh" repo-gated "$PROJECT_PATH" || GATED_RC=$?
-fi
-if [ "$GATED_RC" -gt 1 ]; then
-  echo "error: the Cipher repository gate could not be evaluated" >&2
-  exit 1
-fi
-if [ "$GATED_RC" -eq 0 ]; then
+if [ "$PROVIDER" = github ] && fm_cipher_repo_gated "$PROJECT_PATH"; then
   CIPHER_RC=0
   "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || CIPHER_RC=$?
   if [ "$CIPHER_RC" -ne 0 ] && [ "$CIPHER_RC" -ne 4 ]; then

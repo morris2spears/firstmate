@@ -300,21 +300,21 @@ def identity_for_event(kind: str, task_id: str, argument: str | None) -> dict[st
         "decision_id": decision_id,
         "evidence": evidence,
     }
-    if kind == "needs-decision":
-        identity: dict[str, Any] = {
-            "schema": SCHEMA,
-            "event_type": kind,
-            "task_id": task_id,
-            "repository": repo,
-            "decision_id": decision_id,
-        }
-    else:
-        identity = payload
-    logical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    request_id = "fmch-v1-" + hashlib.sha256(logical).hexdigest()
-    payload["request_id"] = request_id
+    payload["request_id"] = logical_request_id(payload)
     validate_payload(payload)
     return payload
+
+
+def logical_request_id(payload: dict[str, Any]) -> str:
+    if payload["event_type"] == "needs-decision":
+        identity: dict[str, Any] = {
+            key: payload[key]
+            for key in ("schema", "event_type", "task_id", "repository", "decision_id")
+        }
+    else:
+        identity = {key: value for key, value in payload.items() if key != "request_id"}
+    logical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "fmch-v1-" + hashlib.sha256(logical).hexdigest()
 
 
 def validate_payload(payload: dict[str, Any]) -> None:
@@ -430,6 +430,19 @@ def read_json_record(path: Path) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise HookError("state-record-invalid")
     return value
+
+
+def adopt_recorded_request(dirs: dict[str, Path], payload: dict[str, Any]) -> dict[str, Any]:
+    recorded = read_json_record(dirs["requests"] / f"{payload['request_id']}.json")
+    if recorded is None or canonical_body(recorded) == canonical_body(payload):
+        return payload
+    validate_payload(recorded)
+    if (
+        recorded["request_id"] != payload["request_id"]
+        or logical_request_id(recorded) != payload["request_id"]
+    ):
+        raise HookError("request-identity-collision")
+    return recorded
 
 
 def store_request(dirs: dict[str, Path], payload: dict[str, Any]) -> bytes:
@@ -775,6 +788,7 @@ def retry_settings() -> tuple[int, float, float]:
 def deliver(kind: str, task_id: str, argument: str | None) -> int:
     payload = identity_for_event(kind, task_id, argument)
     dirs = record_dirs()
+    payload = adopt_recorded_request(dirs, payload)
     body = store_request(dirs, payload)
     try:
         config = load_config(kind)
