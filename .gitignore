@@ -20,4 +20,6 @@ config/tg-mode.env
 config/cmux-socket-password
 config/wedge-alarm
 config/herdr-presentation-spaces
+config/cipher-hooks
+config/cipher-hooks.secret
 .pi-live-e2e.*

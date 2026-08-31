@@ -83,7 +83,9 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pr-poll.sh`          | Provide the byte-static watcher program for validated PR/MR-poll sidecars           |
 | `fm-pr-check-migrate.sh` | Quarantine older task polls without execution and rebuild only canonical polls       |
 | `fm-pr-check.sh`         | Record validated `pr=` and `pr_head=` values, then atomically arm a static merge poll |
-| `fm-pr-merge.sh`         | Record PR metadata, merge a task's canonical full GitHub URL, then best-effort close its backlog-linked issue |
+| `fm-pr-merge.sh`         | Record PR metadata, enforce any exact-head Cipher boundary, merge a task's canonical full GitHub URL, then best-effort close its backlog-linked issue |
+| `fm-cipher-hook.sh`      | Deliver authenticated decision and iinvy exact-head events and expose Cipher's guarded merge entrypoint |
+| `fm-cipher-receive.sh`   | Queue one authenticated GitHub decision or blocker pointer by task identity without selecting a terminal pane |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require completed scout deliverables, retire secondmate homes |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |

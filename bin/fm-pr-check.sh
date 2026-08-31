@@ -119,4 +119,16 @@ fm_pr_poll_publish_prepared || {
   echo "error: could not publish PR poll" >&2
   exit 1
 }
+
+# Canonical iinvy checks-green transitions are routed only after metadata and
+# the merge poll bind the exact PR head. Every other repository keeps the
+# existing PR-ready path and does not read Cipher config or spend a token.
+if [ "$PROVIDER" = github ] && "$SCRIPT_DIR/fm-cipher-hook.sh" repo-gated "$PROJECT_PATH"; then
+  if "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL"; then
+    :
+  else
+    CIPHER_RC=$?
+    [ "$CIPHER_RC" -eq 4 ] || exit 1
+  fi
+fi
 printf 'armed: state/%s.check.sh\n' "$ID"
