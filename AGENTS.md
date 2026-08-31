@@ -308,7 +308,7 @@ For a no-mistakes ship, trigger validation on the same worker after its implemen
 The task worker that starts a no-mistakes run drives the pipeline and owns every `no-mistakes axi run` and `no-mistakes axi respond` call through the next gate or outcome.
 Firstmate never invokes `no-mistakes axi respond` for a crew-owned run.
 
-On a genuine `needs-decision`, load `cipher-hook` before deciding or escalating; it owns whether Cipher or the existing authority handles that gate.
+On a genuine `needs-decision`, load `cipher-hook` before answering it in any form - deciding, filing a decision-bearing follow-up, keeping the current PR scoped around it, or escalating; it owns whether Cipher or the existing authority handles that gate.
 When `cipher-hook` returns the existing-authority path, firstmate decides only when the configured authority permits, otherwise escalates to the captain.
 Send the same worker one exact decision naming the decision key, step, action, affected finding IDs, instructions where needed, and exact response command.
 Require the matching `resolved` event, forbid `--yes`, and require the worker to process every synchronous return until completion or a genuinely new escalation.

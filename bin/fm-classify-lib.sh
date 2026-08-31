@@ -155,6 +155,11 @@ status_is_paused_or_captain_held() {  # <status-line>
 # format): an OPTIONAL "[key=<slug>]" token sits between the verb and the colon,
 #   needs-decision [key=api-shape]: <summary>
 #   resolved       [key=api-shape]: <how it was decided>
+# Real crews also write the token at the start of the note
+# ("needs-decision: [key=api-shape] <summary>"); that placement is honored with
+# the same key so open and close events match their intended key instead of
+# silently degrading to "default". A leading bracket that is not a valid key
+# token stays ordinary prose.
 # A line with no token uses the key "default", preserving the historical
 # one-open-decision-per-task behavior (a bare "resolved:" closes "default").
 # The three parsers are pure reads of a single line; the verb parser strips any
@@ -173,7 +178,7 @@ status_line_note() {  # <status-line> -> text after the first colon, trimmed
   esac
 }
 _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
-  local prefix=${1%%:*} k
+  local prefix=${1%%:*} k rest
   case "$prefix" in
     *\[key=*\]*)
       k=${prefix#*\[key=}
@@ -183,7 +188,20 @@ _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
         *) printf '%s' "$k" ;;
       esac
       ;;
-    *) printf 'default' ;;
+    *)
+      rest=$(status_line_note "$1")
+      case "$rest" in
+        \[key=*\]*)
+          k=${rest#\[key=}
+          k=${k%%\]*}
+          case "$k" in
+            ''|*[!A-Za-z0-9._-]*) printf 'default' ;;
+            *) printf '%s' "$k" ;;
+          esac
+          ;;
+        *) printf 'default' ;;
+      esac
+      ;;
   esac
 }
 # Drop the record for <key> from a newline-terminated "<key>\t<verb>\t<note>" set.

@@ -304,6 +304,121 @@ EOF
   pass "Cipher events use replay-protected HMAC V2 and dedupe by decision gate and exact PR head"
 }
 
+test_note_keyed_decision_single_hook_and_park() {
+  # Regression for firstmate#21: the observed iinvy#292 event wrote its key
+  # token after the colon ("needs-decision: [key=...] ...") and never reached
+  # the Cipher route. The note-placed key must fold to its intended key, emit
+  # exactly one authenticated hook, and leave the parked worker unanswered.
+  local dir port count open before after
+  dir=$(make_case note-key)
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+  fm_write_meta "$dir/state/issue292-task.meta" \
+    "window=fm-issue292-task" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" "mode=no-mistakes"
+  printf 'needs-decision: [key=issue292-cross-role] neutral entity or strict history roles\n' \
+    > "$dir/state/issue292-task.status"
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] issue292-task - cross-role https://github.com/example/project/issues/292 (kind: ship)
+EOF
+  open=$(bash -c '. "$1"; status_open_decisions "$2"' _ \
+    "$ROOT/bin/fm-classify-lib.sh" "$dir/state/issue292-task.status")
+  case "$open" in
+    issue292-cross-role$'\t'needs-decision$'\t'*) ;;
+    *) fail "note-placed key did not fold to its intended decision key: $open" ;;
+  esac
+
+  before=$(shasum -a 256 "$dir/state/issue292-task.status" | awk '{print $1}')
+  FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" needs-decision issue292-task issue292-cross-role \
+    > "$dir/note.out" 2> "$dir/note.err" || fail "note-keyed decision event delivery failed"
+  FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" needs-decision issue292-task issue292-cross-role \
+    >> "$dir/note.out" 2>> "$dir/note.err" || fail "note-keyed decision dedupe failed"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 1 ] || fail "note-keyed decision was delivered $count times instead of once"
+  jq -e 'select(.v2_present and .v2_valid and .timestamp_fresh)
+    | select(.body.event_type == "needs-decision" and .body.decision_id == "issue292-cross-role")' \
+    "$dir/server.log" >/dev/null || fail "note-keyed decision delivery was not authenticated with its key"
+  after=$(shasum -a 256 "$dir/state/issue292-task.status" | awk '{print $1}')
+  [ "$before" = "$after" ] || fail "the hook answered or mutated the parked decision status"
+  [ ! -s "$dir/gh-axi.log" ] || fail "the hook filed GitHub activity instead of parking: $(cat "$dir/gh-axi.log")"
+  pass "a note-keyed current decision emits exactly one authenticated hook and stays parked"
+}
+
+test_resolve_decision_requires_and_follows_authenticated_answer() {
+  # The "file a follow-up issue / keep the current PR scoped" branch settles a
+  # decision, so the durable keyed closure must be impossible before the route
+  # ran and the authenticated Cipher comment arrived, and automatic afterwards.
+  local dir port rc request_id comment open count
+  dir=$(make_case resolve)
+  fm_write_meta "$dir/state/decision-task.meta" \
+    "window=fm-decision-task" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" "mode=no-mistakes"
+  printf 'needs-decision: [key=route] choose route\n' > "$dir/state/decision-task.status"
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] decision-task - choose route https://github.com/example/project/issues/7 (kind: ship)
+EOF
+
+  # Disabled decision route: the existing-authority fallback stays exit 3 and
+  # the keyed decision still cannot be closed as Cipher-answered.
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" disabled enabled
+  set +e
+  FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" needs-decision decision-task route > "$dir/disabled.out" 2> "$dir/disabled.err"
+  rc=$?
+  set -e
+  expect_code 3 "$rc" "disabled decision route must fall back to the existing authority"
+  request_id=$(request_id_for_kind "$dir" needs-decision)
+  [ -n "$request_id" ] || fail "disabled-route request identity was not recorded"
+  set +e
+  run_hook "$dir" resolve-decision decision-task "$request_id" \
+    > "$dir/resolve-disabled.out" 2> "$dir/resolve-disabled.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "an unacknowledged decision must refuse durable Cipher resolution"
+
+  # Enabled route, delivered and acknowledged, but no authenticated comment yet:
+  # resolution still refuses, so a follow-up filing cannot bypass the answer.
+  write_config "$dir" "$port" enabled enabled
+  FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
+    run_hook "$dir" needs-decision decision-task route >/dev/null 2>&1 \
+    || fail "enabled decision event delivery failed"
+  set +e
+  run_hook "$dir" resolve-decision decision-task "$request_id" \
+    > "$dir/resolve-early.out" 2> "$dir/resolve-early.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "resolution before the authenticated comment must refuse"
+  assert_grep 'no authenticated Cipher decision comment is recorded' "$dir/resolve-early.err" \
+    "early resolution did not name the missing authenticated answer"
+  assert_no_grep 'resolved' "$dir/state/decision-task.status" \
+    "early resolution wrote a durable closure without the authenticated answer"
+
+  # The authenticated decision comment arrives; resolution closes the keyed
+  # decision durably and idempotently.
+  comment='https://github.com/example/project/issues/7#issuecomment-9921'
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" \
+  FM_DATA_OVERRIDE="$dir/data" FM_CONFIG_OVERRIDE="$dir/config" \
+  PATH="$dir/fakebin:$PATH" \
+    "$RECEIVE" decision-comment decision-task "$request_id" "$comment" >/dev/null 2>&1 \
+    || fail "authenticated decision-comment receive failed"
+  run_hook "$dir" resolve-decision decision-task "$request_id" \
+    > "$dir/resolve.out" 2> "$dir/resolve.err" || fail "accepted-comment resolution failed"
+  assert_grep "resolved decision-task route" "$dir/resolve.out" \
+    "resolution did not report the closed keyed decision"
+  assert_grep "resolved [key=route]: Cipher decision accepted $comment" \
+    "$dir/state/decision-task.status" "resolution did not append the durable keyed closure"
+  open=$(bash -c '. "$1"; status_open_decisions "$2"' _ \
+    "$ROOT/bin/fm-classify-lib.sh" "$dir/state/decision-task.status")
+  [ -z "$open" ] || fail "the accepted Cipher answer left the keyed decision open: $open"
+  run_hook "$dir" resolve-decision decision-task "$request_id" \
+    > "$dir/resolve2.out" 2> "$dir/resolve2.err" || fail "idempotent resolution replay failed"
+  [ ! -s "$dir/resolve2.out" ] || fail "resolution replay reported a second closure"
+  count=$(grep -c 'resolved \[key=route\]' "$dir/state/decision-task.status")
+  [ "$count" = 1 ] || fail "resolution replay duplicated the durable closure line"
+  pass "durable keyed closure requires the authenticated Cipher answer and is idempotent"
+}
+
 test_legacy_v1_is_explicit_test_only() {
   local dir port
   dir=$(make_case legacy)
@@ -825,6 +940,8 @@ test_watcher_retries_held_delivery() {
 }
 
 test_v2_decision_and_pr_delivery_dedupe
+test_note_keyed_decision_single_hook_and_park
+test_resolve_decision_requires_and_follows_authenticated_answer
 test_legacy_v1_is_explicit_test_only
 test_real_duplicate_response_is_accepted_exactly
 test_malformed_and_unavailable_hold_without_leakage
