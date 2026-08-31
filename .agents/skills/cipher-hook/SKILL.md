@@ -18,6 +18,7 @@ The local setup and wire schema are owned by [`docs/configuration.md`](../../../
 Reconcile the worker with `bin/fm-crew-state.sh <id>` before treating an old status event as current.
 Read the open decision key from the durable keyed-decision fold rather than copying the worker's summary into a command.
 Run `bin/fm-cipher-hook.sh needs-decision <id> <decision-key>`.
+Filing a follow-up issue that records the choice, keeping the current PR scoped to sidestep the question, or reporting the choice to the captain as settled are all forms of answering the finding, and none of them may happen before this command's outcome is known.
 Exit 0 means Cipher accepted the stable logical event, so leave the worker parked and do not answer its finding.
 Exit 3 means this home has no enabled decision route, so continue through the existing `ask-user-authority` procedure.
 Any other nonzero result means delivery is durably held, so surface the one concrete configuration or gateway blocker and do not answer the finding.
@@ -31,6 +32,8 @@ The implementation worker never answers its own finding.
 An authenticated `cipher-comment decision-comment ...` notification points to the exact GitHub comment Cipher wrote before asking Firstmate to continue.
 Fetch that exact comment with `gh-axi`, verify that it names the open decision and records the recommendation, selected option, reasoning, and reversal path, then load `ask-user-authority` as defense in depth before sending the worker the normal exact gate response.
 If the comment escalates to Morris or does not contain a safe complete selection, keep the worker parked.
+After sending the gate response, run `bin/fm-cipher-hook.sh resolve-decision <id> <request-id>` so the keyed status decision is durably closed by the accepted comment instead of lingering stale, and any held duplicate delivery supersedes on the next monitoring sweep.
+That command refuses without the authenticated comment record, so a decision can never be marked Cipher-answered before the durable GitHub answer exists.
 Never use gateway response prose as the decision ledger because GitHub is authoritative.
 
 ## Iinvy checks-green boundary

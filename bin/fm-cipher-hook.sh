@@ -30,10 +30,18 @@
 # prints one line per delivered or superseded event and nothing while an event
 # simply stays held; configuration-class holds are never auto-retried.
 #
+# `resolve-decision` durably closes the answered keyed status decision for an
+# acknowledged needs-decision event. It refuses unless the authenticated
+# decision-comment receive record for that exact request exists, then appends
+# one idempotent "resolved [key=<decision-id>]: Cipher decision accepted
+# <comment-url>" status line while the keyed decision is still open, so an
+# answered decision cannot linger stale or keep held duplicates alive.
+#
 # Usage:
 #   fm-cipher-hook.sh needs-decision <task-id> [decision-id]
 #   fm-cipher-hook.sh pr-ready <task-id> <pr-url>
 #   fm-cipher-hook.sh retry-held
+#   fm-cipher-hook.sh resolve-decision <task-id> <request-id>
 #   fm-cipher-hook.sh merge <task-id> <pr-url> <request-id> [-- <extra merge args>]
 #   fm-cipher-hook.sh verify-merge <task-id> <pr-url> <request-id>
 #   fm-cipher-hook.sh repo-gated <owner/repo>
@@ -53,7 +61,7 @@ CREW_STATE_BIN=${FM_CREW_STATE_BIN:-$SCRIPT_DIR/fm-crew-state.sh}
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 
 usage() {
-  sed -n '2,39s/^# \{0,1\}//p' "$0"
+  sed -n '2,47s/^# \{0,1\}//p' "$0"
 }
 
 run_python() {
@@ -116,6 +124,28 @@ case "${1:-}" in
     }
     run_python deliver needs-decision "$ID" "$DECISION"
     exit $?
+    ;;
+  resolve-decision)
+    [ "$#" -eq 3 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }
+    ID=$2
+    REQUEST_ID=$3
+    if ! fm_task_id_creation_valid "$ID"; then
+      echo "error: invalid Cipher hook request" >&2
+      exit 2
+    fi
+    PLAN=$(run_python resolve-decision "$ID" "$REQUEST_ID") || exit 1
+    read -r DECISION COMMENT_URL <<<"$PLAN"
+    if [ -z "${DECISION:-}" ] || [ -z "${COMMENT_URL:-}" ]; then
+      echo "error: invalid Cipher hook request" >&2
+      exit 2
+    fi
+    # Idempotent: a decision already closed (or a retired status record) needs
+    # no second resolution line.
+    decision_is_open "$ID" "$DECISION" || exit 0
+    printf 'resolved [key=%s]: Cipher decision accepted %s\n' \
+      "$DECISION" "$COMMENT_URL" >> "$STATE/$ID.status" || exit 1
+    printf 'resolved %s %s\n' "$ID" "$DECISION"
+    exit 0
     ;;
   pr-ready)
     [ "$#" -eq 3 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }

@@ -593,6 +593,7 @@ def diagnostic_message(reason: str) -> str:
         "unavailable": "the local Cipher gateway is unavailable",
         "invalid-response": "the local Cipher gateway returned an invalid acknowledgement",
         "missing-pr-head": "the checks-green PR head could not be bound",
+        "decision-comment-missing": "no authenticated Cipher decision comment is recorded for this request",
         "repository-unknown": "the task's canonical GitHub repository could not be established",
         "repository-mismatch": "the task repository does not match its pull request",
         "pr-metadata-mismatch": "the pull request does not match task metadata",
@@ -1014,6 +1015,39 @@ def commit_receive(kind: str, task_id: str, request_id: str, comment_url: str) -
     return receive_id
 
 
+def resolve_decision_plan(task_id: str, request_id: str) -> tuple[str, str]:
+    """Plan the durable closure of a Cipher-answered keyed decision.
+
+    Requires the acknowledged needs-decision request for this task plus the
+    committed authenticated decision-comment receive record bound to it, so a
+    keyed decision can never be closed as Cipher-answered unless the durable
+    GitHub answer actually arrived. Returns the decision id and the exact
+    comment URL Cipher wrote.
+    """
+    validate_task(task_id)
+    dirs = record_dirs()
+    request = validated_request_record(dirs, request_id)
+    if request["task_id"] != task_id:
+        raise HookError("receive-task-mismatch")
+    if request["event_type"] != "needs-decision":
+        raise HookError("receive-event-mismatch")
+    decision_id = request["decision_id"]
+    if not isinstance(decision_id, str) or not decision_id:
+        raise HookError("state-record-invalid")
+    for path in sorted(dirs["received"].glob("*.json")):
+        record = read_json_record(path)
+        if record is None:
+            continue
+        if (
+            record.get("kind") == "decision-comment"
+            and record.get("task_id") == task_id
+            and record.get("request_id") == request_id
+            and isinstance(record.get("comment_url"), str)
+        ):
+            return decision_id, record["comment_url"]
+    raise HookError("decision-comment-missing")
+
+
 def verify_merge(task_id: str, pr_url: str, request_id: str) -> str:
     if not REQUEST_RE.fullmatch(request_id):
         raise HookError("merge-authorization-missing")
@@ -1047,6 +1081,7 @@ def main(argv: list[str]) -> int:
             "retry-plan | "
             "supersede <request-id> <reason> | "
             "verify-merge <task-id> <pr-url> <request-id> | "
+            "resolve-decision <task-id> <request-id> | "
             "prepare-receive <kind> <task-id> <request-id> <comment-url> | "
             "commit-receive <kind> <task-id> <request-id> <comment-url> | "
             "request-id <task-id> <pr-url>"
@@ -1071,6 +1106,10 @@ def main(argv: list[str]) -> int:
             return 0
         if command == "verify-merge" and len(argv) == 4:
             print(verify_merge(argv[1], argv[2], argv[3]))
+            return 0
+        if command == "resolve-decision" and len(argv) == 3:
+            decision_id, comment_url = resolve_decision_plan(argv[1], argv[2])
+            print(f"{decision_id} {comment_url}")
             return 0
         if command == "prepare-receive" and len(argv) == 5:
             receive_id, duplicate = prepare_receive(argv[1], argv[2], argv[3], argv[4])

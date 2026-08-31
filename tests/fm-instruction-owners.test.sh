@@ -13,6 +13,7 @@ HARNESS="$ROOT/.agents/skills/harness-adapters/SKILL.md"
 CODING="$ROOT/.agents/skills/firstmate-coding-guidelines/SKILL.md"
 RECOVERY="$ROOT/.agents/skills/stuck-crewmate-recovery/SKILL.md"
 SECONDMATE="$ROOT/.agents/skills/secondmate-provisioning/SKILL.md"
+CIPHER="$ROOT/.agents/skills/cipher-hook/SKILL.md"
 CONFIG="$ROOT/docs/configuration.md"
 AGENTS="$ROOT/AGENTS.md"
 BRIEF="$ROOT/bin/fm-brief.sh"
@@ -292,6 +293,20 @@ test_compressed_agents_retains_authority_and_supervision_safety() {
   pass "compressed AGENTS.md retains authority, supervision, AFK, and X safety"
 }
 
+test_cipher_needs_decision_owner_covers_answering_forms() {
+  assert_grep 'load `cipher-hook` before answering it in any form - deciding, filing a decision-bearing follow-up, keeping the current PR scoped around it, or escalating' "$AGENTS" \
+    "AGENTS.md lost the follow-up and scope-keeping branch on the cipher-hook needs-decision trigger"
+  assert_grep 'Filing a follow-up issue that records the choice, keeping the current PR scoped to sidestep the question, or reporting the choice to the captain as settled are all forms of answering the finding' "$CIPHER" \
+    "cipher-hook owner lost the answering-by-follow-up definition"
+  assert_grep 'run `bin/fm-cipher-hook.sh resolve-decision <id> <request-id>`' "$CIPHER" \
+    "cipher-hook owner lost the durable keyed-decision resolution step"
+  assert_grep 'refuses without the authenticated comment record' "$CIPHER" \
+    "cipher-hook owner lost the authenticated-answer requirement for resolution"
+  assert_grep 'token between the verb and the colon' "$BRIEF" \
+    "generated brief lost the canonical needs-decision key placement"
+  pass "cipher-hook owns every answering form and the durable resolution step"
+}
+
 test_new_skill_metadata_and_triggers
 test_diagnostic_owner_covers_causal_procedure
 test_project_management_owner_covers_guarded_operations
@@ -303,3 +318,4 @@ test_state_startup_and_ordinary_recovery_placement
 test_compressed_agents_owner_map
 test_intake_reuses_evidence_and_parallelizes_safe_work
 test_compressed_agents_retains_authority_and_supervision_safety
+test_cipher_needs_decision_owner_covers_answering_forms

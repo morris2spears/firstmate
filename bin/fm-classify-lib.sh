@@ -155,8 +155,17 @@ status_is_paused_or_captain_held() {  # <status-line>
 # format): an OPTIONAL "[key=<slug>]" token sits between the verb and the colon,
 #   needs-decision [key=api-shape]: <summary>
 #   resolved       [key=api-shape]: <how it was decided>
+# Real crews also write the token at the start of the note
+# ("needs-decision: [key=api-shape] <summary>"); that placement is honored with
+# the same key so open and close events match their intended key instead of
+# silently degrading to "default". A leading bracket that is not a valid key
+# token stays ordinary prose.
 # A line with no token uses the key "default", preserving the historical
 # one-open-decision-per-task behavior (a bare "resolved:" closes "default").
+# Because note-placed keys used to degrade to "default", every status file
+# written before that placement was honored closed them with a BARE close event.
+# So a bare close still closes every note-placed key open at that point, exactly
+# as it did before; explicit "[key=x]" opens keep needing an "[key=x]" close.
 # The three parsers are pure reads of a single line; the verb parser strips any
 # key token before the colon so the leading word is recovered cleanly.
 status_line_verb() {  # <status-line> -> leading verb word
@@ -173,7 +182,7 @@ status_line_note() {  # <status-line> -> text after the first colon, trimmed
   esac
 }
 _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
-  local prefix=${1%%:*} k
+  local prefix=${1%%:*} k rest
   case "$prefix" in
     *\[key=*\]*)
       k=${prefix#*\[key=}
@@ -183,7 +192,46 @@ _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
         *) printf '%s' "$k" ;;
       esac
       ;;
-    *) printf 'default' ;;
+    *)
+      rest=$(status_line_note "$1")
+      case "$rest" in
+        \[key=*\]*)
+          k=${rest#\[key=}
+          k=${k%%\]*}
+          case "$k" in
+            ''|*[!A-Za-z0-9._-]*) printf 'default' ;;
+            *) printf '%s' "$k" ;;
+          esac
+          ;;
+        *) printf 'default' ;;
+      esac
+      ;;
+  esac
+}
+_fm_decision_key_placement() {  # <status-line> -> prefix|note|bare
+  local prefix=${1%%:*} k rest
+  case "$prefix" in
+    *\[key=*\]*)
+      k=${prefix#*\[key=}
+      k=${k%%\]*}
+      case "$k" in
+        ''|*[!A-Za-z0-9._-]*) printf 'bare' ;;
+        *) printf 'prefix' ;;
+      esac
+      return 0
+      ;;
+  esac
+  rest=$(status_line_note "$1")
+  case "$rest" in
+    \[key=*\]*)
+      k=${rest#\[key=}
+      k=${k%%\]*}
+      case "$k" in
+        ''|*[!A-Za-z0-9._-]*) printf 'bare' ;;
+        *) printf 'note' ;;
+      esac
+      ;;
+    *) printf 'bare' ;;
   esac
 }
 # Drop the record for <key> from a newline-terminated "<key>\t<verb>\t<note>" set.
@@ -201,6 +249,19 @@ $set
 EOF
   printf '%s' "$out"
 }
+# Drop the records for every key in <keys-set> from an open set. Used to give a
+# bare close event its historical reach over note-placed keys.
+_fm_decision_drop_all() {  # <open-set> <keys-set>
+  local set=$1 keys=$2 k
+  while IFS=$'\t' read -r k _; do
+    [ -n "$k" ] || continue
+    set=$(_fm_decision_drop "$set" "$k")
+    [ -n "$set" ] && set="${set}"$'\n'
+  done <<EOF
+$keys
+EOF
+  printf '%s' "$set"
+}
 # Fold the WHOLE status stream into the set of decisions still open. Prints one
 # TAB-separated "<key>\t<verb>\t<summary>" line per still-open decision, in
 # most-recently-opened-last order; prints nothing when none are open. Pure read of
@@ -208,7 +269,7 @@ EOF
 # is the durable open-set the fleet snapshot and any point-in-time consumer must use
 # instead of trusting the last status line.
 status_open_decisions() {  # <status-file>
-  local f=$1 line verb key note resolve held open='' stripped
+  local f=$1 line verb key note resolve held open='' stripped place notekeys=''
   [ -f "$f" ] || return 0
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
@@ -217,15 +278,24 @@ status_open_decisions() {  # <status-file>
     [ -n "$stripped" ] || continue
     verb=$(status_line_verb "$line")
     key=$(_fm_decision_key "$line") || continue
+    place=$(_fm_decision_key_placement "$line")
     case "$verb" in
       needs-decision|blocked)
         note=$(status_line_note "$line")
         open=$(_fm_decision_drop "$open" "$key")
+        notekeys=$(_fm_decision_drop "$notekeys" "$key")
+        [ -n "$notekeys" ] && notekeys="${notekeys}"$'\n'
+        [ "$place" = note ] && notekeys="${notekeys}${key}"$'\t1\n'
         [ -n "$open" ] && open="${open}"$'\n'
         open="${open}${key}"$'\t'"${verb}"$'\t'"${note}"$'\n'
         ;;
       "$resolve"|"$held")
         open=$(_fm_decision_drop "$open" "$key")
+        notekeys=$(_fm_decision_drop "$notekeys" "$key")
+        if [ "$place" = bare ]; then
+          open=$(_fm_decision_drop_all "$open" "$notekeys")
+          notekeys=''
+        fi
         [ -n "$open" ] && open="${open}"$'\n'
         ;;
     esac
@@ -243,7 +313,7 @@ status_open_decisions() {  # <status-file>
 # It is never authoritative current crew state, and consumers must not let an open
 # phase outrank a structured home snapshot or fm-crew-state result.
 _fm_status_open_activities_stream() {
-  local line verb key note resolve held open='' stripped pause
+  local line verb key note resolve held open='' stripped pause place notekeys=''
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   held=${FM_CLASSIFY_CAPTAIN_HELD_VERB:-$FM_CLASSIFY_CAPTAIN_HELD_VERB_DEFAULT}
   pause=${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}
@@ -252,15 +322,24 @@ _fm_status_open_activities_stream() {
     [ -n "$stripped" ] || continue
     verb=$(status_line_verb "$line")
     key=$(_fm_decision_key "$line") || continue
+    place=$(_fm_decision_key_placement "$line")
     case "$verb" in
       working|"$pause")
         note=$(status_line_note "$line")
         open=$(_fm_decision_drop "$open" "$key")
+        notekeys=$(_fm_decision_drop "$notekeys" "$key")
+        [ -n "$notekeys" ] && notekeys="${notekeys}"$'\n'
+        [ "$place" = note ] && notekeys="${notekeys}${key}"$'\t1\n'
         [ -n "$open" ] && open="${open}"$'\n'
         open="${open}${key}"$'\t'"${verb}"$'\t'"${note}"$'\n'
         ;;
       done|failed|needs-decision|blocked|"$resolve"|"$held")
         open=$(_fm_decision_drop "$open" "$key")
+        notekeys=$(_fm_decision_drop "$notekeys" "$key")
+        if [ "$place" = bare ]; then
+          open=$(_fm_decision_drop_all "$open" "$notekeys")
+          notekeys=''
+        fi
         [ -n "$open" ] && open="${open}"$'\n'
         ;;
     esac

@@ -89,6 +89,8 @@ An absent bridge or `decision_route=disabled` leaves the existing Firstmate deci
 When the decision route is enabled, Cipher may select only a routine reversible option within the accepted GitHub issue contract and must write its recommendation, selected option, reasoning, and reversal path on GitHub before asking Firstmate to continue.
 Cipher escalates to Morris instead of deciding when no safe recommendation exists or the choice expands the product or engineering contract, is destructive or irreversible, changes security or credentials, migrates production data, or spends money.
 Firstmate keeps the worker parked until it fetches the exact durable GitHub comment.
+After sending the worker its decision, `bin/fm-cipher-hook.sh resolve-decision <task-id> <request-id>` durably closes the keyed status decision with one idempotent `resolved [key=<decision-id>]: Cipher decision accepted <comment-url>` line, so an answered decision cannot linger open and any held duplicate delivery supersedes on the next sweep.
+That command refuses unless both the acknowledged needs-decision request and the authenticated decision-comment record exist, so a decision can never be marked Cipher-answered without its durable GitHub answer.
 
 The iinvy route is fail-safe rather than optional for `morris2spears/iinvy` and `morris2spears/iinvy-storefront`.
 A missing config, disabled route, unavailable gateway, timeout, invalid response, or missing exact head holds those merges, while every other repository keeps its existing PR-ready and merge behavior without reading bridge configuration or sending an event.
@@ -587,7 +589,7 @@ FM_WATCH_CYCLE_LOG_MAX_BYTES=262144   # size cap for the arm-owned watcher lifec
 FM_WATCH_CYCLE_LOG_KEEP_LINES=1000   # newest complete lifecycle rows considered when the ledger is capped
 FM_WATCHER_STALE_GRACE=300   # defaults to FM_GUARD_GRACE; seconds a live watcher lock may have a stale beacon before re-arm errors
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake
-FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # captain-relevant status regex; nonterminal progress verbs remain excluded even when their prose matches
+FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # captain-relevant status regex; nonterminal progress verbs remain excluded even when their prose matches; an override must also match keyed lines such as `needs-decision [key=<slug>]:`
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked
 FM_STALE_ESCALATE_SECS=240         # idle seconds before a provably-working stale pane escalates; stale panes whose crew is not provably working surface immediately unless they declare the pause verb
 FM_PAUSE_RESURFACE_SECS=3600       # seconds before an idle declared external wait re-surfaces for a recheck in the watcher or away-mode daemon
