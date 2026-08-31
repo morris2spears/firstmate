@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -780,7 +781,7 @@ def post_once(
         response = connection.getresponse()
         raw = response.read(MAX_RESPONSE + 1)
         status_code = response.status
-    except TimeoutError:
+    except (TimeoutError, socket.timeout):
         return "timeout", None, None
     except OSError:
         return "unavailable", None, None

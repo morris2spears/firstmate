@@ -422,7 +422,7 @@ prepare_pr_case() { # <dir> <id> <repo> [head] [current-state]
 }
 
 test_timeout_is_durable_hold() {
-  local dir port rc request_id
+  local dir port rc request_id system_python
   dir=$(make_case timeout)
   port=$(start_server "$dir" delay)
   write_config "$dir" "$port" enabled enabled
@@ -432,7 +432,11 @@ test_timeout_is_durable_hold() {
   cat > "$dir/data/backlog.md" <<'EOF'
 - [ ] timeout-task - timeout https://github.com/example/project/issues/12 (kind: ship)
 EOF
+  # Apple's stock Python exposes socket.timeout as an OSError but not a TimeoutError.
+  system_python=/usr/bin/python3
+  [ -x "$system_python" ] || system_python=$(command -v python3)
   set +e
+  FM_CIPHER_PYTHON="$system_python" \
   FM_CIPHER_RETRIES=1 FM_CIPHER_TIMEOUT_SECS=0.1 FM_CIPHER_RETRY_DELAY_SECS=0 \
   FM_TEST_CREW_STATE='state: parked · source: run-step · parked at review' \
     run_hook "$dir" needs-decision timeout-task slow > "$dir/out" 2> "$dir/err"
@@ -442,7 +446,7 @@ EOF
   request_id=$(request_id_for_kind "$dir" needs-decision)
   jq -e 'select(.reason == "timeout")' "$dir/state/cipher-hooks/holds/$request_id.json" >/dev/null \
     || fail "timeout did not create its bounded durable hold"
-  pass "gateway timeout is a durable fail-safe hold"
+  pass "system Python gateway timeout is a durable fail-safe hold"
 }
 
 assert_direct_merge_held() { # <dir> <id> <repo> <label>
