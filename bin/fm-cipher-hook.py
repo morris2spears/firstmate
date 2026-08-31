@@ -781,6 +781,9 @@ def post_once(
         response = connection.getresponse()
         raw = response.read(MAX_RESPONSE + 1)
         status_code = response.status
+    # socket.timeout is an alias of TimeoutError only from Python 3.10 onward.
+    # Stock macOS Apple Python 3.9 raises a distinct OSError subclass, so dropping
+    # it here would misclassify a gateway timeout as "unavailable".
     except (TimeoutError, socket.timeout):
         return "timeout", None, None
     except OSError:
