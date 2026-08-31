@@ -35,7 +35,8 @@ This preference is local to each Firstmate home and is not part of secondmate in
 
 ## Cipher/Hermes bridge
 
-The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the two repositories listed in `bin/fm-cipher-hook-repositories`.
+The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the two canonical iinvy repositories.
+Gated membership is decided by the literal case-insensitive `FM_CIPHER_GATED_REPOSITORIES` list in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh), which needs no file or configuration read, and `bin/fm-cipher-hook-repositories` carries the same list for the Python payload owner with a test holding the two in step.
 It is not a generic notification channel, does not copy Firstmate supervision state, and never sends worker prose.
 GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow iinvy production-outage inspection and merge action.
 
