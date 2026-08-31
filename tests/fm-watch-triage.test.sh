@@ -166,6 +166,25 @@ test_classifier_primitives() {
     && fail "a key token in note prose changed the decision key"
   printf '%s' "$open" | grep -F $'bad key\t' >/dev/null \
     && fail "an invalid key slug entered the open-decision set"
+  # Backward compatibility: note-placed keys used to degrade to "default", so
+  # every status file written before that placement was honored closed them with a
+  # bare "resolved:". That bare close must still close them, or already-settled
+  # decisions reopen as live blockers on the next fold.
+  printf 'needs-decision: [key=legacy-note] settled long ago\nresolved: captain answered in chat\n' \
+    > "$state/legacy-note.status"
+  [ -z "$(status_open_decisions "$state/legacy-note.status")" ] \
+    || fail "a bare resolved no longer closes a note-placed keyed decision"
+  printf 'needs-decision [key=explicit]: keyed open\nresolved: unrelated bare close\n' \
+    > "$state/explicit-key.status"
+  printf '%s' "$(status_open_decisions "$state/explicit-key.status")" | grep -F $'explicit\t' >/dev/null \
+    || fail "a bare resolved wrongly closed an explicitly keyed decision"
+  printf 'needs-decision: [key=note-a] first\nresolved [key=note-a]: closed by key\nneeds-decision [key=note-a]: reopened explicitly\nresolved: unrelated bare close\n' \
+    > "$state/note-then-explicit.status"
+  printf '%s' "$(status_open_decisions "$state/note-then-explicit.status")" | grep -F $'note-a\t' >/dev/null \
+    || fail "a stale note-placed key let a bare resolved close a later explicit open"
+  printf 'working: [key=legacy-phase] started\ndone: finished\n' > "$state/legacy-note-activity.status"
+  [ -z "$(status_open_activities "$state/legacy-note-activity.status")" ] \
+    || fail "a bare done no longer closes a note-placed working phase"
   cat > "$state/activity.status" <<'EOF'
 working [key=phase7]: Phase 7 started
 working [key=phase6]: Phase 6 started
