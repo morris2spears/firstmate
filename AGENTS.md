@@ -112,6 +112,7 @@ state/               volatile runtime signals; gitignored
   tg-away-versions/  away-mode immutable batch versions, one complete v.<id>/ copy of the escalation buffer, ledger sidecar, wedge marker, and digests per ledger transition, plus the single active/active.applied pointer and the .owner.lock every transition holds; the live artifacts are that pointer's projection, and retained versions fold into return catch-up and retire whole once it is acknowledged (bin/fm-away-ledger-lib.sh)
   pending-replies/   parent-owned secondmate pending-reply records (correlation id, delivery vs reply, recovery, escalation); fm-pending-reply-lib.sh
   cipher-hooks/      private request, sent, acknowledgement, hold, announcement, diagnostic, and authenticated-return records for the optional Cipher/Hermes bridge; bin/fm-cipher-hook.sh
+  .cipher-reconcile-cursor  private per-cadence resume point for the Cipher checks-green reconciliation sweep, naming the last gated task it took; never touch (docs/configuration.md "Cipher/Hermes bridge")
   cipher-receive.turn-ended  append-only content-free monitoring edge for authenticated Cipher return records already in the durable wake queue; bin/fm-cipher-receive.sh
   x-inbox/           generated X-mode pending mention payloads; fmx-respond drains it (section 14)
   x-context/         generated X-mode durable per-request reply context and one-wake offer markers, keyed by request_id; survives inbox cleanup and expires within seven days (section 14; bin/fm-x-lib.sh)

@@ -143,6 +143,9 @@ SH
   # check run of its own is the default, and is never green.
   cat > "$dir/fakebin/gh" <<'SH'
 #!/usr/bin/env bash
+# FM_TEST_GH_FAIL is a forge that cannot answer right now: gh exits non-zero
+# with no output, the way an auth, network, or rate-limit failure does.
+[ -z "${FM_TEST_GH_FAIL:-}" ] || exit 1
 case "${1:-} ${2:-}" in
   "pr view")
     case "$*" in
@@ -1338,7 +1341,115 @@ EOF
   pass "the forge snapshot query calls only a genuinely passed check rollup green"
 }
 
+test_reconcile_budget_reaches_every_gated_task_in_turn() {
+  local dir port out id delivered count cursor sweep number
+  dir=$(make_case reconcile-budget)
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] alpha-task - first gated pull request https://github.com/morris2spears/iinvy/issues/31 (kind: ship)
+- [ ] bravo-task - second gated pull request https://github.com/morris2spears/iinvy/issues/32 (kind: ship)
+- [ ] charlie-task - third gated pull request https://github.com/morris2spears/iinvy/issues/33 (kind: ship)
+EOF
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+
+  # Three gated pull requests, none green at registration, so no event is
+  # spent before the sweeps run.
+  number=31
+  for id in alpha-task bravo-task charlie-task; do
+    number=$((number + 1))
+    fm_write_meta "$dir/state/$id.meta" \
+      "window=fm-$id" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" "mode=no-mistakes"
+    FM_TEST_HEAD=$HEAD_A \
+    FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+      run_pr_check "$dir" "$id" "https://github.com/morris2spears/iinvy/pull/$number" \
+      > "$dir/$id.register.out" 2> "$dir/$id.register.err" \
+      || fail "registering $id failed"
+  done
+  assert_absent "$dir/state/cipher-hooks" "a not-green registration spent a Cipher event"
+
+  # A budget of one task per cadence must still reach all three, one per
+  # sweep, resuming after the task the previous sweep took.
+  delivered=
+  for sweep in 1 2 3; do
+    out=$(FM_CIPHER_RECONCILE_BUDGET=1 FM_TEST_HEAD=$HEAD_A \
+      FM_TEST_FORGE_GREEN='OPEN CLEAN' FM_TEST_FORGE_CHECKS=1 \
+      FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+      run_hook "$dir" reconcile 2> "$dir/budget-$sweep.err") \
+      || fail "budgeted reconcile sweep $sweep failed"
+    count=$(printf '%s\n' "$out" | grep -c 'iinvy-pr-ready' || true)
+    [ "$count" = 1 ] || fail "budgeted sweep $sweep delivered $count events: $out"
+    id=${out##* }
+    cursor=$(cat "$dir/state/.cipher-reconcile-cursor")
+    [ "$cursor" = "$id" ] \
+      || fail "budgeted sweep $sweep announced $id but resumes after $cursor"
+    case " $delivered " in
+      *" $id "*) fail "budgeted sweep $sweep repeated $id instead of advancing" ;;
+    esac
+    delivered="$delivered $id"
+  done
+  [ "$delivered" = " alpha-task bravo-task charlie-task" ] \
+    || fail "budgeted sweeps did not reach every gated task in turn:$delivered"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 3 ] || fail "budgeted sweeps delivered $count events"
+
+  # A fourth sweep wraps back to the first task, which is already acknowledged
+  # and announced, so the wrap is silent and spends nothing.
+  out=$(FM_CIPHER_RECONCILE_BUDGET=1 FM_TEST_HEAD=$HEAD_A \
+    FM_TEST_FORGE_GREEN='OPEN CLEAN' FM_TEST_FORGE_CHECKS=1 \
+    FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+    run_hook "$dir" reconcile 2>/dev/null) || fail "wrapped reconcile sweep failed"
+  [ -z "$out" ] || fail "the wrapped sweep re-announced a delivered event: $out"
+  [ "$(cat "$dir/state/.cipher-reconcile-cursor")" = alpha-task ] \
+    || fail "the sweep did not wrap back to the first gated task"
+  count=$(wc -l < "$dir/server.log" | tr -d ' ')
+  [ "$count" = 3 ] || fail "the wrapped sweep reached the gateway"
+  pass "a budgeted reconcile sweep reaches every gated task in turn across cadences"
+}
+
+test_recorded_head_survives_a_silent_forge() {
+  local dir head
+  dir=$(make_case head-preservation)
+  cat > "$dir/data/backlog.md" <<'EOF'
+- [ ] silent-forge-task - head preservation https://github.com/morris2spears/iinvy/issues/34 (kind: ship)
+EOF
+  fm_write_meta "$dir/state/silent-forge-task.meta" \
+    "window=fm-silent-forge-task" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" "mode=no-mistakes"
+  FM_TEST_HEAD=$HEAD_A FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+    run_pr_check "$dir" silent-forge-task https://github.com/morris2spears/iinvy/pull/34 \
+    > "$dir/register.out" 2> "$dir/register.err" || fail "registration failed"
+  head=$(grep '^pr_head=' "$dir/state/silent-forge-task.meta" | cut -d= -f2-)
+  [ "$head" = "$HEAD_A" ] || fail "registration did not record the exact head: $head"
+
+  # Re-registering the same pull request while the forge cannot answer is
+  # head-unknown, never head-changed, so the recorded exact head survives.
+  FM_TEST_GH_FAIL=1 FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+    run_pr_check "$dir" silent-forge-task https://github.com/morris2spears/iinvy/pull/34 \
+    > "$dir/silent.out" 2> "$dir/silent.err" || fail "re-registration under a silent forge failed"
+  head=$(grep '^pr_head=' "$dir/state/silent-forge-task.meta" | cut -d= -f2-)
+  [ "$head" = "$HEAD_A" ] || fail "a silent forge erased or changed the recorded head: $head"
+
+  # Registering a different pull request while the forge is silent records no
+  # head at all: the recorded one belongs to the previous pull request.
+  FM_TEST_GH_FAIL=1 FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+    run_pr_check "$dir" silent-forge-task https://github.com/morris2spears/iinvy/pull/35 \
+    > "$dir/replaced.out" 2> "$dir/replaced.err" || fail "replacement registration failed"
+  grep -q '^pr_head=' "$dir/state/silent-forge-task.meta" \
+    && fail "a replaced pull request inherited the previous pull request's head"
+  grep -qxF 'pr=https://github.com/morris2spears/iinvy/pull/35' "$dir/state/silent-forge-task.meta" \
+    || fail "the replacement pull request was not recorded"
+
+  # Once the forge answers again the head is refreshed from it.
+  FM_TEST_HEAD=$HEAD_B FM_TEST_CREW_STATE='state: working · source: run-step · ci running' \
+    run_pr_check "$dir" silent-forge-task https://github.com/morris2spears/iinvy/pull/35 \
+    > "$dir/recovered.out" 2> "$dir/recovered.err" || fail "recovered registration failed"
+  head=$(grep '^pr_head=' "$dir/state/silent-forge-task.meta" | cut -d= -f2-)
+  [ "$head" = "$HEAD_B" ] || fail "a recovered forge did not refresh the head: $head"
+  pass "a silent forge preserves the recorded exact head only for the same pull request"
+}
+
 test_forge_green_query_classifies_check_rollup
+test_reconcile_budget_reaches_every_gated_task_in_turn
+test_recorded_head_survives_a_silent_forge
 test_v2_decision_and_pr_delivery_dedupe
 test_note_keyed_decision_single_hook_and_park
 test_resolve_decision_requires_and_follows_authenticated_answer

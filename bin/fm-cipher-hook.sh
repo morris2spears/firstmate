@@ -296,11 +296,13 @@ EOF
       clear_marker "$id.pending"
       return 0
     }
-    # Markers outlive nothing they describe. A request marker is only ever
-    # written beside a durable acknowledgement, and a pending marker only ever
-    # for a live task, so a marker whose acknowledgement or task metadata is
-    # gone - a rebased head, a torn-down task - is orphaned and pruned here.
-    # Without this the directory grows one permanent entry per gated head.
+    # The announcement set is bounded by the bridge's own durable record set
+    # rather than pruned on a schedule of its own: a request marker is written
+    # only beside an acknowledgement, so the markers can never outnumber the
+    # acknowledgements they mirror and they retire with them. A marker whose
+    # acknowledgement or whose task metadata is already gone describes nothing
+    # and is dropped here, which is what keeps an interrupted announcement from
+    # outliving its task.
     prune_markers() {
       local file name
       [ -d "$ANNOUNCED" ] || return 0
