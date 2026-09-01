@@ -649,6 +649,9 @@ test_pr_check_allowlist_and_safe_holds() {
     || fail "the shell gate list and the Cipher allowlist file disagree"
   fm_cipher_repo_gated Morris2Spears/iinvy || fail "mixed-case iinvy owner was not recognized as gated"
   fm_cipher_repo_gated morris2spears/iinvy-control-plane || fail "the control-plane repository was not recognized as gated"
+  fm_cipher_repo_gated Morris2Spears/CutBot || fail "mixed-case cutbot repository was not recognized as gated"
+  fm_cipher_repo_gated Morris2Spears/Hermes-Agent-CutBot \
+    || fail "mixed-case hermes-agent-cutbot repository was not recognized as gated"
   fm_cipher_repo_gated example/other && fail "an unrelated repository was treated as gated"
   dir=$(make_case pr-check)
   export FM_TEST_CREW_STATE_MARKER="$dir/crew-state.called"
@@ -668,6 +671,21 @@ test_pr_check_allowlist_and_safe_holds() {
   set -e
   expect_code 0 "$rc" "non-green iinvy PR registration should keep waiting for checks"
   assert_absent "$dir/state/cipher-hooks" "non-green iinvy PR emitted a Cipher event"
+
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+  prepare_pr_case "$dir" green-cutbot morris2spears/cutbot > "$dir/cutbot.out" 2> "$dir/cutbot.err" \
+    || fail "green cutbot PR registration did not take the Cipher PR-ready path"
+  prepare_pr_case "$dir" green-hermes-agent-cutbot morris2spears/hermes-agent-cutbot \
+    > "$dir/hermes-agent-cutbot.out" 2> "$dir/hermes-agent-cutbot.err" \
+    || fail "green hermes-agent-cutbot PR registration did not take the Cipher PR-ready path"
+  jq -s -e '
+    length == 2
+    and ([.[].body.repository] | sort
+      == ["morris2spears/cutbot", "morris2spears/hermes-agent-cutbot"])
+    and all(.[].body.event_type; . == "iinvy-pr-ready")
+  ' "$dir/server.log" >/dev/null || fail "CutBot PR registrations did not emit the expected Cipher events"
+  stop_server "$(cat "$dir/server.pid")"
 
   for repo in "${FM_CIPHER_GATED_REPOSITORIES[@]}"; do
     rm -f "$dir/config/cipher-hooks" "$dir/crew-state.called"
@@ -715,7 +733,7 @@ test_pr_check_allowlist_and_safe_holds() {
   assert_direct_merge_held "$dir" invalid-iinvy morris2spears/iinvy "invalid iinvy acknowledgement"
   count=$(wc -l < "$dir/server.log" | tr -d ' ')
   [ "$count" -ge 1 ] || fail "invalid-response fake gateway was not exercised"
-  pass "only iinvy repositories emit at checks-green and every route failure holds them"
+  pass "only Cipher-gated repositories emit at checks-green and every route failure holds them"
 }
 
 test_iinvy_merge_requires_cipher_actor_and_exact_head() {
