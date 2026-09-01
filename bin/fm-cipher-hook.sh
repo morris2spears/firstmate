@@ -185,7 +185,7 @@ case "${1:-}" in
       exit 2
     fi
     run_python repo-gated "$FM_PR_PATH" || {
-      echo "error: Cipher hook refused: repository is not an iinvy production gate" >&2
+      echo "error: Cipher hook refused: repository is not a Cipher-gated production gate" >&2
       exit 2
     }
     STATE_LINE=$(current_state "$ID")
