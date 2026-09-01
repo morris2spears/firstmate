@@ -35,10 +35,10 @@ This preference is local to each Firstmate home and is not part of secondmate in
 
 ## Cipher/Hermes bridge
 
-The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the gated iinvy repositories listed in [`bin/fm-cipher-hook-repositories`](../bin/fm-cipher-hook-repositories).
+The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the gated repositories listed in [`bin/fm-cipher-hook-repositories`](../bin/fm-cipher-hook-repositories).
 Gated membership is decided by the literal case-insensitive `FM_CIPHER_GATED_REPOSITORIES` list in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh), which needs no file or configuration read, and `bin/fm-cipher-hook-repositories` carries the same list for the Python payload owner with a test holding the two in step.
 It is not a generic notification channel, does not copy Firstmate supervision state, and never sends worker prose.
-GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow iinvy production-outage inspection and merge action.
+GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow production-outage inspection and merge action for those gated repositories.
 
 The bridge reads `config/cipher-hooks` from the effective Firstmate home, or from `FM_CONFIG_OVERRIDE` for isolated tests.
 The file must be a regular single-link mode-0600 file with this exact key set and no duplicate or unknown keys:
@@ -65,7 +65,7 @@ The production sender does not send legacy `X-Webhook-Signature`.
 A doubly explicit test seam exercises Hermes's legacy body-only `X-Webhook-Signature` compatibility path, but no local production configuration value can select it.
 
 The compact JSON request is no larger than 4096 bytes and has exactly these versioned allowlisted fields: `schema`, `event_type`, `request_id`, `task_id`, `repository`, `issue_url`, `pr_url`, `pr_head_sha`, `decision_id`, and `evidence`.
-`event_type` is `needs-decision` or `iinvy-pr-ready`, which is the installed Hermes adapter's recognized event selector.
+`event_type` is `needs-decision` or `iinvy-pr-ready`, which is the installed Hermes adapter's recognized event selector; the `iinvy` prefix is that fixed selector name and carries no repository scope, so every gated repository emits it.
 Unknown values are JSON `null`, and evidence contains only the validated relative pointers `state/<task-id>.meta` and `state/<task-id>.status` with fixed kind names.
 The request ID is a stable SHA-256 identity over the event's own logical scope: a decision identity covers only the schema, event type, task, repository, and decision key, while a PR-ready identity covers the whole exact-head event, so a keyed decision emits once even after PR metadata is later recorded and each distinct PR head emits once.
 The first recorded request body for a logical decision stays canonical, so a later repeat of the same key retries or dedupes that exact body rather than sending a second event.
@@ -82,7 +82,7 @@ Only the first unchanged hold emits its bounded actionable diagnostic.
 Recovery from a transient hold is automatic: the watcher's slow check cadence runs `bin/fm-cipher-hook.sh retry-held` whenever hold records exist, so an event held while the gateway was down, timing out, or returning a transient HTTP failure is redelivered after the gateway recovers, with no manual record edits.
 Each retried event re-enters its own preflighted trigger path and adopts the recorded request, so the exact body and request ID are resent and the gateway's idempotent duplicate response remains a success.
 A transiently held event whose task records are gone, whose identity was replaced by a newer exact-head event, or whose decision was closed through the existing authority is durably marked superseded instead of retried, and the sweep reports only delivered or superseded outcomes.
-A held iinvy pull-request event is deliberately not superseded when its checks are merely not green right now - checks can regress and return to green on the same head under the same request identity - so it keeps retrying until it is delivered or until teardown removes the task records.
+A held gated pull-request event is deliberately not superseded when its checks are merely not green right now - checks can regress and return to green on the same head under the same request identity - so it keeps retrying until it is delivered or until teardown removes the task records.
 Configuration-class holds - a missing or invalid route configuration, a bad secret, a non-transient HTTP rejection, or an invalid acknowledgement - are deliberately not auto-retried; after repairing the configuration, re-run the original trigger command, which adopts and retries the same recorded event.
 
 Checks-green reconciliation is likewise automatic and durable rather than agent-driven.
@@ -100,7 +100,7 @@ Firstmate keeps the worker parked until it fetches the exact durable GitHub comm
 After sending the worker its decision, `bin/fm-cipher-hook.sh resolve-decision <task-id> <request-id>` durably closes the keyed status decision with one idempotent `resolved [key=<decision-id>]: Cipher decision accepted <comment-url>` line, so an answered decision cannot linger open and any held duplicate delivery supersedes on the next sweep.
 That command refuses unless both the acknowledged needs-decision request and the authenticated decision-comment record exist, so a decision can never be marked Cipher-answered without its durable GitHub answer.
 
-The iinvy route is fail-safe rather than optional for every repository listed in `bin/fm-cipher-hook-repositories`, the single owner of the gated set.
+The `iinvy_pr_ready_route` is fail-safe rather than optional for every repository listed in `bin/fm-cipher-hook-repositories`, the single owner of the gated set.
 A missing config, disabled route, unavailable gateway, timeout, invalid response, or missing exact head holds those merges, while every other repository keeps its existing PR-ready and merge behavior without reading bridge configuration or sending an event.
 Cipher's review is limited to cross-repository provider and consumer contracts, migration and deployment ordering, runtime dependency install/import/restart behavior, and production-realistic smoke or health gates.
 Cipher invokes `bin/fm-cipher-hook.sh merge` with the request ID it inspected, and the guarded merge path adds GitHub's exact-head condition so a later head cannot inherit an earlier inspection.
@@ -114,7 +114,7 @@ The receive command validates those identities, appends one durable notification
 A self-repo ship worker can therefore coexist with the real primary without appearing to be a second primary to Hermes, while terminal transports retain their exactly-one-primary safety check unchanged.
 
 For a local rollback, stop the Hermes route first, set `decision_route=disabled` to restore ordinary decision handling, then remove `config/cipher-hooks` and its secret when no event is in flight.
-Removing or disabling the iinvy route deliberately leaves iinvy merges held and never restores autonomous merging.
+Removing or disabling `iinvy_pr_ready_route` deliberately leaves gated merges held and never restores autonomous merging.
 Reverting the tracked feature is the only rollback that removes that production boundary.
 The private event records contain no secret and can remain for restart-safe deduplication.
 

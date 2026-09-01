@@ -131,7 +131,7 @@ fm_pr_poll_publish_prepared || {
 
 printf 'armed: state/%s.check.sh\n' "$ID"
 
-# Canonical iinvy checks-green transitions are routed only after metadata and
+# Canonical gated checks-green transitions are routed only after metadata and
 # the merge poll bind the exact PR head, and an armed task that cannot be
 # routed holds. Every other repository keeps the existing PR-ready path and
 # does not read Cipher config or spend a token.
