@@ -69,12 +69,21 @@ fi
 # bin/fm-teardown.sh reads the head from the forge at teardown rather than from
 # metadata and falls back to its provider-agnostic content check, and
 # bin/fm-review-diff.sh resolves the head from the remote when none is recorded.
-WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+#
+# A forge that cannot answer right now is head-unknown, never head-changed, so
+# an already recorded head is kept rather than erased: dropping it would break
+# the exact-head request identity of an event already in flight and leave every
+# later re-registration comparing against nothing. A head that genuinely moved
+# is still refreshed, because the forge answered in that case. The recorded
+# head is only ever carried forward for the pull request it was recorded
+# against, so registering a different pull request while the forge is silent
+# records no head at all rather than the previous one's.
 PR_HEAD=
-if [ "$PROVIDER" = github ] && [ -n "$WT" ] && [ -d "$WT" ] && command -v gh >/dev/null 2>&1; then
-  if REMOTE_HEAD=$(cd "$WT" && gh pr view "$URL" --json headRefOid -q .headRefOid 2>/dev/null) \
-    && fm_pr_head_valid "$REMOTE_HEAD"; then
-    PR_HEAD=$REMOTE_HEAD
+if [ "$PROVIDER" = github ]; then
+  PR_HEAD=$(fm_pr_github_live_head "$META" "$URL")
+  if [ -z "$PR_HEAD" ] && grep -qxF "pr=$URL" "$META"; then
+    PR_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2-) || true
+    fm_pr_head_valid "$PR_HEAD" || PR_HEAD=
   fi
 fi
 

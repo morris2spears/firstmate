@@ -35,7 +35,7 @@ This preference is local to each Firstmate home and is not part of secondmate in
 
 ## Cipher/Hermes bridge
 
-The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the two canonical iinvy repositories.
+The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the gated iinvy repositories listed in [`bin/fm-cipher-hook-repositories`](../bin/fm-cipher-hook-repositories).
 Gated membership is decided by the literal case-insensitive `FM_CIPHER_GATED_REPOSITORIES` list in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh), which needs no file or configuration read, and `bin/fm-cipher-hook-repositories` carries the same list for the Python payload owner with a test holding the two in step.
 It is not a generic notification channel, does not copy Firstmate supervision state, and never sends worker prose.
 GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow iinvy production-outage inspection and merge action.
@@ -73,8 +73,8 @@ A first delivery succeeds only on HTTP 202 with exactly `{"status":"accepted","r
 An idempotent retry succeeds only on HTTP 200 with exactly `{"status":"duplicate","delivery_id":"<same-request-id>"}` and no additional fields.
 Every other HTTP status or response shape is invalid and holds the event.
 
-`bin/fm-cipher-hook.sh` validates current reconciled state before delivery, and `bin/fm-cipher-hook.py` owns the payload, HMAC, retry, response, and private-record mechanics.
-Requests are written before network delivery under mode-0700 `state/cipher-hooks/`, with separate mode-0600 request, sent, acknowledgement, hold, diagnostic, and authenticated-return records.
+`bin/fm-cipher-hook.sh` validates genuine current state before delivery - reconciled local state, or for the PR-ready event GitHub's own answer that the pull request is open, CLEAN, and carries a passed check rollup - and `bin/fm-cipher-hook.py` owns the payload, HMAC, retry, response, and private-record mechanics.
+Requests are written before network delivery under mode-0700 `state/cipher-hooks/`, with separate mode-0600 request, sent, acknowledgement, hold, announcement, diagnostic, and authenticated-return records.
 An acknowledged logical event is not sent again after restart, while a transiently held event retries the same exact body and request ID with a fresh V2 timestamp.
 Timeouts, connection failures, transient HTTP failures, authentication failures, malformed responses, unsafe local files, and schema failures never print a response body or secret.
 Only the first unchanged hold emits its bounded actionable diagnostic.
@@ -85,6 +85,14 @@ A transiently held event whose task records are gone, whose identity was replace
 A held iinvy pull-request event is deliberately not superseded when its checks are merely not green right now - checks can regress and return to green on the same head under the same request identity - so it keeps retrying until it is delivered or until teardown removes the task records.
 Configuration-class holds - a missing or invalid route configuration, a bad secret, a non-transient HTTP rejection, or an invalid acknowledgement - are deliberately not auto-retried; after repairing the configuration, re-run the original trigger command, which adopts and retries the same recorded event.
 
+Checks-green reconciliation is likewise automatic and durable rather than agent-driven.
+On the same slow check cadence, the watcher runs `bin/fm-cipher-hook.sh reconcile`, which re-registers every recorded gated pull request that is currently checks-green through `bin/fm-pr-check.sh`, the one canonical trigger that refreshes the exact head and re-enters the idempotent PR-ready path.
+Checks-green itself is decided by local current-state reconciliation or by GitHub's own answer, whichever reports it first, so a wedged or stale local CI monitor cannot silently keep a forge-green pull request from ever emitting its event.
+The forge answer is deliberately strict: the pull request must be open and CLEAN and its own check rollup must carry at least one passed check with nothing still running or unsuccessful, because GitHub reports CLEAN for a pull request that has no checks at all - before CI registers its first run, and permanently in a repository that requires none - and such a pull request has verified nothing.
+A green transition reached only after registration - a rebase or sync onto the current default branch, a repair or recovery, or a manual coordinator reconciliation run directly in the task's local copy - therefore still emits its exact-head event even though the registration-time trigger saw the pull request before it was green.
+Selecting the gated pull requests costs no forge call, but each selected one does, so a single sweep spends at most `FM_CIPHER_RECONCILE_BUDGET` (default 8) forge round trips and the next sweep resumes at the task after the last one it took; every gated task is therefore still reached across cadences even when a home has more gated pull requests than one watcher check timeout can serve.
+The sweep wakes Firstmate with a `cipher-reconcile` check notification only when a new event is acknowledged; a task that is not green, an identity that is already acknowledged, and a held identity awaiting retry or configuration repair all stay silent, so repeated reconciliation never redelivers.
+
 An absent bridge or `decision_route=disabled` leaves the existing Firstmate decision authority unchanged.
 When the decision route is enabled, Cipher may select only a routine reversible option within the accepted GitHub issue contract and must write its recommendation, selected option, reasoning, and reversal path on GitHub before asking Firstmate to continue.
 Cipher escalates to Morris instead of deciding when no safe recommendation exists or the choice expands the product or engineering contract, is destructive or irreversible, changes security or credentials, migrates production data, or spends money.
@@ -92,7 +100,7 @@ Firstmate keeps the worker parked until it fetches the exact durable GitHub comm
 After sending the worker its decision, `bin/fm-cipher-hook.sh resolve-decision <task-id> <request-id>` durably closes the keyed status decision with one idempotent `resolved [key=<decision-id>]: Cipher decision accepted <comment-url>` line, so an answered decision cannot linger open and any held duplicate delivery supersedes on the next sweep.
 That command refuses unless both the acknowledged needs-decision request and the authenticated decision-comment record exist, so a decision can never be marked Cipher-answered without its durable GitHub answer.
 
-The iinvy route is fail-safe rather than optional for `morris2spears/iinvy` and `morris2spears/iinvy-storefront`.
+The iinvy route is fail-safe rather than optional for every repository listed in `bin/fm-cipher-hook-repositories`, the single owner of the gated set.
 A missing config, disabled route, unavailable gateway, timeout, invalid response, or missing exact head holds those merges, while every other repository keeps its existing PR-ready and merge behavior without reading bridge configuration or sending an event.
 Cipher's review is limited to cross-repository provider and consumer contracts, migration and deployment ordering, runtime dependency install/import/restart behavior, and production-realistic smoke or health gates.
 Cipher invokes `bin/fm-cipher-hook.sh merge` with the request ID it inspected, and the guarded merge path adds GitHub's exact-head condition so a later head cannot inherit an earlier inspection.
@@ -553,6 +561,7 @@ FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartb
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or X-mode/Telegram-mode dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
+FM_CIPHER_RECONCILE_BUDGET=8   # forge round trips one Cipher checks-green reconciliation sweep may spend; the next sweep resumes after the last task it took ("Cipher/Hermes bridge")
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code

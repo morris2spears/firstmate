@@ -3,8 +3,10 @@
 # Cipher's narrow exact-head entrypoint into the guarded iinvy merge path.
 #
 # `needs-decision` first proves that the named keyed decision remains open and
-# current; `pr-ready` first proves that current-state reconciliation reports a
-# checks-green PR. The Python module receives only validated identity fields,
+# current; `pr-ready` first proves the PR is genuinely checks-green - either
+# current-state reconciliation reports it, or GitHub itself reports the pull
+# request open and CLEAN, so a wedged or stale local CI monitor cannot hide a
+# forge-green PR forever. The Python module receives only validated identity fields,
 # never worker prose. It owns strict payload/config validation, HMAC-SHA256 over
 # the exact request bytes, stable request IDs, private request/sent/ack/hold
 # records under state/cipher-hooks/, bounded retry, and localhost transport.
@@ -37,11 +39,24 @@
 # <comment-url>" status line while the keyed decision is still open, so an
 # answered decision cannot linger stale or keep held duplicates alive.
 #
+# `reconcile` is the watcher's checks-green reconciliation sweep. For every
+# recorded gated GitHub pull request that is currently checks-green - by local
+# reconciliation or by GitHub's own open-and-CLEAN answer - it re-registers
+# through bin/fm-pr-check.sh - the one canonical trigger, which refreshes the
+# exact head and re-enters this pr-ready path - so a green transition reached
+# after registration (a rebase or sync, a repair or recovery, a manual
+# coordinator reconciliation, a wedged local CI monitor) still emits its
+# exact-head event durably instead of relying on agent prose. It prints one
+# line per newly acknowledged event and nothing otherwise; a held current
+# identity stays with `retry-held` or, for configuration-class holds, with
+# captain repair.
+#
 # Usage:
 #   fm-cipher-hook.sh needs-decision <task-id> [decision-id]
 #   fm-cipher-hook.sh pr-ready <task-id> <pr-url>
 #   fm-cipher-hook.sh retry-held
 #   fm-cipher-hook.sh resolve-decision <task-id> <request-id>
+#   fm-cipher-hook.sh reconcile
 #   fm-cipher-hook.sh merge <task-id> <pr-url> <request-id> [-- <extra merge args>]
 #   fm-cipher-hook.sh verify-merge <task-id> <pr-url> <request-id>
 #   fm-cipher-hook.sh repo-gated <owner/repo>
@@ -61,7 +76,7 @@ CREW_STATE_BIN=${FM_CREW_STATE_BIN:-$SCRIPT_DIR/fm-crew-state.sh}
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 
 usage() {
-  sed -n '2,47s/^# \{0,1\}//p' "$0"
+  sed -n '2,62s/^# \{0,1\}//p' "$0"
 }
 
 run_python() {
@@ -74,6 +89,20 @@ run_python() {
 
 current_state() { # <task-id>
   "$CREW_STATE_BIN" "$1" 2>/dev/null || true
+}
+
+# Checks-green means local reconciliation reports it OR the forge itself does.
+# Local run-step state is the cheap primary read, but it can under-report while
+# the pipeline's own CI monitor is wedged or stale, so GitHub's own answer is
+# accepted as equal truth before an event is refused or skipped. That forge
+# answer is deliberately strict - open, CLEAN, and a check rollup carrying a
+# real passed check - so a pull request whose CI has not run cannot pass as
+# green here (see fm_pr_github_snapshot in bin/fm-pr-lib.sh).
+pr_checks_green_now() { # <current-state-line> <pr-url>
+  case "$1" in
+    "state: done"*"checks green"*) return 0 ;;
+  esac
+  fm_pr_github_checks_green "$2"
 }
 
 decision_is_open() { # <task-id> <decision-id>
@@ -160,10 +189,7 @@ case "${1:-}" in
       exit 2
     }
     STATE_LINE=$(current_state "$ID")
-    case "$STATE_LINE" in
-      "state: done"*"checks green"*) ;;
-      *) exit 4 ;;
-    esac
+    pr_checks_green_now "$STATE_LINE" "$URL" || exit 4
     run_python deliver iinvy-pr-ready "$ID" "$URL"
     exit $?
     ;;
@@ -206,18 +232,194 @@ case "${1:-}" in
           # the event on a temporarily not-green read would drop a delivery
           # that must still retry. A merged or declined pull request instead
           # supersedes once teardown removes the task metadata.
-          case "$STATE_LINE" in
-            "state: done"*"checks green"*)
-              if FM_CIPHER_RETRIES=1 run_python deliver iinvy-pr-ready "$ID" "$ARGUMENT"; then
-                printf 'delivered %s iinvy-pr-ready %s\n' "$REQUEST_ID" "$ID"
-              fi
-              ;;
-          esac
+          if pr_checks_green_now "$STATE_LINE" "$ARGUMENT"; then
+            if FM_CIPHER_RETRIES=1 run_python deliver iinvy-pr-ready "$ID" "$ARGUMENT"; then
+              printf 'delivered %s iinvy-pr-ready %s\n' "$REQUEST_ID" "$ID"
+            fi
+          fi
           ;;
       esac
     done <<EOF
 $PLAN
 EOF
+    exit 0
+    ;;
+  reconcile)
+    [ "$#" -eq 1 ] || { echo "error: invalid Cipher hook request" >&2; exit 2; }
+    ACKS="$STATE/cipher-hooks/acks"
+    HOLDS="$STATE/cipher-hooks/holds"
+    ANNOUNCED="$STATE/cipher-hooks/announced"
+    # The sweep runs on the watcher's own cadence, so bin/fm-pr-check.sh is
+    # invoked here by a descendant of the watcher rather than by an agent or
+    # coordinator. Its migration takes watcher exclusion by terminating the
+    # live watcher, which would be this process's own ancestor, so the
+    # watcher-internal path asks the migration to defer instead. An un-migrated
+    # home simply reconciles on a later cadence, after a coordinator-run
+    # bin/fm-pr-check.sh has crossed that boundary safely.
+    export FM_PR_CHECK_MIGRATION_DEFER=1
+    # An announcement is durable, not in-process: the check that prints it can
+    # be killed by the watcher's check timeout after the acknowledgement is
+    # already written, and diffing the acks directory in memory would then
+    # leave that PR-ready silently unannounced forever. A task the sweep is
+    # about to register is marked pending first and unmarked as soon as that
+    # iteration reaches any outcome of its own, so the marker outlives the
+    # iteration only when the sweep was killed inside the delivery window and
+    # a later cadence still owes the announcement. An acknowledgement the
+    # sweep never registered was already reported by its own registration or
+    # by the retry-held sweep, so it is recorded as announced without a wake
+    # and steady state stays silent.
+    marker_path() { # <name>
+      case "$1" in
+        *[!A-Za-z0-9._-]*|''|.|..) return 1 ;;
+      esac
+      printf '%s/%s\n' "$ANNOUNCED" "$1"
+    }
+    mark_announced() { # <name>
+      local file
+      file=$(marker_path "$1") || return 0
+      (umask 077 && mkdir -p "$ANNOUNCED" && : > "$file") 2>/dev/null || true
+      return 0
+    }
+    clear_marker() { # <name>
+      local file
+      file=$(marker_path "$1") || return 0
+      rm -f -- "$file" 2>/dev/null || true
+      return 0
+    }
+    announce_reconciled() { # <request-id> <task-id>
+      local rid=$1 id=$2 file
+      file=$(marker_path "$rid") || { clear_marker "$id.pending"; return 0; }
+      if [ ! -f "$file" ]; then
+        printf 'delivered %s iinvy-pr-ready %s\n' "$rid" "$id"
+        mark_announced "$rid"
+      fi
+      clear_marker "$id.pending"
+      return 0
+    }
+    # The announcement set is bounded by the bridge's own durable record set
+    # rather than pruned on a schedule of its own: a request marker is written
+    # only beside an acknowledgement, so the markers can never outnumber the
+    # acknowledgements they mirror and they retire with them. A marker whose
+    # acknowledgement or whose task metadata is already gone describes nothing
+    # and is dropped here, which is what keeps an interrupted announcement from
+    # outliving its task.
+    prune_markers() {
+      local file name
+      [ -d "$ANNOUNCED" ] || return 0
+      for file in "$ANNOUNCED"/*; do
+        [ -f "$file" ] || continue
+        name=$(basename "$file")
+        case "$name" in
+          *.pending)
+            [ -f "$STATE/${name%.pending}.meta" ] || rm -f -- "$file" 2>/dev/null || true
+            ;;
+          *)
+            [ -f "$ACKS/$name.json" ] || rm -f -- "$file" 2>/dev/null || true
+            ;;
+        esac
+      done
+      return 0
+    }
+    reconcile_task() { # <task-id> <pr-url>
+      local ID=$1 URL=$2 META="$STATE/$1.meta"
+      local WORKTREE LIVE_HEAD STATE_LINE RECORDED_HEAD RID
+      [ -f "$META" ] && [ ! -L "$META" ] || return 0
+      # One forge round-trip answers both questions this sweep asks of a gated
+      # pull request - is it green, and where is its head now - inside a check
+      # budget shared with every other task in the glob.
+      WORKTREE=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2-)
+      fm_pr_github_snapshot "$WORKTREE" "$URL"
+      LIVE_HEAD=$FM_PR_GITHUB_HEAD
+      STATE_LINE=$(current_state "$ID")
+      case "$STATE_LINE" in
+        "state: done"*"checks green"*) ;;
+        *) [ "$FM_PR_GITHUB_GREEN" = 1 ] || return 0 ;;
+      esac
+      RECORDED_HEAD=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2-)
+      RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || RID=
+      if [ -z "$LIVE_HEAD" ] || [ "$LIVE_HEAD" = "$RECORDED_HEAD" ]; then
+        # Same or unknown live head: an acknowledged current identity is
+        # complete and only needs its announcement to be durable, and a held
+        # one belongs to retry-held or captain repair. Only a live head that
+        # moved past the recorded one re-registers regardless, so a post-hold
+        # rebase still gets its fresh event.
+        if [ -n "$RID" ] && [ -f "$ACKS/$RID.json" ]; then
+          if [ -f "$ANNOUNCED/$ID.pending" ]; then
+            announce_reconciled "$RID" "$ID"
+          else
+            mark_announced "$RID"
+          fi
+          return 0
+        fi
+        if [ -n "$RID" ] && [ -f "$HOLDS/$RID.json" ]; then
+          clear_marker "$ID.pending"
+          return 0
+        fi
+      fi
+      mark_announced "$ID.pending"
+      "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL" >/dev/null 2>&1 || true
+      RID=$(run_python request-id "$ID" "$URL" 2>/dev/null) || RID=
+      if [ -n "$RID" ] && [ -f "$ACKS/$RID.json" ]; then
+        announce_reconciled "$RID" "$ID"
+      else
+        clear_marker "$ID.pending"
+      fi
+      return 0
+    }
+    # Selecting the gated pull requests costs no forge call, so the whole
+    # inventory is always known; only the per-task forge work is bounded. The
+    # watcher runs this sweep under a check timeout, and an unbounded sweep
+    # killed by it would restart at the same alphabetical head every cadence
+    # and never reach the later tasks - the very class of missed transition
+    # this sweep exists to close. So the sweep resumes where the last one
+    # stopped and takes at most a fixed number of tasks per cadence, and it
+    # records each task as taken before spending the round trip, so even a task
+    # whose own iteration is killed cannot pin the cursor and starve the rest.
+    RECONCILE_IDS=()
+    RECONCILE_URLS=()
+    for META in "$STATE"/*.meta; do
+      [ -f "$META" ] && [ ! -L "$META" ] || continue
+      ID=$(basename "$META" .meta)
+      fm_task_id_creation_valid "$ID" || continue
+      URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2-)
+      [ -n "$URL" ] || continue
+      fm_pr_url_parse "$URL" || continue
+      [ "$FM_PR_PROVIDER" = github ] || continue
+      fm_cipher_repo_gated "$FM_PR_PATH" || continue
+      RECONCILE_IDS+=("$ID")
+      RECONCILE_URLS+=("$URL")
+    done
+    TOTAL=${#RECONCILE_IDS[@]}
+    if [ "$TOTAL" -gt 0 ]; then
+      # Sweep bookkeeping, never a Cipher record, so it lives beside the task
+      # state rather than inside the private cipher-hooks record tree, which
+      # exists only once a real event does.
+      CURSOR="$STATE/.cipher-reconcile-cursor"
+      BUDGET=${FM_CIPHER_RECONCILE_BUDGET:-8}
+      case "$BUDGET" in
+        ''|*[!0-9]*|0) BUDGET=8 ;;
+      esac
+      LAST=
+      [ ! -f "$CURSOR" ] || LAST=$(head -1 "$CURSOR" 2>/dev/null) || LAST=
+      START=0
+      INDEX=0
+      while [ "$INDEX" -lt "$TOTAL" ]; do
+        if [ "${RECONCILE_IDS[$INDEX]}" = "$LAST" ]; then
+          START=$(( (INDEX + 1) % TOTAL ))
+          break
+        fi
+        INDEX=$((INDEX + 1))
+      done
+      TAKEN=0
+      while [ "$TAKEN" -lt "$TOTAL" ] && [ "$TAKEN" -lt "$BUDGET" ]; do
+        INDEX=$(( (START + TAKEN) % TOTAL ))
+        TAKEN=$((TAKEN + 1))
+        ID=${RECONCILE_IDS[$INDEX]}
+        (umask 077 && printf '%s\n' "$ID" > "$CURSOR") 2>/dev/null || true
+        reconcile_task "$ID" "${RECONCILE_URLS[$INDEX]}"
+      done
+    fi
+    prune_markers
     exit 0
     ;;
   verify-merge)
