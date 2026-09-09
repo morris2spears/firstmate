@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deliver the two versioned, authenticated Cipher/Hermes transitions and provide
-# Cipher's narrow exact-head entrypoint into the guarded iinvy merge path.
+# Cipher's narrow exact-head entrypoint into the guarded gated-repository merge path.
 #
 # `needs-decision` first proves that the named keyed decision remains open and
 # current; `pr-ready` first proves the PR is genuinely checks-green - either
@@ -18,10 +18,10 @@
 # An absent or explicitly disabled decision route exits 3 without changing the
 # existing decision authority. A gated PR that is not currently green exits 4
 # without delivery so ordinary PR registration can continue waiting for checks.
-# The iinvy PR-ready route otherwise refuses on every
+# The gated PR-ready route otherwise refuses on every
 # missing, disabled, malformed, unavailable, timed-out, or invalid-response case.
 # Only Cipher invokes `merge`; firstmate's ordinary merge command is separately
-# guarded and accepts an iinvy merge only with this event's acknowledged request
+# guarded and accepts a gated merge only with this event's acknowledged request
 # identity, while GitHub's exact-head condition prevents a later head from riding
 # an earlier inspection.
 #
@@ -185,7 +185,7 @@ case "${1:-}" in
       exit 2
     fi
     run_python repo-gated "$FM_PR_PATH" || {
-      echo "error: Cipher hook refused: repository is not an iinvy production gate" >&2
+      echo "error: Cipher hook refused: repository is not a Cipher-gated production gate" >&2
       exit 2
     }
     STATE_LINE=$(current_state "$ID")

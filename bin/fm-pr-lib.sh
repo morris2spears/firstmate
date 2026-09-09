@@ -321,6 +321,8 @@ FM_CIPHER_GATED_REPOSITORIES=(
   morris2spears/iinvy
   morris2spears/iinvy-storefront
   morris2spears/iinvy-control-plane
+  morris2spears/cutbot
+  morris2spears/hermes-agent-cutbot
 )
 
 fm_cipher_repo_gated() { # <owner/repo>

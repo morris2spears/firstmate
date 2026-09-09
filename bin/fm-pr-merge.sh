@@ -99,12 +99,12 @@ CIPHER_HEAD=
 if fm_cipher_repo_gated "$PR_OWNER/$PR_REPO"; then
   reject_cipher_head_override "$@" || exit 1
   "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || {
-    echo "error: this iinvy PR is not currently checks-green or its Cipher event is held" >&2
+    echo "error: this Cipher-gated PR is not currently checks-green or its Cipher event is held" >&2
     exit 1
   }
   CIPHER_HEAD=$("$SCRIPT_DIR/fm-cipher-hook.sh" verify-merge \
     "$ID" "$URL" "${FM_CIPHER_MERGE_REQUEST_ID:-}") || {
-      echo "error: this iinvy merge remains held for Cipher's exact-head production inspection" >&2
+      echo "error: this Cipher-gated merge remains held for Cipher's exact-head production inspection" >&2
       exit 1
     }
 fi
