@@ -350,7 +350,8 @@ def usage() -> str:
     return (
         "usage: fm-cipher-repositories.sh <list|inspect|validate> [--json] | "
         "fm-cipher-repositories.sh <add|remove|contains> <owner/repo> | "
-        "fm-cipher-repositories.sh rollback"
+        "fm-cipher-repositories.sh rollback | "
+        "fm-cipher-repositories.sh hold-shared-exec -- <command> [args...]"
     )
 
 
@@ -360,6 +361,10 @@ def main(argv: list[str]) -> int:
         return 0 if argv else 2
     command = argv[0]
     try:
+        if command == "hold-shared-exec" and len(argv) >= 3 and argv[1] == "--":
+            with registration_lock(exclusive=False):
+                os.execvp(argv[2], argv[2:])
+            return 1
         if command == "contains" and len(argv) == 2:
             return 0 if repository_registered(argv[1]) else 1
         if command in {"list", "inspect", "validate"} and argv[1:] in ([], ["--json"]):

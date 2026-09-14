@@ -32,6 +32,23 @@ HOST=$FM_PR_HOST
 PROJECT_PATH=$FM_PR_PATH
 NUMBER=$FM_PR_NUMBER
 
+# Publishing pr= metadata and reading Cipher gated membership must be atomic
+# with respect to `fm-cipher-repositories.sh remove`, or a removal can land
+# between the two and silently drop in-flight gated work. Re-exec once under
+# the same shared registration lock `remove` takes exclusively; the flock
+# survives execve and releases only when this process exits.
+if [ "$PROVIDER" = github ] && [ -z "${FM_PR_CHECK_CIPHER_LOCK_HELD:-}" ]; then
+  CIPHER_CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+  if [ -d "$CIPHER_CONFIG" ] && [ ! -L "$CIPHER_CONFIG" ]; then
+    CIPHER_PYTHON="${FM_CIPHER_PYTHON:-python3}"
+    if command -v "$CIPHER_PYTHON" >/dev/null 2>&1; then
+      export FM_PR_CHECK_CIPHER_LOCK_HELD=1
+      exec "$CIPHER_PYTHON" "$SCRIPT_DIR/fm_cipher_repositories.py" hold-shared-exec -- \
+        "${BASH:-bash}" "$0" "$ID" "$RAW_URL"
+    fi
+  fi
+fi
+
 # Task-derived paths are constructed only after the canonical ID validation.
 META="$STATE/$ID.meta"
 if [ ! -f "$META" ] || [ -L "$META" ] || [ "$(fm_pr_file_link_count "$META")" != 1 ]; then
