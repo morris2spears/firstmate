@@ -175,7 +175,7 @@ def _config_directory() -> Path:
 
 
 @contextmanager
-def registration_lock(*, exclusive: bool) -> Iterator[None]:
+def registration_lock(*, exclusive: bool, inheritable: bool = False) -> Iterator[None]:
     _config_directory()
     _, _, _, lock_path = registration_paths()
     flags = os.O_RDWR | os.O_CREAT
@@ -194,6 +194,8 @@ def registration_lock(*, exclusive: bool) -> Iterator[None]:
         ):
             raise RegistrationError("repository registration lock is unsafe")
         fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        if inheritable:
+            os.set_inheritable(fd, True)
         yield
     finally:
         os.close(fd)
@@ -362,7 +364,7 @@ def main(argv: list[str]) -> int:
     command = argv[0]
     try:
         if command == "hold-shared-exec" and len(argv) >= 3 and argv[1] == "--":
-            with registration_lock(exclusive=False):
+            with registration_lock(exclusive=False, inheritable=True):
                 os.execvp(argv[2], argv[2:])
             return 1
         if command == "contains" and len(argv) == 2:
