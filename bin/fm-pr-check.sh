@@ -135,10 +135,21 @@ printf 'armed: state/%s.check.sh\n' "$ID"
 # the merge poll bind the exact PR head, and an armed task that cannot be
 # routed holds. Every other repository keeps the existing PR-ready path and
 # does not read Cipher config or spend a token.
-if [ "$PROVIDER" = github ] && fm_cipher_repo_gated "$PROJECT_PATH"; then
-  CIPHER_RC=0
-  "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || CIPHER_RC=$?
-  if [ "$CIPHER_RC" -ne 0 ] && [ "$CIPHER_RC" -ne 4 ]; then
-    exit 1
-  fi
+if [ "$PROVIDER" = github ]; then
+  REPOSITORY_RC=0
+  fm_cipher_repo_gated "$PROJECT_PATH" || REPOSITORY_RC=$?
+  case "$REPOSITORY_RC" in
+    0)
+      CIPHER_RC=0
+      "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || CIPHER_RC=$?
+      if [ "$CIPHER_RC" -ne 0 ] && [ "$CIPHER_RC" -ne 4 ]; then
+        exit 1
+      fi
+      ;;
+    1) ;;
+    *)
+      echo "error: Cipher repository registration is unavailable; PR registration remains held" >&2
+      exit 1
+      ;;
+  esac
 fi

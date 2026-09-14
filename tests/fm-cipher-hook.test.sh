@@ -13,6 +13,7 @@ HOOK="$ROOT/bin/fm-cipher-hook.sh"
 RECEIVE="$ROOT/bin/fm-cipher-receive.sh"
 PR_CHECK="$ROOT/bin/fm-pr-check.sh"
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
+REPOSITORIES="$ROOT/bin/fm-cipher-repositories.sh"
 TMP_ROOT=$(fm_test_tmproot fm-cipher-hook-tests)
 SECRET='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 HEAD_A='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -198,6 +199,16 @@ run_hook() { # <dir> <args...>
   FM_TEST_GH_AXI_LOG="$dir/gh-axi.log" \
   PATH="$dir/fakebin:$PATH" \
     "$HOOK" "$@"
+}
+
+run_repositories() { # <dir> <args...>
+  local dir=$1
+  shift
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_HOME="$dir" \
+  FM_STATE_OVERRIDE="$dir/state" \
+  FM_CONFIG_OVERRIDE="$dir/config" \
+    "$REPOSITORIES" "$@"
 }
 
 run_pr_check() { # <dir> <id> <url>
@@ -642,18 +653,37 @@ assert_direct_merge_held() { # <dir> <id> <repo> <label>
 
 test_pr_check_allowlist_and_safe_holds() {
   local dir rc port count repo
+  local -a registered_repos
+  local expected_repos=(
+    morris2spears/iinvy
+    morris2spears/iinvy-storefront
+    morris2spears/iinvy-control-plane
+    morris2spears/cutbot
+    morris2spears/hermes-agent-cutbot
+  )
   # shellcheck source=bin/fm-pr-lib.sh
   . "$ROOT/bin/fm-pr-lib.sh"
-  diff <(printf '%s\n' "${FM_CIPHER_GATED_REPOSITORIES[@]}") \
-    <(grep -v -e '^#' -e '^$' "$ROOT/bin/fm-cipher-hook-repositories") >/dev/null \
-    || fail "the shell gate list and the Cipher allowlist file disagree"
-  fm_cipher_repo_gated Morris2Spears/iinvy || fail "mixed-case iinvy owner was not recognized as gated"
-  fm_cipher_repo_gated morris2spears/iinvy-control-plane || fail "the control-plane repository was not recognized as gated"
-  fm_cipher_repo_gated Morris2Spears/CutBot || fail "mixed-case cutbot repository was not recognized as gated"
-  fm_cipher_repo_gated Morris2Spears/Hermes-Agent-CutBot \
-    || fail "mixed-case hermes-agent-cutbot repository was not recognized as gated"
-  fm_cipher_repo_gated example/other && fail "an unrelated repository was treated as gated"
   dir=$(make_case pr-check)
+  diff <(printf '%s\n' "${expected_repos[@]}") <(run_repositories "$dir" list) >/dev/null \
+    || fail "the five existing repository registrations changed"
+  run_repositories "$dir" contains Morris2Spears/iinvy \
+    || fail "mixed-case iinvy owner was not recognized as gated"
+  run_repositories "$dir" contains morris2spears/iinvy-control-plane \
+    || fail "the control-plane repository was not recognized as gated"
+  run_repositories "$dir" contains Morris2Spears/CutBot \
+    || fail "mixed-case cutbot repository was not recognized as gated"
+  run_repositories "$dir" contains Morris2Spears/Hermes-Agent-CutBot \
+    || fail "mixed-case hermes-agent-cutbot repository was not recognized as gated"
+  set +e
+  run_repositories "$dir" contains morris2spears/realvis-studio
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "RealVis must not be registered before an explicit add"
+  set +e
+  run_repositories "$dir" contains example/other
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "an unrelated repository was treated as gated"
   export FM_TEST_CREW_STATE_MARKER="$dir/crew-state.called"
   set +e
   prepare_pr_case "$dir" other-task example/other > "$dir/other.out" 2> "$dir/other.err"
@@ -672,6 +702,13 @@ test_pr_check_allowlist_and_safe_holds() {
   expect_code 0 "$rc" "non-green iinvy PR registration should keep waiting for checks"
   assert_absent "$dir/state/cipher-hooks" "non-green iinvy PR emitted a Cipher event"
 
+  run_repositories "$dir" add Morris2Spears/RealVis-Studio > "$dir/add.out" \
+    || fail "RealVis registration failed"
+  assert_grep 'registered: morris2spears/realvis-studio' "$dir/add.out" \
+    "RealVis registration was not normalized"
+  FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" FM_CONFIG_OVERRIDE="$dir/config" \
+    fm_cipher_repo_gated Morris2Spears/RealVis-Studio \
+    || fail "the shell merge gate did not read the home registration"
   port=$(start_server "$dir" accepted)
   write_config "$dir" "$port" enabled enabled
   prepare_pr_case "$dir" green-cutbot morris2spears/cutbot > "$dir/cutbot.out" 2> "$dir/cutbot.err" \
@@ -679,15 +716,22 @@ test_pr_check_allowlist_and_safe_holds() {
   prepare_pr_case "$dir" green-hermes-agent-cutbot morris2spears/hermes-agent-cutbot \
     > "$dir/hermes-agent-cutbot.out" 2> "$dir/hermes-agent-cutbot.err" \
     || fail "green hermes-agent-cutbot PR registration did not take the Cipher PR-ready path"
+  prepare_pr_case "$dir" green-realvis-studio morris2spears/realvis-studio \
+    > "$dir/realvis-studio.out" 2> "$dir/realvis-studio.err" \
+    || fail "green realvis-studio PR registration did not take the Cipher PR-ready path"
   jq -s -e '
-    length == 2
+    length == 3
     and ([.[].body.repository] | sort
-      == ["morris2spears/cutbot", "morris2spears/hermes-agent-cutbot"])
+      == ["morris2spears/cutbot", "morris2spears/hermes-agent-cutbot", "morris2spears/realvis-studio"])
     and all(.[].body.event_type; . == "iinvy-pr-ready")
-  ' "$dir/server.log" >/dev/null || fail "CutBot PR registrations did not emit the expected Cipher events"
+  ' "$dir/server.log" >/dev/null || fail "gated PR registrations did not emit the expected Cipher events"
   stop_server "$(cat "$dir/server.pid")"
 
-  for repo in "${FM_CIPHER_GATED_REPOSITORIES[@]}"; do
+  registered_repos=()
+  while IFS= read -r repo; do
+    registered_repos+=("$repo")
+  done < <(run_repositories "$dir" list)
+  for repo in "${registered_repos[@]}"; do
     rm -f "$dir/config/cipher-hooks" "$dir/crew-state.called"
     set +e
     prepare_pr_case "$dir" "missing-${repo##*/}" "$repo" > "$dir/missing.out" 2> "$dir/missing.err"
@@ -1031,19 +1075,21 @@ test_reconcile_delivers_post_registration_green() {
   head_c='cccccccccccccccccccccccccccccccccccccccc'
   dir=$(make_case reconcile)
   cat > "$dir/data/backlog.md" <<'EOF'
-- [ ] sync-task - close the reconciliation gap https://github.com/morris2spears/iinvy-control-plane/issues/19 (kind: ship)
+- [ ] sync-task - close the reconciliation gap https://github.com/morris2spears/realvis-studio/issues/19 (kind: ship)
 EOF
+  run_repositories "$dir" add morris2spears/realvis-studio >/dev/null \
+    || fail "RealVis registration for reconcile failed"
   port=$(start_server "$dir" accepted)
   write_config "$dir" "$port" enabled enabled
 
   # Registration while the PR is behind or red records the PR, keeps waiting
   # for checks, and spends no Cipher event.
   set +e
-  prepare_pr_case "$dir" sync-task morris2spears/iinvy-control-plane "$HEAD_A" \
+  prepare_pr_case "$dir" sync-task morris2spears/realvis-studio "$HEAD_A" \
     'state: working · source: run-step · ci running' > "$dir/register.out" 2> "$dir/register.err"
   rc=$?
   set -e
-  expect_code 0 "$rc" "non-green control-plane registration should keep waiting for checks"
+  expect_code 0 "$rc" "non-green RealVis registration should keep waiting for checks"
   assert_absent "$dir/state/cipher-hooks" "non-green registration emitted a Cipher event"
 
   # A reconcile sweep while the task is still not green stays silent.
@@ -1179,14 +1225,16 @@ test_watcher_reconciles_post_registration_green() {
   local dir port request_id out wpid i
   dir=$(make_case watcher-reconcile)
   cat > "$dir/data/backlog.md" <<'EOF'
-- [ ] recover-task - reconcile after recovery https://github.com/morris2spears/iinvy-control-plane/issues/20 (kind: ship)
+- [ ] recover-task - reconcile after recovery https://github.com/morris2spears/realvis-studio/issues/20 (kind: ship)
 EOF
+  run_repositories "$dir" add morris2spears/realvis-studio >/dev/null \
+    || fail "RealVis registration for watcher reconcile failed"
   port=$(start_server "$dir" accepted)
   write_config "$dir" "$port" enabled enabled
   # Register while red, then lose the observing session: only durable records
   # remain when the PR later reaches green.
   set +e
-  prepare_pr_case "$dir" recover-task morris2spears/iinvy-control-plane "$HEAD_A" \
+  prepare_pr_case "$dir" recover-task morris2spears/realvis-studio "$HEAD_A" \
     'state: working · source: run-step · ci running' >/dev/null 2>&1
   set -e
   assert_absent "$dir/state/cipher-hooks" "red registration emitted a Cipher event"
@@ -1424,6 +1472,143 @@ EOF
   pass "a budgeted reconcile sweep reaches every gated task in turn across cadences"
 }
 
+test_repository_registration_store() {
+  local dir other malformed duplicate concurrent rc i pid failed count port request_id
+  local pids=
+  dir=$(make_case repository-registration)
+  other=$(make_case repository-registration-other-home)
+
+  run_repositories "$dir" inspect --json | jq -e '
+    .schema == "firstmate.cipher-repositories.v1"
+    and .effective_source == "built-in-defaults"
+    and .degraded == false
+    and (.repositories | length == 5)
+  ' >/dev/null || fail "default repository registration inspection was invalid"
+  run_repositories "$dir" add Morris2Spears/RealVis-Studio > "$dir/add-first.out" \
+    || fail "case-normalized repository add failed"
+  run_repositories "$dir" add morris2spears/realvis-studio > "$dir/add-second.out" \
+    || fail "idempotent repository add failed"
+  assert_grep 'already registered: morris2spears/realvis-studio' "$dir/add-second.out" \
+    "idempotent add did not report the effective registration"
+  run_repositories "$dir" contains MORRIS2SPEARS/REALVIS-STUDIO \
+    || fail "case-normalized registration was not effective"
+  set +e
+  run_repositories "$dir" add 'morris2spears/*' > /dev/null 2> "$dir/wildcard.err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "wildcard registration must be rejected"
+  assert_absent "$other/config/cipher-repositories.json" \
+    "registration in one home modified another home"
+  set +e
+  run_repositories "$other" contains morris2spears/realvis-studio
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a registration leaked into another home"
+
+  rm -f "$dir/config/cipher-repositories.json"
+  run_repositories "$dir" contains morris2spears/realvis-studio \
+    || fail "a missing primary did not retain the last-known-good registration"
+  run_repositories "$dir" inspect --json | jq -e '
+    .effective_source == "last-known-good" and .degraded == true
+  ' >/dev/null || fail "missing-primary recovery was not reported clearly"
+  printf '{broken\n' > "$dir/config/cipher-repositories.json"
+  chmod 0600 "$dir/config/cipher-repositories.json"
+  run_repositories "$dir" contains morris2spears/realvis-studio \
+    || fail "a corrupt primary did not retain the last-known-good registration"
+  printf '{also-broken\n' > "$dir/config/cipher-repositories.last-good.json"
+  chmod 0600 "$dir/config/cipher-repositories.last-good.json"
+  set +e
+  run_repositories "$dir" validate > /dev/null 2> "$dir/corrupt.err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "corrupt primary and fallback must refuse registration resolution"
+  : > "$dir/gh-axi.log"
+  fm_write_meta "$dir/state/corrupt-task.meta" \
+    "window=fm-corrupt-task" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" \
+    "pr=https://github.com/morris2spears/realvis-studio/pull/19"
+  set +e
+  run_pr_merge "$dir" corrupt-task https://github.com/morris2spears/realvis-studio/pull/19 \
+    > "$dir/corrupt-merge.out" 2> "$dir/corrupt-merge.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unavailable registration source must hold merge"
+  assert_no_grep 'pr merge' "$dir/gh-axi.log" "unavailable registration source reached merge"
+
+  malformed=$(make_case repository-registration-malformed)
+  printf '%s\n' '{"schema":"firstmate.cipher-repositories.v2","repositories":["morris2spears/iinvy"]}' \
+    > "$malformed/config/cipher-repositories.json"
+  chmod 0600 "$malformed/config/cipher-repositories.json"
+  set +e
+  run_repositories "$malformed" validate > /dev/null 2> "$malformed/validate.err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "unsupported registration schema must be rejected"
+
+  duplicate=$(make_case repository-registration-duplicate)
+  printf '%s\n' '{"schema":"firstmate.cipher-repositories.v1","repositories":["morris2spears/iinvy","morris2spears/iinvy"]}' \
+    > "$duplicate/config/cipher-repositories.json"
+  chmod 0600 "$duplicate/config/cipher-repositories.json"
+  set +e
+  run_repositories "$duplicate" validate > /dev/null 2> "$duplicate/validate.err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "duplicate registration entries must be rejected"
+
+  concurrent=$(make_case repository-registration-concurrent)
+  failed=0
+  for i in $(seq 1 20); do
+    run_repositories "$concurrent" add "example/repo-$i" \
+      > "$concurrent/add-$i.out" 2> "$concurrent/add-$i.err" &
+    pids="$pids $!"
+  done
+  for i in $(seq 1 20); do
+    run_repositories "$concurrent" inspect --json | jq -e '.schema == "firstmate.cipher-repositories.v1"' \
+      >/dev/null || failed=1
+  done
+  for pid in $pids; do
+    wait "$pid" || failed=1
+  done
+  [ "$failed" -eq 0 ] || fail "a concurrent registration read or write failed"
+  count=$(run_repositories "$concurrent" list | wc -l | tr -d ' ')
+  [ "$count" = 25 ] || fail "concurrent adds lost registrations: $count effective entries"
+
+  dir=$(make_case repository-registration-removal)
+  run_repositories "$dir" add morris2spears/realvis-studio >/dev/null \
+    || fail "removal fixture registration failed"
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+  prepare_pr_case "$dir" realvis-task morris2spears/realvis-studio \
+    > "$dir/realvis.out" 2> "$dir/realvis.err" \
+    || fail "in-flight RealVis request fixture failed"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  [ -n "$request_id" ] || fail "in-flight RealVis request was not recorded"
+  stop_server "$(cat "$dir/server.pid")"
+  set +e
+  run_repositories "$dir" remove morris2spears/realvis-studio \
+    > /dev/null 2> "$dir/remove-inflight.err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "removal with in-flight gated work must refuse"
+  run_repositories "$dir" contains morris2spears/realvis-studio \
+    || fail "refused removal released in-flight gated work"
+  rm -f "$dir/state/realvis-task.meta"
+  run_repositories "$dir" remove morris2spears/realvis-studio > "$dir/remove.out" \
+    || fail "safe repository removal failed"
+  set +e
+  run_repositories "$dir" contains morris2spears/realvis-studio
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "removed repository remained enrolled"
+  printf '{broken-after-remove\n' > "$dir/config/cipher-repositories.json"
+  chmod 0600 "$dir/config/cipher-repositories.json"
+  run_repositories "$dir" contains morris2spears/realvis-studio \
+    || fail "degraded recovery released a recently removed registration"
+  run_repositories "$dir" rollback > "$dir/rollback.out" || fail "registration rollback failed"
+  run_repositories "$dir" contains morris2spears/realvis-studio \
+    || fail "rollback did not restore the prior registration"
+  pass "repository registrations are per-home, validated, atomic, recoverable, and removal-safe"
+}
+
 test_recorded_head_survives_a_silent_forge() {
   local dir head
   dir=$(make_case head-preservation)
@@ -1466,6 +1651,7 @@ EOF
 }
 
 test_forge_green_query_classifies_check_rollup
+test_repository_registration_store
 test_reconcile_budget_reaches_every_gated_task_in_turn
 test_recorded_head_survives_a_silent_forge
 test_v2_decision_and_pr_delivery_dedupe

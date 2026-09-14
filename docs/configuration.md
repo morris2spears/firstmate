@@ -35,10 +35,18 @@ This preference is local to each Firstmate home and is not part of secondmate in
 
 ## Cipher/Hermes bridge
 
-The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for the gated repositories listed in [`bin/fm-cipher-hook-repositories`](../bin/fm-cipher-hook-repositories).
-Gated membership is decided by the literal case-insensitive `FM_CIPHER_GATED_REPOSITORIES` list in [`bin/fm-pr-lib.sh`](../bin/fm-pr-lib.sh), which needs no file or configuration read, and `bin/fm-cipher-hook-repositories` carries the same list for the Python payload owner with a test holding the two in step.
+The optional local Cipher/Hermes bridge emits only a genuine keyed decision and an exact-head checks-green PR event for repositories enrolled in the effective Firstmate home's canonical registration source.
+[`bin/fm-cipher-repositories.sh`](../bin/fm-cipher-repositories.sh) is the supported operator and machine-readable interface: `list`, `inspect --json`, and `validate --json` read effective state, `add <owner/repo>` explicitly enrolls one exact normalized GitHub repository, `remove <owner/repo>` removes one safely, and `rollback` restores the set saved before the latest successful mutation.
+The versioned source is `config/cipher-repositories.json`, with `config/cipher-repositories.last-good.json` as its recovery copy and `config/cipher-repositories.rollback.json` as its explicit rollback snapshot.
+A home with no managed source or snapshots starts with the existing five registrations - `morris2spears/iinvy`, `morris2spears/iinvy-storefront`, `morris2spears/iinvy-control-plane`, `morris2spears/cutbot`, and `morris2spears/hermes-agent-cutbot` - so upgrading creates no migration gap, and the first successful mutation atomically materializes that effective set plus the requested change.
+The source schema is exactly `{"schema":"firstmate.cipher-repositories.v1","repositories":["owner/repo"]}`: unknown fields, unsupported schemas, empty sets, malformed names, wildcards, mixed-case stored values, and duplicates are rejected without evaluation.
+Reads and writes use the same home resolution and a per-home shared/exclusive lock, each file replacement is atomic and durable, and a missing or invalid primary uses the validated last-known-good copy while reporting degraded state through `inspect --json`.
+The recovery copy conservatively retains registrations removed by the latest mutation, so degraded operation can over-protect a removed repository but cannot release it.
+If a managed source cannot be recovered, repository classification errors and every affected PR registration, reconciliation, payload, and merge path stays held rather than treating a formerly protected repository as ordinary.
+Removal refuses while matching PR task metadata remains in that home, including an acknowledged request awaiting merge, and succeeds only after that in-flight work is finished and cleaned up.
 It is not a generic notification channel, does not copy Firstmate supervision state, and never sends worker prose.
-GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow production-outage inspection and merge action for those gated repositories.
+Registration authorizes notification and the guarded merge boundary only; it grants no deployment instruction, wildcard merge authority, Hermes-profile access, route change, or secret access.
+GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow production-outage inspection and merge action for registered repositories.
 
 The bridge reads `config/cipher-hooks` from the effective Firstmate home, or from `FM_CONFIG_OVERRIDE` for isolated tests.
 The file must be a regular single-link mode-0600 file with this exact key set and no duplicate or unknown keys:
@@ -100,7 +108,7 @@ Firstmate keeps the worker parked until it fetches the exact durable GitHub comm
 After sending the worker its decision, `bin/fm-cipher-hook.sh resolve-decision <task-id> <request-id>` durably closes the keyed status decision with one idempotent `resolved [key=<decision-id>]: Cipher decision accepted <comment-url>` line, so an answered decision cannot linger open and any held duplicate delivery supersedes on the next sweep.
 That command refuses unless both the acknowledged needs-decision request and the authenticated decision-comment record exist, so a decision can never be marked Cipher-answered without its durable GitHub answer.
 
-The `iinvy_pr_ready_route` is fail-safe rather than optional for every repository listed in `bin/fm-cipher-hook-repositories`, the single owner of the gated set.
+The `iinvy_pr_ready_route` is fail-safe rather than optional for every repository returned by `bin/fm-cipher-repositories.sh`, the single interface to the per-home gated set.
 A missing config, disabled route, unavailable gateway, timeout, invalid response, or missing exact head holds those merges, while every other repository keeps its existing PR-ready and merge behavior without reading bridge configuration or sending an event.
 Cipher's review is limited to cross-repository provider and consumer contracts, migration and deployment ordering, runtime dependency install/import/restart behavior, and production-realistic smoke or health gates.
 Cipher invokes `bin/fm-cipher-hook.sh merge` with the request ID it inspected, and the guarded merge path adds GitHub's exact-head condition so a later head cannot inherit an earlier inspection.

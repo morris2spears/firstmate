@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fm_cipher_repositories import RegistrationError, registered_repositories
+
 SCHEMA = "firstmate.cipher-hook.v1"
 DELIVERY_ACK_SCHEMA = "firstmate.cipher-hook-delivery-ack.v1"
 DELIVERY_SCHEMA = "firstmate.cipher-hook-delivery.v1"
@@ -76,21 +79,10 @@ def code_root() -> Path:
 
 
 def gated_repos() -> frozenset[str]:
-    path = Path(__file__).resolve().parent / "fm-cipher-hook-repositories"
     try:
-        lines = path.read_text(encoding="ascii").splitlines()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise HookError("repository-allowlist-unavailable") from exc
-    repos = frozenset(line for line in lines if line and not line.startswith("#"))
-    if not repos:
-        raise HookError("repository-allowlist-unavailable")
-    for repo in repos:
-        if repo.count("/") != 1:
-            raise HookError("repository-allowlist-invalid")
-        owner, name = repo.split("/", 1)
-        if canonical_repo(owner, name) != repo:
-            raise HookError("repository-allowlist-invalid")
-    return repos
+        return registered_repositories()
+    except RegistrationError as exc:
+        raise HookError("repository-registration-unavailable") from exc
 
 
 def operational_paths() -> tuple[Path, Path, Path]:
@@ -595,6 +587,7 @@ def diagnostic_message(reason: str) -> str:
         "missing-pr-head": "the checks-green PR head could not be bound",
         "decision-comment-missing": "no authenticated Cipher decision comment is recorded for this request",
         "repository-unknown": "the task's canonical GitHub repository could not be established",
+        "repository-registration-unavailable": "the repository registration source is unavailable",
         "repository-mismatch": "the task repository does not match its pull request",
         "pr-metadata-mismatch": "the pull request does not match task metadata",
     }

@@ -10,7 +10,7 @@ metadata:
 
 # Cipher hook
 
-Load this after current-state reconciliation proves a genuine `needs-decision`, when a checks-green pull request belongs to a repository listed in [`bin/fm-cipher-hook-repositories`](../../../bin/fm-cipher-hook-repositories), or on a `cipher-comment`, `cipher-retry`, or `cipher-reconcile` check notification.
+Load this after current-state reconciliation proves a genuine `needs-decision`, when a checks-green pull request belongs to a repository returned by [`bin/fm-cipher-repositories.sh`](../../../bin/fm-cipher-repositories.sh), or on a `cipher-comment`, `cipher-retry`, or `cipher-reconcile` check notification.
 The local setup and wire schema are owned by [`docs/configuration.md`](../../../docs/configuration.md#cipherhermes-bridge), while the command contracts are owned by the headers of [`bin/fm-cipher-hook.sh`](../../../bin/fm-cipher-hook.sh) and [`bin/fm-cipher-receive.sh`](../../../bin/fm-cipher-receive.sh).
 
 ## Genuine needs-decision
