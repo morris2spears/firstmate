@@ -193,6 +193,10 @@ def registration_lock(*, exclusive: bool, inheritable: bool = False) -> Iterator
             or stat.S_IMODE(info.st_mode) != 0o600
         ):
             raise RegistrationError("repository registration lock is unsafe")
+        ready_marker = os.environ.get("FM_CIPHER_LOCK_TEST_READY_MARKER")
+        if ready_marker:
+            with open(ready_marker, "wb"):
+                pass
         fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         if inheritable:
             os.set_inheritable(fd, True)

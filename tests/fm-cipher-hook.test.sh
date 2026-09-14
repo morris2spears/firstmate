@@ -1610,7 +1610,7 @@ test_repository_registration_store() {
 }
 
 test_removal_waits_for_wrapped_pr_check_publication() {
-  local dir repo id real_mv paused released check_pid remove_pid rc ck i port
+  local dir repo id real_mv paused released ready check_pid remove_pid rc ck i port request_id
   dir=$(make_case removal-race)
   repo=morris2spears/racecheck
   run_repositories "$dir" add "$repo" >/dev/null || fail "race fixture registration failed"
@@ -1623,6 +1623,7 @@ test_removal_waits_for_wrapped_pr_check_publication() {
   real_mv=$(command -v mv)
   paused="$dir/mv-paused"
   released="$dir/mv-release"
+  ready="$dir/remove-ready"
   cat > "$dir/fakebin/mv" <<SH
 #!/usr/bin/env bash
 last=\${!#}
@@ -1652,8 +1653,17 @@ SH
   done
   [ -e "$paused" ] || fail "wrapped PR-check never reached metadata publication under the shared lock"
 
-  run_repositories "$dir" remove "$repo" > "$dir/remove-blocked.out" 2> "$dir/remove-blocked.err" &
+  FM_CIPHER_LOCK_TEST_READY_MARKER="$ready" \
+    run_repositories "$dir" remove "$repo" > "$dir/remove-blocked.out" 2> "$dir/remove-blocked.err" &
   remove_pid=$!
+  i=0
+  while [ ! -e "$ready" ] && [ "$i" -lt 100 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] \
+    || fail "removal never reached its exclusive-lock attempt on the shared registration lock"
+
   i=0
   while kill -0 "$remove_pid" 2>/dev/null && [ "$i" -lt 10 ]; do
     sleep 0.1
@@ -1666,6 +1676,14 @@ SH
   ck=0
   wait "$check_pid" || ck=$?
   expect_code 0 "$ck" "wrapped PR-check did not complete after the pause was released"
+  request_id=$(request_id_for_kind "$dir" iinvy-pr-ready)
+  [ -n "$request_id" ] || fail "released PR-check never emitted a Cipher PR-ready request"
+  assert_present "$dir/state/cipher-hooks/acks/$request_id.json" \
+    "released PR-check's Cipher PR-ready delivery was never acknowledged"
+  jq -e --arg repo "$repo" '.body.repository == $repo and .body.event_type == "iinvy-pr-ready"' \
+    "$dir/server.log" >/dev/null \
+    || fail "the gateway never observed the classified iinvy-pr-ready delivery"
+
   rc=0
   wait "$remove_pid" || rc=$?
   expect_code 2 "$rc" "removal did not refuse once matching PR metadata became visible"
