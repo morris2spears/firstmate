@@ -1609,6 +1609,75 @@ test_repository_registration_store() {
   pass "repository registrations are per-home, validated, atomic, recoverable, and removal-safe"
 }
 
+test_removal_waits_for_wrapped_pr_check_publication() {
+  local dir repo id real_mv paused released check_pid remove_pid rc ck i port
+  dir=$(make_case removal-race)
+  repo=morris2spears/racecheck
+  run_repositories "$dir" add "$repo" >/dev/null || fail "race fixture registration failed"
+  port=$(start_server "$dir" accepted)
+  write_config "$dir" "$port" enabled enabled
+  id=race-task
+  fm_write_meta "$dir/state/$id.meta" \
+    "window=fm-$id" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" "mode=no-mistakes"
+
+  real_mv=$(command -v mv)
+  paused="$dir/mv-paused"
+  released="$dir/mv-release"
+  cat > "$dir/fakebin/mv" <<SH
+#!/usr/bin/env bash
+last=\${!#}
+if [ "\$last" = "$dir/state/$id.meta" ]; then
+  : > "$paused"
+  i=0
+  while [ ! -e "$released" ] && [ "\$i" -lt 300 ]; do
+    sleep 0.1
+    i=\$((i + 1))
+  done
+fi
+exec "$real_mv" "\$@"
+SH
+  chmod +x "$dir/fakebin/mv"
+
+  : > "$dir/gh-axi.log"
+  FM_TEST_HEAD=$HEAD_A \
+  FM_TEST_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    run_pr_check "$dir" "$id" "https://github.com/$repo/pull/19" \
+    > "$dir/check.out" 2> "$dir/check.err" &
+  check_pid=$!
+
+  i=0
+  while [ ! -e "$paused" ] && [ "$i" -lt 100 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$paused" ] || fail "wrapped PR-check never reached metadata publication under the shared lock"
+
+  run_repositories "$dir" remove "$repo" > "$dir/remove-blocked.out" 2> "$dir/remove-blocked.err" &
+  remove_pid=$!
+  i=0
+  while kill -0 "$remove_pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill -0 "$remove_pid" 2>/dev/null \
+    || fail "removal acquired exclusivity while the wrapped PR-check still held the shared lock"
+
+  : > "$released"
+  ck=0
+  wait "$check_pid" || ck=$?
+  expect_code 0 "$ck" "wrapped PR-check did not complete after the pause was released"
+  rc=0
+  wait "$remove_pid" || rc=$?
+  expect_code 2 "$rc" "removal did not refuse once matching PR metadata became visible"
+  assert_grep "in-flight gated work" "$dir/remove-blocked.err" \
+    "removal refusal did not cite the newly published in-flight task"
+  assert_grep "pr=https://github.com/$repo/pull/19" "$dir/state/$id.meta" \
+    "PR-check did not publish metadata once the shared lock was released"
+  run_repositories "$dir" contains "$repo" \
+    || fail "a removal racing publication released in-flight gated work"
+  pass "an exclusive removal cannot enter until a wrapped PR-check's publication and classification complete"
+}
+
 test_recorded_head_survives_a_silent_forge() {
   local dir head
   dir=$(make_case head-preservation)
@@ -1652,6 +1721,7 @@ EOF
 
 test_forge_green_query_classifies_check_rollup
 test_repository_registration_store
+test_removal_waits_for_wrapped_pr_check_publication
 test_reconcile_budget_reaches_every_gated_task_in_turn
 test_recorded_head_survives_a_silent_forge
 test_v2_decision_and_pr_delivery_dedupe
