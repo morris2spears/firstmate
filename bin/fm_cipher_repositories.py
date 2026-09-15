@@ -306,19 +306,42 @@ def _inflight_tasks(repository: str) -> tuple[str, ...]:
     return tuple(sorted(tasks))
 
 
+def _validate_removals(
+    current: tuple[str, ...], updated: tuple[str, ...]
+) -> None:
+    retained = frozenset(updated)
+    blocked: list[tuple[str, tuple[str, ...]]] = []
+    for repository in current:
+        if repository in retained:
+            continue
+        inflight = _inflight_tasks(repository)
+        if inflight:
+            blocked.append((repository, inflight))
+    if not blocked:
+        return
+    if len(blocked) == 1:
+        _, tasks = blocked[0]
+        raise RegistrationError(
+            f"repository has in-flight gated work ({', '.join(tasks)}); "
+            "finish or clean it up before removal"
+        )
+    details = "; ".join(
+        f"{repository}: {', '.join(tasks)}" for repository, tasks in blocked
+    )
+    raise RegistrationError(
+        f"repositories have in-flight gated work ({details}); "
+        "finish or clean them up before removal"
+    )
+
+
 def remove_repository(raw: str) -> tuple[str, bool]:
     repository = canonical_repository(raw)
     with registration_lock(exclusive=True):
         state = _load_unlocked()
         if repository not in state.repositories:
             return repository, False
-        inflight = _inflight_tasks(repository)
-        if inflight:
-            raise RegistrationError(
-                f"repository has in-flight gated work ({', '.join(inflight)}); "
-                "finish or clean it up before removal"
-            )
         updated = tuple(item for item in state.repositories if item != repository)
+        _validate_removals(state.repositories, updated)
         if not updated:
             raise RegistrationError("the final repository registration cannot be removed")
         _commit(updated, state.repositories)
@@ -332,6 +355,7 @@ def rollback() -> tuple[str, ...]:
         if not _path_present(rollback_path):
             raise RegistrationError("no repository registration rollback is available")
         previous = _decode_document(rollback_path)
+        _validate_removals(state.repositories, previous)
         _commit(previous, state.repositories)
         return previous
 

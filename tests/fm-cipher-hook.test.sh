@@ -1609,6 +1609,61 @@ test_repository_registration_store() {
   pass "repository registrations are per-home, validated, atomic, recoverable, and removal-safe"
 }
 
+test_rollback_refuses_multi_repository_inflight_removal() {
+  local dir first second rc path
+  dir=$(make_case repository-registration-rollback-removal)
+  first=example/rollback-first
+  second=example/rollback-second
+
+  run_repositories "$dir" add "$first" >/dev/null \
+    || fail "first rollback-removal fixture registration failed"
+  cp "$dir/config/cipher-repositories.rollback.json" "$dir/rollback-target.json"
+  run_repositories "$dir" add "$second" >/dev/null \
+    || fail "second rollback-removal fixture registration failed"
+  cp "$dir/rollback-target.json" "$dir/config/cipher-repositories.rollback.json"
+  chmod 0600 "$dir/config/cipher-repositories.rollback.json"
+  fm_write_meta "$dir/state/rollback-second-task.meta" \
+    "window=fm-rollback-second-task" "worktree=$dir/wt" "project=$dir/wt" "kind=ship" \
+    "pr=https://github.com/$second/pull/5"
+  chmod 0600 "$dir/state/rollback-second-task.meta"
+
+  for path in cipher-repositories.json cipher-repositories.last-good.json \
+    cipher-repositories.rollback.json; do
+    cp "$dir/config/$path" "$dir/before-$path"
+  done
+  set +e
+  run_repositories "$dir" rollback > "$dir/rollback-blocked.out" 2> "$dir/rollback-blocked.err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "rollback removing a repository with in-flight work must refuse"
+  assert_grep "in-flight gated work" "$dir/rollback-blocked.err" \
+    "rollback refusal did not cite the in-flight task"
+  for path in cipher-repositories.json cipher-repositories.last-good.json \
+    cipher-repositories.rollback.json; do
+    cmp -s "$dir/before-$path" "$dir/config/$path" \
+      || fail "refused rollback mutated $path"
+  done
+  run_repositories "$dir" contains "$first" \
+    || fail "refused multi-repository rollback dropped its first removal"
+  run_repositories "$dir" contains "$second" \
+    || fail "refused multi-repository rollback dropped its in-flight second removal"
+
+  rm -f "$dir/state/rollback-second-task.meta"
+  run_repositories "$dir" rollback > "$dir/rollback-completed.out" \
+    || fail "rollback did not succeed after the in-flight work was cleaned up"
+  set +e
+  run_repositories "$dir" contains "$first"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "completed multi-repository rollback retained its first removal"
+  set +e
+  run_repositories "$dir" contains "$second"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "completed multi-repository rollback retained its second removal"
+  pass "rollback validates every removed repository before writing and succeeds after cleanup"
+}
+
 test_removal_waits_for_wrapped_pr_check_publication() {
   local dir repo id real_mv paused released ready check_pid remove_pid rc ck i port request_id
   dir=$(make_case removal-race)
@@ -1739,6 +1794,7 @@ EOF
 
 test_forge_green_query_classifies_check_rollup
 test_repository_registration_store
+test_rollback_refuses_multi_repository_inflight_removal
 test_removal_waits_for_wrapped_pr_check_publication
 test_reconcile_budget_reaches_every_gated_task_in_turn
 test_recorded_head_survives_a_silent_forge

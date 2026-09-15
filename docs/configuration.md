@@ -43,7 +43,7 @@ The source schema is exactly `{"schema":"firstmate.cipher-repositories.v1","repo
 Reads and writes use the same home resolution and a per-home shared/exclusive lock, each file replacement is atomic and durable, and a missing or invalid primary uses the validated last-known-good copy while reporting degraded state through `inspect --json`.
 The recovery copy conservatively retains registrations removed by the latest mutation, so degraded operation can over-protect a removed repository but cannot release it.
 If a managed source cannot be recovered, repository classification errors and every affected PR registration, reconciliation, payload, and merge path stays held rather than treating a formerly protected repository as ordinary.
-Removal refuses while matching PR task metadata remains in that home, including an acknowledged request awaiting merge, and succeeds only after that in-flight work is finished and cleaned up.
+Removal and rollback both refuse before writing when they would drop any repository with matching PR task metadata in that home, including an acknowledged request awaiting merge, and succeed only after that in-flight work is finished and cleaned up.
 It is not a generic notification channel, does not copy Firstmate supervision state, and never sends worker prose.
 Registration authorizes notification and the guarded merge boundary only; it grants no deployment instruction, wildcard merge authority, Hermes-profile access, route change, or secret access.
 GitHub remains the durable decision and review ledger, Firstmate remains coding-only, and Cipher owns the narrow production-outage inspection and merge action for registered repositories.

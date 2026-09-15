@@ -7,7 +7,8 @@
 # normalizes case; `remove` refuses while this home has matching PR task
 # metadata, so an in-flight gated request cannot become ordinary merge work.
 # `rollback` atomically restores the registration set saved before the latest
-# successful mutation. All commands resolve FM_HOME, FM_CONFIG_OVERRIDE, and
+# successful mutation and applies the same in-flight removal check before any
+# write. All commands resolve FM_HOME, FM_CONFIG_OVERRIDE, and
 # FM_STATE_OVERRIDE in the same way as the hook, watcher, and merge paths.
 #
 # Usage:
