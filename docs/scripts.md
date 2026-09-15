@@ -79,12 +79,13 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
 | `fm-check-register.sh`   | Bind an intentional custom watcher check to its current bytes                       |
 | `fm-check-lib.sh`        | Validate custom-check registrations and prepare private execution snapshots          |
-| `fm-pr-lib.sh`           | Own canonical task and PR validation, the literal Cipher-gated repository list, the forge's live-head and checks-green answer, plus private atomic PR-poll publication and identity-bound retirement |
+| `fm-pr-lib.sh`           | Own canonical task and PR validation, resolve Cipher gate membership through the per-home interface, provide the forge's live-head and checks-green answer, plus private atomic PR-poll publication and identity-bound retirement |
 | `fm-pr-poll.sh`          | Provide the byte-static watcher program for validated PR/MR-poll sidecars           |
 | `fm-pr-check-migrate.sh` | Quarantine older task polls without execution and rebuild only canonical polls       |
 | `fm-pr-check.sh`         | Record validated `pr=` and `pr_head=` values, then atomically arm a static merge poll |
 | `fm-pr-merge.sh`         | Record PR metadata, enforce any exact-head Cipher boundary, merge a task's canonical full GitHub URL, then best-effort close its backlog-linked issue |
 | `fm-cipher-hook.sh`      | Deliver authenticated decision and gated exact-head events, retry transiently held deliveries after gateway recovery, reconcile gated checks-green pull requests back through the canonical trigger, durably close a keyed decision answered by an authenticated Cipher comment, and expose Cipher's guarded merge entrypoint |
+| `fm-cipher-repositories.sh` | Manage and inspect the canonical validated per-home Cipher repository registrations with safe removal, recovery, and rollback |
 | `fm-cipher-receive.sh`   | Queue one authenticated GitHub decision or blocker pointer by task identity without selecting a terminal pane |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require completed scout deliverables, retire secondmate homes |

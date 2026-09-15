@@ -385,7 +385,16 @@ EOF
       [ -n "$URL" ] || continue
       fm_pr_url_parse "$URL" || continue
       [ "$FM_PR_PROVIDER" = github ] || continue
-      fm_cipher_repo_gated "$FM_PR_PATH" || continue
+      REPOSITORY_RC=0
+      fm_cipher_repo_gated "$FM_PR_PATH" || REPOSITORY_RC=$?
+      case "$REPOSITORY_RC" in
+        0) ;;
+        1) continue ;;
+        *)
+          echo "error: Cipher repository registration is unavailable; reconciliation remains held" >&2
+          exit 1
+          ;;
+      esac
       RECONCILE_IDS+=("$ID")
       RECONCILE_URLS+=("$URL")
     done

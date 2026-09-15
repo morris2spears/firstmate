@@ -96,18 +96,27 @@ if [ ! -f "$META" ] || [ -L "$META" ]; then
 fi
 
 CIPHER_HEAD=
-if fm_cipher_repo_gated "$PR_OWNER/$PR_REPO"; then
-  reject_cipher_head_override "$@" || exit 1
-  "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || {
-    echo "error: this Cipher-gated PR is not currently checks-green or its Cipher event is held" >&2
-    exit 1
-  }
-  CIPHER_HEAD=$("$SCRIPT_DIR/fm-cipher-hook.sh" verify-merge \
-    "$ID" "$URL" "${FM_CIPHER_MERGE_REQUEST_ID:-}") || {
-      echo "error: this Cipher-gated merge remains held for Cipher's exact-head production inspection" >&2
+REPOSITORY_RC=0
+fm_cipher_repo_gated "$PR_OWNER/$PR_REPO" || REPOSITORY_RC=$?
+case "$REPOSITORY_RC" in
+  0)
+    reject_cipher_head_override "$@" || exit 1
+    "$SCRIPT_DIR/fm-cipher-hook.sh" pr-ready "$ID" "$URL" || {
+      echo "error: this Cipher-gated PR is not currently checks-green or its Cipher event is held" >&2
       exit 1
     }
-fi
+    CIPHER_HEAD=$("$SCRIPT_DIR/fm-cipher-hook.sh" verify-merge \
+      "$ID" "$URL" "${FM_CIPHER_MERGE_REQUEST_ID:-}") || {
+        echo "error: this Cipher-gated merge remains held for Cipher's exact-head production inspection" >&2
+        exit 1
+      }
+    ;;
+  1) ;;
+  *)
+    echo "error: Cipher repository registration is unavailable; merge remains held" >&2
+    exit 1
+    ;;
+esac
 
 "$SCRIPT_DIR/fm-pr-check.sh" "$ID" "$URL"
 grep -qxF "pr=$URL" "$META" || {

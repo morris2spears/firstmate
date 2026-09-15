@@ -24,6 +24,7 @@
 # bound to the pull request URL as well as the comment, so re-arming a task on a
 # different pull request can never be silenced by the previous one's record.
 
+FM_PR_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_PR_PROVIDER=
 FM_PR_URL=
 FM_PR_HOST=
@@ -311,36 +312,11 @@ fm_pr_github_checks_green() { # <pr-url>
   [ "$FM_PR_GITHUB_GREEN" = 1 ]
 }
 
-# The GitHub repositories whose checks-green merge boundary belongs to Cipher.
-# Membership is decided here, by a literal case-insensitive comparison
-# with no file, subprocess, or configuration dependency, so an unrelated
-# repository can never be blocked by a failure in the bridge's machinery and a
-# gated repository can never be released by one. bin/fm-cipher-hook-repositories
-# is the same list for the Python payload owner and is kept in step by test.
-FM_CIPHER_GATED_REPOSITORIES=(
-  morris2spears/iinvy
-  morris2spears/iinvy-storefront
-  morris2spears/iinvy-control-plane
-  morris2spears/cutbot
-  morris2spears/hermes-agent-cutbot
-)
-
+# Resolve Cipher gate membership from the canonical per-home registration
+# interface. Exit 0 means registered, 1 means valid but unregistered, and 2
+# means the source could not be validated; callers must treat 2 as a safe hold.
 fm_cipher_repo_gated() { # <owner/repo>
-  local candidate=${1-} repo restore=1
-  local LC_ALL=C
-  case "$candidate" in
-    ''|*[!A-Za-z0-9._/-]*|*/*/*) return 1 ;;
-  esac
-  shopt -q nocasematch && restore=0
-  shopt -s nocasematch
-  for repo in "${FM_CIPHER_GATED_REPOSITORIES[@]}"; do
-    if [[ "$candidate" == "$repo" ]]; then
-      [ "$restore" -eq 0 ] || shopt -u nocasematch
-      return 0
-    fi
-  done
-  [ "$restore" -eq 0 ] || shopt -u nocasematch
-  return 1
+  "$FM_PR_LIB_DIR/fm-cipher-repositories.sh" contains "${1-}"
 }
 
 fm_pr_file_mode() {

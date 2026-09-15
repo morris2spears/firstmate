@@ -73,6 +73,7 @@ config/herdr-presentation-spaces  optional Herdr presentation layout selector (e
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/cipher-hooks and config/cipher-hooks.secret  optional local Cipher/Hermes route and HMAC secret; LOCAL, gitignored, mode 0600, and not inherited; see docs/configuration.md "Cipher/Hermes bridge"
+config/cipher-repositories*.json  canonical per-home Cipher gate registrations, recovery copy, and rollback snapshot managed by bin/fm-cipher-repositories.sh; LOCAL, gitignored, mode 0600, and not inherited; see docs/configuration.md "Cipher/Hermes bridge"
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 config/telegram-mode  Telegram-mode opt-in flag file (no secret); LOCAL, gitignored; presence-gates section 15
 config/tg-mode.env   generated Telegram-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
